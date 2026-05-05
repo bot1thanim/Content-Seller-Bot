@@ -2,6 +2,8 @@ import os
 import json
 import random
 import logging
+import threading
+from http.server import HTTPServer, BaseHTTPRequestHandler
 from datetime import datetime, date
 from pathlib import Path
 
@@ -1030,8 +1032,33 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 
+class _HealthHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"OK")
+
+    def log_message(self, format, *args):
+        pass
+
+
+def _start_health_server():
+    import socket
+    port = int(os.environ.get("PORT", "8080"))
+    try:
+        server = HTTPServer(("0.0.0.0", port), _HealthHandler)
+        server.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        logger.info(f"Health check server listening on port {port}")
+        server.serve_forever()
+    except OSError:
+        logger.warning(f"Health server could not bind to port {port} (dev mode — OK in production)")
+
+
 def main():
     ensure_data_files()
+
+    health_thread = threading.Thread(target=_start_health_server, daemon=True)
+    health_thread.start()
 
     if not TOKEN:
         logger.error("TELEGRAM_BOT_TOKEN לא הוגדר!")
@@ -1091,9 +1118,15 @@ def main():
     support_conv = ConversationHandler(
         entry_points=[CallbackQueryHandler(support_menu, pattern="^support$")],
         states={
-            SUPPORT_WAITING_MSG: [MessageHandler(filters.TEXT & ~filters.COMMAND, support_receive_msg)],
+            SUPPORT_WAITING_MSG: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, support_receive_msg),
+                CallbackQueryHandler(back_main, pattern="^back_main$"),
+            ],
         },
-        fallbacks=[CommandHandler("cancel", cancel)],
+        fallbacks=[
+            CommandHandler("cancel", cancel),
+            CallbackQueryHandler(back_main, pattern="^back_main$"),
+        ],
         per_message=False,
         per_chat=True,
     )
