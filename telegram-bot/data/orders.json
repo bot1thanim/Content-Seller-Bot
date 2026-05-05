@@ -1,1 +1,16 @@
-[]
+[
+  {
+    "user_id": 7706183809,
+    "amount": 0,
+    "videos_count": 1,
+    "date": "2026-05-05",
+    "type": "coins"
+  },
+  {
+    "user_id": 7706183809,
+    "amount": 0,
+    "videos_count": 199,
+    "date": "2026-05-05",
+    "type": "coins"
+  }
+]
