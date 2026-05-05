@@ -39,15 +39,17 @@ REFERRALS_FILE = DATA_DIR / "referrals.json"
 VIDEOS_FILE = DATA_DIR / "videos.json"
 ORDERS_FILE = DATA_DIR / "orders.json"
 
+COINS_PER_SHEKEL = 10
+
 PACKAGES = [
-    {"price": 2, "videos": 1, "label": "₪2 – 1 סרטון"},
-    {"price": 9, "videos": 5, "label": "₪9 – 5 סרטונים"},
-    {"price": 16, "videos": 10, "label": "₪16 – 10 סרטונים"},
-    {"price": 30, "videos": 20, "label": "₪30 – 20 סרטונים"},
-    {"price": 65, "videos": 50, "label": "₪65 – 50 סרטונים"},
-    {"price": 85, "videos": 70, "label": "₪85 – 70 סרטונים"},
-    {"price": 110, "videos": 100, "label": "₪110 – 100 סרטונים"},
-    {"price": 180, "videos": 200, "label": "₪180 – 200 סרטונים"},
+    {"price": 2,   "videos": 1,   "coins": 20,   "label_paypal": "₪2 – 1 סרטון",       "label_coins": "🪙20 מטבעות – 1 סרטון"},
+    {"price": 9,   "videos": 5,   "coins": 90,   "label_paypal": "₪9 – 5 סרטונים",      "label_coins": "🪙90 מטבעות – 5 סרטונים"},
+    {"price": 16,  "videos": 10,  "coins": 160,  "label_paypal": "₪16 – 10 סרטונים",    "label_coins": "🪙160 מטבעות – 10 סרטונים"},
+    {"price": 30,  "videos": 20,  "coins": 300,  "label_paypal": "₪30 – 20 סרטונים",    "label_coins": "🪙300 מטבעות – 20 סרטונים"},
+    {"price": 65,  "videos": 50,  "coins": 650,  "label_paypal": "₪65 – 50 סרטונים",    "label_coins": "🪙650 מטבעות – 50 סרטונים"},
+    {"price": 85,  "videos": 70,  "coins": 850,  "label_paypal": "₪85 – 70 סרטונים",    "label_coins": "🪙850 מטבעות – 70 סרטונים"},
+    {"price": 110, "videos": 100, "coins": 1100, "label_paypal": "₪110 – 100 סרטונים",  "label_coins": "🪙1100 מטבעות – 100 סרטונים"},
+    {"price": 180, "videos": 200, "coins": 1800, "label_paypal": "₪180 – 200 סרטונים",  "label_coins": "🪙1800 מטבעות – 200 סרטונים"},
 ]
 
 (
@@ -125,7 +127,7 @@ def register_user(user, ref_id=None):
 def get_main_keyboard(user_id):
     buttons = [
         [
-            InlineKeyboardButton("💳 תשלום בפייפאל", callback_data="payment"),
+            InlineKeyboardButton("💳 תשלום", callback_data="payment_method"),
             InlineKeyboardButton("👥 הפניות שלי", callback_data="referrals"),
         ],
         [
@@ -170,6 +172,41 @@ def get_admin_inline_keyboard():
     return InlineKeyboardMarkup(buttons)
 
 
+async def send_videos_to_user(context, user_id: int, count: int) -> int:
+    videos = load_json(VIDEOS_FILE)
+    if len(videos) < count:
+        return -1
+
+    selected = random.sample(videos, count)
+    sent = 0
+    for file_id in selected:
+        try:
+            await context.bot.send_video(chat_id=user_id, video=file_id)
+            sent += 1
+        except Exception:
+            pass
+    return sent
+
+
+def record_order(user_id: int, amount: float, videos_count: int, order_type: str):
+    orders = load_json(ORDERS_FILE)
+    orders.append({
+        "user_id": user_id,
+        "amount": amount,
+        "videos_count": videos_count,
+        "date": str(date.today()),
+        "type": order_type,
+    })
+    save_json(ORDERS_FILE, orders)
+
+    users = load_json(USERS_FILE)
+    uid = str(user_id)
+    if uid in users:
+        users[uid]["purchases"] = users[uid].get("purchases", 0) + 1
+        users[uid]["total_spent"] = users[uid].get("total_spent", 0) + amount
+        save_json(USERS_FILE, users)
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     args = context.args
@@ -194,39 +231,59 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(text, reply_markup=get_main_keyboard(user.id))
 
 
-async def payment_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def payment_method_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    coins = load_json(COINS_FILE)
+    balance = coins.get(str(query.from_user.id), 0)
+
+    buttons = [
+        [InlineKeyboardButton("💳 תשלום בפייפאל", callback_data="paypal_menu")],
+        [InlineKeyboardButton(f"🪙 שלם במטבעות (יתרה: {balance})", callback_data="coins_menu")],
+        [InlineKeyboardButton("🔙 חזרה", callback_data="back_main")],
+    ]
+    await query.edit_message_text(
+        "💰 *בחר אמצעי תשלום:*",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(buttons),
+    )
+
+
+async def paypal_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
 
     buttons = []
     for i, pkg in enumerate(PACKAGES):
-        buttons.append([InlineKeyboardButton(pkg["label"], callback_data=f"pkg_{i}")])
-    buttons.append([InlineKeyboardButton("🔙 חזרה", callback_data="back_main")])
+        buttons.append([InlineKeyboardButton(pkg["label_paypal"], callback_data=f"pp_{i}")])
+    buttons.append([InlineKeyboardButton("🔙 חזרה", callback_data="payment_method")])
 
     await query.edit_message_text(
-        "💳 בחר חבילה:",
+        "💳 *תשלום בפייפאל – בחר חבילה:*",
+        parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup(buttons),
     )
 
 
-async def package_selected(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def paypal_package_selected(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
 
-    idx = int(query.data.split("pkg_")[1])
+    idx = int(query.data.split("pp_")[1])
     pkg = PACKAGES[idx]
     user_id = query.from_user.id
 
     paypal_url = f"{PAYPAL_LINK}/{pkg['price']}ILS"
     text = (
-        f"📦 *חבילה נבחרת:* {pkg['label']}\n\n"
+        f"📦 *חבילה נבחרת:* {pkg['label_paypal']}\n\n"
         f"🔗 [לחץ כאן לתשלום בפייפאל]({paypal_url})\n\n"
         f"לאחר השלמת התשלום:\n"
         f"שלח את התשלום וציין את ה-ID שלך: `{user_id}`\n"
         f"לאחר מכן שלח צילום מסך לתמיכה ✅"
     )
 
-    buttons = [[InlineKeyboardButton("🔙 חזרה לחבילות", callback_data="payment")]]
+    buttons = [[InlineKeyboardButton("🔙 חזרה לחבילות", callback_data="paypal_menu")]]
     await query.edit_message_text(
         text,
         parse_mode="Markdown",
@@ -235,13 +292,114 @@ async def package_selected(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def coins_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    user_id = str(query.from_user.id)
+    coins = load_json(COINS_FILE)
+    balance = coins.get(user_id, 0)
+
+    buttons = []
+    for i, pkg in enumerate(PACKAGES):
+        affordable = "✅ " if balance >= pkg["coins"] else "🔒 "
+        buttons.append([InlineKeyboardButton(
+            affordable + pkg["label_coins"],
+            callback_data=f"coin_{i}"
+        )])
+    buttons.append([InlineKeyboardButton("🔙 חזרה", callback_data="payment_method")])
+
+    await query.edit_message_text(
+        f"🪙 *תשלום במטבעות*\n\n💰 יתרתך: *{balance} מטבעות*\n\n✅ = יש מספיק | 🔒 = אין מספיק\nבחר חבילה:",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(buttons),
+    )
+
+
+async def coin_package_buy(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    idx = int(query.data.split("coin_")[1])
+    pkg = PACKAGES[idx]
+    user_id = query.from_user.id
+    uid = str(user_id)
+
+    coins = load_json(COINS_FILE)
+    balance = coins.get(uid, 0)
+    cost = pkg["coins"]
+    video_count = pkg["videos"]
+
+    if balance < cost:
+        needed = cost - balance
+        buttons = [
+            [InlineKeyboardButton("💳 שלם בפייפאל במקום", callback_data="paypal_menu")],
+            [InlineKeyboardButton("🔙 חזרה לחבילות", callback_data="coins_menu")],
+        ]
+        await query.edit_message_text(
+            f"❌ *אין מספיק מטבעות*\n\n"
+            f"🪙 יתרתך: *{balance}*\n"
+            f"🏷 נדרש: *{cost}*\n"
+            f"חסרים לך: *{needed} מטבעות*\n\n"
+            f"צבור מטבעות על ידי הפניית חברים,\nאו שלם בפייפאל 💳",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup(buttons),
+        )
+        return
+
+    videos = load_json(VIDEOS_FILE)
+    if len(videos) < video_count:
+        await query.edit_message_text(
+            f"⚠️ *המאגר אינו מכיל מספיק סרטונים כרגע*\n\n"
+            f"יש {len(videos)} סרטונים, נדרשים {video_count}.\n"
+            f"נסה חבילה קטנה יותר או פנה לתמיכה.",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 חזרה", callback_data="coins_menu")]]),
+        )
+        return
+
+    coins[uid] = balance - cost
+    save_json(COINS_FILE, coins)
+
+    await query.edit_message_text(
+        f"⏳ *מעבד את הרכישה...*\n\n"
+        f"🪙 נוכו {cost} מטבעות\n"
+        f"📤 שולח {video_count} סרטונים...",
+        parse_mode="Markdown",
+    )
+
+    sent = await send_videos_to_user(context, user_id, video_count)
+
+    if sent == -1:
+        coins[uid] = balance
+        save_json(COINS_FILE, coins)
+        await context.bot.send_message(
+            chat_id=user_id,
+            text="❌ שגיאה: אין מספיק סרטונים במאגר. המטבעות הוחזרו.",
+        )
+        return
+
+    record_order(user_id, 0, sent, "coins")
+
+    new_balance = coins.get(uid, balance - cost)
+    await context.bot.send_message(
+        chat_id=user_id,
+        text=(
+            f"✅ *רכישה הושלמה בהצלחה!*\n\n"
+            f"🎬 קיבלת *{sent} סרטונים*\n"
+            f"🪙 יתרת מטבעות: *{new_balance}*\n\n"
+            f"תהנה! 🔥"
+        ),
+        parse_mode="Markdown",
+    )
+
+
 async def referrals_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
 
     user = query.from_user
-    bot = context.bot
-    bot_info = await bot.get_me()
+    bot_info = await context.bot.get_me()
     bot_username = bot_info.username
 
     referrals = load_json(REFERRALS_FILE)
@@ -275,16 +433,20 @@ async def wallet_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = query.from_user
     coins = load_json(COINS_FILE)
     balance = coins.get(str(user.id), 0)
-    shekel_value = balance / 10
+    shekel_value = balance / COINS_PER_SHEKEL
 
     text = (
         f"💰 *הארנק שלי*\n\n"
         f"🪙 יתרת מטבעות: *{balance}*\n"
         f"💵 שווי בשקלים: *₪{shekel_value:.1f}*\n\n"
-        f"_10 מטבעות = ₪1_"
+        f"_10 מטבעות = ₪1_\n\n"
+        f"💡 צבור מטבעות על ידי הפניית חברים!"
     )
 
-    buttons = [[InlineKeyboardButton("🔙 חזרה", callback_data="back_main")]]
+    buttons = [
+        [InlineKeyboardButton("🪙 קנה עם מטבעות", callback_data="coins_menu")],
+        [InlineKeyboardButton("🔙 חזרה", callback_data="back_main")],
+    ]
     await query.edit_message_text(
         text,
         parse_mode="Markdown",
@@ -345,13 +507,17 @@ async def admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     today = str(date.today())
     new_today = sum(1 for u in users.values() if u.get("joined") == today)
     total_revenue = sum(o.get("amount", 0) for o in orders)
+    coin_orders = sum(1 for o in orders if o.get("type") == "coins")
+    paypal_orders = sum(1 for o in orders if o.get("type") in ("manual", "paypal"))
 
     text = (
         f"📊 *סטטיסטיקה*\n\n"
         f"👤 סה\"כ משתמשים: *{len(users)}*\n"
         f"🆕 משתמשים חדשים היום: *{new_today}*\n"
-        f"💰 הכנסות כוללות: *₪{total_revenue}*\n"
-        f"🎬 סרטונים במאגר: *{len(videos)}*"
+        f"💰 הכנסות פייפאל: *₪{total_revenue}*\n"
+        f"🎬 סרטונים במאגר: *{len(videos)}*\n\n"
+        f"🧾 הזמנות פייפאל: *{paypal_orders}*\n"
+        f"🪙 הזמנות מטבעות: *{coin_orders}*"
     )
 
     buttons = [[InlineKeyboardButton("🔙 חזרה לפאנל", callback_data="back_admin")]]
@@ -377,8 +543,9 @@ async def admin_orders(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         lines = ["🧾 *10 הזמנות אחרונות:*\n"]
         for o in reversed(last_10):
+            type_icon = "🪙" if o.get("type") == "coins" else "💳"
             lines.append(
-                f"👤 ID: `{o.get('user_id')}` | 💰 ₪{o.get('amount')} | 📅 {o.get('date')} | 🎬 {o.get('videos_count')} סרטונים"
+                f"{type_icon} ID: `{o.get('user_id')}` | ₪{o.get('amount')} | 📅 {o.get('date')} | 🎬 {o.get('videos_count')} סרטונים"
             )
         text = "\n".join(lines)
 
@@ -408,11 +575,7 @@ async def admin_check_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
         return ConversationHandler.END
 
-    try:
-        target_id = str(update.message.text.strip())
-    except ValueError:
-        await update.message.reply_text("❌ ID לא תקין.", reply_markup=get_admin_inline_keyboard())
-        return ConversationHandler.END
+    target_id = update.message.text.strip()
 
     users = load_json(USERS_FILE)
     coins = load_json(COINS_FILE)
@@ -430,6 +593,7 @@ async def admin_check_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
     balance = coins.get(target_id, 0)
     ref_data = referrals.get(target_id, {"count": 0})
     user_orders = [o for o in orders if str(o.get("user_id")) == target_id]
+    coin_orders = [o for o in user_orders if o.get("type") == "coins"]
 
     text = (
         f"🔍 *דוח משתמש*\n\n"
@@ -438,7 +602,9 @@ async def admin_check_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"📅 הצטרף: {user_data.get('joined')}\n"
         f"🪙 מטבעות: {balance}\n"
         f"👥 הפניות: {ref_data.get('count', 0)}\n"
-        f"🛒 רכישות: {len(user_orders)}\n"
+        f"🛒 רכישות סה\"כ: {len(user_orders)}\n"
+        f"   - פייפאל: {len(user_orders) - len(coin_orders)}\n"
+        f"   - מטבעות: {len(coin_orders)}\n"
         f"💰 סה\"כ הוציא: ₪{sum(o.get('amount', 0) for o in user_orders)}"
     )
 
@@ -457,7 +623,6 @@ async def admin_send_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if query.from_user.id != ADMIN_ID:
         return
 
-    context.user_data["admin_action"] = "send"
     await query.edit_message_text("📩 *שליחה למשתמש*\n\nשלח את ההודעה שברצונך לשלוח:", parse_mode="Markdown")
     return ADMIN_SEND_MSG
 
@@ -537,36 +702,18 @@ async def admin_approve_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return ConversationHandler.END
 
-    selected = random.sample(videos, count)
-
     await update.message.reply_text(
         f"📤 שולח {count} סרטונים למשתמש `{target_id}`...",
         parse_mode="Markdown",
     )
 
-    sent = 0
-    for video_file_id in selected:
-        try:
-            await context.bot.send_video(chat_id=target_id, video=video_file_id)
-            sent += 1
-        except Exception:
-            pass
+    sent = await send_videos_to_user(context, target_id, count)
 
-    orders = load_json(ORDERS_FILE)
-    orders.append({
-        "user_id": target_id,
-        "amount": 0,
-        "videos_count": sent,
-        "date": str(date.today()),
-        "type": "manual",
-    })
-    save_json(ORDERS_FILE, orders)
+    if sent == -1:
+        await update.message.reply_text("❌ שגיאה בשליחה.", reply_markup=get_admin_inline_keyboard())
+        return ConversationHandler.END
 
-    users = load_json(USERS_FILE)
-    uid = str(target_id)
-    if uid in users:
-        users[uid]["purchases"] = users[uid].get("purchases", 0) + 1
-        save_json(USERS_FILE, users)
+    record_order(target_id, 0, sent, "manual")
 
     try:
         await context.bot.send_message(
@@ -875,8 +1022,11 @@ def main():
     app.add_handler(broadcast_conv)
     app.add_handler(coins_conv)
 
-    app.add_handler(CallbackQueryHandler(payment_menu, pattern="^payment$"))
-    app.add_handler(CallbackQueryHandler(package_selected, pattern=r"^pkg_\d+$"))
+    app.add_handler(CallbackQueryHandler(payment_method_menu, pattern="^payment_method$"))
+    app.add_handler(CallbackQueryHandler(paypal_menu, pattern="^paypal_menu$"))
+    app.add_handler(CallbackQueryHandler(paypal_package_selected, pattern=r"^pp_\d+$"))
+    app.add_handler(CallbackQueryHandler(coins_menu, pattern="^coins_menu$"))
+    app.add_handler(CallbackQueryHandler(coin_package_buy, pattern=r"^coin_\d+$"))
     app.add_handler(CallbackQueryHandler(referrals_menu, pattern="^referrals$"))
     app.add_handler(CallbackQueryHandler(wallet_menu, pattern="^wallet$"))
     app.add_handler(CallbackQueryHandler(support_menu, pattern="^support$"))
