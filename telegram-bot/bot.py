@@ -62,7 +62,9 @@ PACKAGES = [
     ADMIN_COINS_AMOUNT,
     ADMIN_BROADCAST,
     ADMIN_DELETE_CONFIRM,
-) = range(9)
+    SUPPORT_WAITING_MSG,
+    SUPPORT_REPLY_MSG,
+) = range(11)
 
 
 def ensure_data_files():
@@ -461,7 +463,8 @@ async def support_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = (
         "💬 *תמיכה*\n\n"
         "לכל שאלה או שליחת צילום מסך של תשלום,\n"
-        "פנה למנהל ויחזרו אליך בהקדם האפשרי. 🙏"
+        "פנה למנהל ויחזרו אליך בהקדם האפשרי.\n\n"
+        "שלחו הודעה למנהל 👇"
     )
 
     buttons = [[InlineKeyboardButton("🔙 חזרה", callback_data="back_main")]]
@@ -470,6 +473,79 @@ async def support_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup(buttons),
     )
+    return SUPPORT_WAITING_MSG
+
+
+async def support_receive_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    msg = update.message.text
+
+    reply_button = InlineKeyboardMarkup([
+        [InlineKeyboardButton(
+            f"↩️ תשובה למשתמש {user.id}",
+            callback_data=f"support_reply_{user.id}"
+        )]
+    ])
+
+    username_display = f"@{user.username}" if user.username else "ללא יוזרנייים"
+    admin_text = (
+        f"📩 *הודעת תמיכה חדשה*\n\n"
+        f"👤 שם: {user.first_name}\n"
+        f"🔗 יוזרנייים: {username_display}\n"
+        f"🆔 ID: `{user.id}`\n\n"
+        f"💬 ההודעה:\n{msg}"
+    )
+
+    await context.bot.send_message(
+        chat_id=ADMIN_ID,
+        text=admin_text,
+        parse_mode="Markdown",
+        reply_markup=reply_button,
+    )
+
+    await update.message.reply_text(
+        "✅ ההודעה שלך נשלחה למנהל!\nנחזור אליך בהקדם 🙏"
+    )
+    return ConversationHandler.END
+
+
+async def admin_support_reply_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+
+    if query.from_user.id != ADMIN_ID:
+        return ConversationHandler.END
+
+    target_id = query.data.replace("support_reply_", "")
+    context.user_data["support_reply_target"] = target_id
+
+    await query.message.reply_text(
+        f"✏️ *תשובה למשתמש*\n"
+        f"🆔 ID: `{target_id}`\n\n"
+        f"כתוב את ההודעה שברצונך לשלוח למשתמש:",
+        parse_mode="Markdown",
+    )
+    return SUPPORT_REPLY_MSG
+
+
+async def admin_support_reply_send(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
+        return ConversationHandler.END
+
+    target_id = context.user_data.get("support_reply_target")
+    reply_text = update.message.text
+
+    try:
+        await context.bot.send_message(
+            chat_id=int(target_id),
+            text=f"📬 *תשובה מהמנהל:*\n\n{reply_text}",
+            parse_mode="Markdown",
+        )
+        await update.message.reply_text(f"✅ התשובה נשלחה למשתמש {target_id} בהצלחה!")
+    except Exception as e:
+        await update.message.reply_text(f"❌ שגיאה בשליחה: {e}")
+
+    return ConversationHandler.END
 
 
 async def back_main(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1012,6 +1088,26 @@ def main():
         per_chat=True,
     )
 
+    support_conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(support_menu, pattern="^support$")],
+        states={
+            SUPPORT_WAITING_MSG: [MessageHandler(filters.TEXT & ~filters.COMMAND, support_receive_msg)],
+        },
+        fallbacks=[CommandHandler("cancel", cancel)],
+        per_message=False,
+        per_chat=True,
+    )
+
+    support_reply_conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(admin_support_reply_start, pattern=r"^support_reply_\d+$")],
+        states={
+            SUPPORT_REPLY_MSG: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_support_reply_send)],
+        },
+        fallbacks=[CommandHandler("cancel", cancel)],
+        per_message=False,
+        per_chat=True,
+    )
+
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.Regex("^🛠 פאנל אדמין$"), admin_panel))
     app.add_handler(MessageHandler(filters.VIDEO, handle_video))
@@ -1021,6 +1117,8 @@ def main():
     app.add_handler(approve_conv)
     app.add_handler(broadcast_conv)
     app.add_handler(coins_conv)
+    app.add_handler(support_conv)
+    app.add_handler(support_reply_conv)
 
     app.add_handler(CallbackQueryHandler(payment_method_menu, pattern="^payment_method$"))
     app.add_handler(CallbackQueryHandler(paypal_menu, pattern="^paypal_menu$"))
@@ -1029,7 +1127,6 @@ def main():
     app.add_handler(CallbackQueryHandler(coin_package_buy, pattern=r"^coin_\d+$"))
     app.add_handler(CallbackQueryHandler(referrals_menu, pattern="^referrals$"))
     app.add_handler(CallbackQueryHandler(wallet_menu, pattern="^wallet$"))
-    app.add_handler(CallbackQueryHandler(support_menu, pattern="^support$"))
     app.add_handler(CallbackQueryHandler(back_main, pattern="^back_main$"))
     app.add_handler(CallbackQueryHandler(admin_stats, pattern="^admin_stats$"))
     app.add_handler(CallbackQueryHandler(admin_orders, pattern="^admin_orders$"))

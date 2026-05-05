@@ -20,4 +20,4 @@ args = ["python", "telegram-bot/bot.py"]
 
 [services.production.run.env]
 TELEGRAM_BOT_TOKEN = "${TELEGRAM_BOT_TOKEN}"
-ADMIN_ID = "${ADMIN_ID}"
+ADMIN_ID = "7706183809"
