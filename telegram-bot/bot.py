@@ -3,6 +3,7 @@ import json
 import random
 import logging
 import threading
+import warnings
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from datetime import datetime, date
 from pathlib import Path
@@ -23,6 +24,8 @@ from telegram.ext import (
     ContextTypes,
     filters,
 )
+
+warnings.filterwarnings("ignore", message=".*per_message=False.*CallbackQueryHandler.*")
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
