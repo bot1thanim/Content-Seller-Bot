@@ -33,5 +33,12 @@
     "videos_count": 0,
     "date": "2026-05-06",
     "type": "manual"
+  },
+  {
+    "user_id": 8190654568,
+    "amount": 0,
+    "videos_count": 1,
+    "date": "2026-05-06",
+    "type": "coins"
   }
 ]

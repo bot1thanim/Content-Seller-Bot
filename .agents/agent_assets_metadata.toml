@@ -1,0 +1,8 @@
+uploads = []
+generated = []
+
+[[outputs]]
+id = "S5PYejmfJQRNuazTzBxGX"
+uri = "file://project_backup.zip"
+type = "unspecified"
+title = "Project Full Backup (99.6 MB)"

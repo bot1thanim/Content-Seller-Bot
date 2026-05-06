@@ -12,7 +12,7 @@
     "first_name": "דוד",
     "username": "david12la1",
     "joined": "2026-05-05",
-    "purchases": 2,
+    "purchases": 3,
     "total_spent": 0
   },
   "8462266929": {
@@ -506,6 +506,54 @@
   "678210556": {
     "id": 678210556,
     "first_name": "מתן",
+    "username": null,
+    "joined": "2026-05-06",
+    "purchases": 0,
+    "total_spent": 0
+  },
+  "6840243818": {
+    "id": 6840243818,
+    "first_name": "יונתן",
+    "username": null,
+    "joined": "2026-05-06",
+    "purchases": 0,
+    "total_spent": 0
+  },
+  "7176301753": {
+    "id": 7176301753,
+    "first_name": "Noa",
+    "username": null,
+    "joined": "2026-05-06",
+    "purchases": 0,
+    "total_spent": 0
+  },
+  "1055914801": {
+    "id": 1055914801,
+    "first_name": "שחר",
+    "username": null,
+    "joined": "2026-05-06",
+    "purchases": 0,
+    "total_spent": 0
+  },
+  "705008795": {
+    "id": 705008795,
+    "first_name": "Daniel",
+    "username": null,
+    "joined": "2026-05-06",
+    "purchases": 0,
+    "total_spent": 0
+  },
+  "8745739358": {
+    "id": 8745739358,
+    "first_name": "Mark",
+    "username": null,
+    "joined": "2026-05-06",
+    "purchases": 0,
+    "total_spent": 0
+  },
+  "758137373": {
+    "id": 758137373,
+    "first_name": "שחף",
     "username": null,
     "joined": "2026-05-06",
     "purchases": 0,
