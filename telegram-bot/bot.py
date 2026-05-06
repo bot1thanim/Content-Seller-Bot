@@ -5,7 +5,7 @@ import logging
 import threading
 import warnings
 from http.server import HTTPServer, BaseHTTPRequestHandler
-from datetime import datetime, date
+from datetime import datetime, date, timezone
 from pathlib import Path
 
 from telegram import (
@@ -215,6 +215,11 @@ def record_order(user_id: int, amount: float, videos_count: int, order_type: str
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.message and update.message.date:
+        age = (datetime.now(timezone.utc) - update.message.date).total_seconds()
+        if age > 30:
+            return
+
     user = update.effective_user
     args = context.args
     ref_id = None
