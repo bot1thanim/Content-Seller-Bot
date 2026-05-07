@@ -6,3 +6,9 @@ id = "S5PYejmfJQRNuazTzBxGX"
 uri = "file://project_backup.zip"
 type = "unspecified"
 title = "Project Full Backup (99.6 MB)"
+
+[[outputs]]
+id = "_inYhZ-yByeXK3K5Ty9Mg"
+uri = "file://telegram_bot_github.zip"
+type = "unspecified"
+title = "Telegram Bot — GitHub Ready (25.5 KB)"
