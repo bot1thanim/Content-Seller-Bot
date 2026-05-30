@@ -87,7 +87,7 @@ externalPort = 3001
 
 [userenv.shared]
 ADMIN_ID = "7706183809"
-TELEGRAM_BOT_TOKEN = "8331646432:AAEWzvdR6m85PKQfeC41HP274t3RBAbtai8"
+TELEGRAM_BOT_TOKEN = ""
 
 [nix]
 channel = "stable-25_05"

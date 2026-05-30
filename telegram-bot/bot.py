@@ -1,11 +1,12 @@
 import os
 import json
 import random
+import asyncio
 import logging
 import threading
 import warnings
 from http.server import HTTPServer, BaseHTTPRequestHandler
-from datetime import datetime, date, timezone
+from datetime import datetime, date, timezone, timedelta
 from pathlib import Path
 
 from telegram import (
@@ -38,11 +39,13 @@ ADMIN_ID = int(os.environ.get("ADMIN_ID", "7706183809"))
 PAYPAL_LINK = "https://paypal.me/Eliyas2005"
 
 DATA_DIR = Path("data")
-USERS_FILE = DATA_DIR / "users.json"
-COINS_FILE = DATA_DIR / "coins.json"
+USERS_FILE     = DATA_DIR / "users.json"
+COINS_FILE     = DATA_DIR / "coins.json"
 REFERRALS_FILE = DATA_DIR / "referrals.json"
-VIDEOS_FILE = DATA_DIR / "videos.json"
-ORDERS_FILE = DATA_DIR / "orders.json"
+VIDEOS_FILE    = DATA_DIR / "videos.json"
+ORDERS_FILE    = DATA_DIR / "orders.json"
+COUPONS_FILE   = DATA_DIR / "coupons.json"
+SETTINGS_FILE  = DATA_DIR / "settings.json"
 
 COINS_PER_SHEKEL = 10
 
@@ -66,20 +69,30 @@ PACKAGES = [
     ADMIN_COINS_ID,
     ADMIN_COINS_AMOUNT,
     ADMIN_BROADCAST,
-    ADMIN_DELETE_CONFIRM,
+    ADMIN_BROADCAST_BTN,
     SUPPORT_WAITING_MSG,
     SUPPORT_REPLY_MSG,
-) = range(11)
+    ADMIN_COUPON_CODE,
+    ADMIN_COUPON_COINS,
+    ADMIN_COUPON_EXPIRY,
+    ADMIN_COUPON_LIMIT,
+    COUPON_REDEEM,
+    ADMIN_MULTIPLIER,
+) = range(17)
 
+
+# ─── Data helpers ────────────────────────────────────────────────────────────
 
 def ensure_data_files():
     DATA_DIR.mkdir(exist_ok=True)
     for filepath, default in [
-        (USERS_FILE, {}),
-        (COINS_FILE, {}),
-        (REFERRALS_FILE, {}),
-        (VIDEOS_FILE, []),
-        (ORDERS_FILE, []),
+        (USERS_FILE,    {}),
+        (COINS_FILE,    {}),
+        (REFERRALS_FILE,{}),
+        (VIDEOS_FILE,   []),
+        (ORDERS_FILE,   []),
+        (COUPONS_FILE,  {}),
+        (SETTINGS_FILE, {"referral_multiplier": 1.0}),
     ]:
         if not filepath.exists():
             save_json(filepath, default)
@@ -90,13 +103,31 @@ def load_json(filepath):
         with open(filepath, "r", encoding="utf-8") as f:
             return json.load(f)
     except (json.JSONDecodeError, FileNotFoundError):
-        return {} if "videos" not in str(filepath) and "orders" not in str(filepath) else []
+        if "videos" in str(filepath) or "orders" in str(filepath):
+            return []
+        return {}
 
 
 def save_json(filepath, data):
-    with open(filepath, "w", encoding="utf-8") as f:
+    tmp = Path(str(filepath) + ".tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
+    tmp.replace(filepath)
 
+
+def load_settings():
+    s = load_json(SETTINGS_FILE)
+    if not isinstance(s, dict):
+        s = {}
+    s.setdefault("referral_multiplier", 1.0)
+    return s
+
+
+def save_settings(s):
+    save_json(SETTINGS_FILE, s)
+
+
+# ─── Business logic ──────────────────────────────────────────────────────────
 
 def register_user(user, ref_id=None):
     users = load_json(USERS_FILE)
@@ -123,7 +154,6 @@ def register_user(user, ref_id=None):
                 referrals[ref_key]["count"] += 1
                 referrals[ref_key]["referred_ids"].append(uid)
                 save_json(REFERRALS_FILE, referrals)
-
                 coins = load_json(COINS_FILE)
                 coins[ref_key] = coins.get(ref_key, 0) + 1
                 save_json(COINS_FILE, coins)
@@ -131,59 +161,10 @@ def register_user(user, ref_id=None):
     return users.get(uid, {})
 
 
-def get_main_keyboard(user_id):
-    buttons = [
-        [
-            InlineKeyboardButton("💳 תשלום", callback_data="payment_method"),
-            InlineKeyboardButton("👥 הפניות שלי", callback_data="referrals"),
-        ],
-        [
-            InlineKeyboardButton("💰 ארנק מטבעות", callback_data="wallet"),
-            InlineKeyboardButton("💬 תמיכה", callback_data="support"),
-        ],
-    ]
-    return InlineKeyboardMarkup(buttons)
-
-
-def get_admin_reply_keyboard():
-    return ReplyKeyboardMarkup(
-        [[KeyboardButton("🛠 פאנל אדמין")]],
-        resize_keyboard=True,
-        one_time_keyboard=False,
-    )
-
-
-def get_admin_inline_keyboard():
-    buttons = [
-        [
-            InlineKeyboardButton("📊 סטטיסטיקה", callback_data="admin_stats"),
-            InlineKeyboardButton("🧾 הזמנות", callback_data="admin_orders"),
-        ],
-        [
-            InlineKeyboardButton("🔍 בדוק משתמש", callback_data="admin_check"),
-            InlineKeyboardButton("📩 שלח למשתמש", callback_data="admin_send"),
-        ],
-        [
-            InlineKeyboardButton("✅ אישור תשלום", callback_data="admin_approve"),
-            InlineKeyboardButton("📜 סרטונים", callback_data="admin_videos"),
-        ],
-        [
-            InlineKeyboardButton("📢 הודעה לכולם", callback_data="admin_broadcast"),
-            InlineKeyboardButton("🪙 ניהול מטבעות", callback_data="admin_coins"),
-        ],
-        [
-            InlineKeyboardButton("💾 גיבוי", callback_data="admin_backup"),
-            InlineKeyboardButton("🧹 מחק הכל", callback_data="admin_delete"),
-        ],
-    ]
-    return InlineKeyboardMarkup(buttons)
-
-
 async def send_videos_to_user(context, user_id: int, count: int) -> int:
     videos = load_json(VIDEOS_FILE)
     if len(videos) < count:
         return -1
-
     selected = random.sample(videos, count)
     sent = 0
     for file_id in selected:
@@ -205,7 +186,6 @@ def record_order(user_id: int, amount: float, videos_count: int, order_type: str
         "type": order_type,
     })
     save_json(ORDERS_FILE, orders)
-
     users = load_json(USERS_FILE)
     uid = str(user_id)
     if uid in users:
@@ -213,6 +193,63 @@ def record_order(user_id: int, amount: float, videos_count: int, order_type: str
         users[uid]["total_spent"] = users[uid].get("total_spent", 0) + amount
         save_json(USERS_FILE, users)
 
+
+# ─── Keyboard builders ───────────────────────────────────────────────────────
+
+def get_main_keyboard(user_id):
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("💳 תשלום",         callback_data="payment_method"),
+            InlineKeyboardButton("👥 הפניות שלי",     callback_data="referrals"),
+        ],
+        [
+            InlineKeyboardButton("💰 ארנק מטבעות",   callback_data="wallet"),
+            InlineKeyboardButton("🎟 מימוש קופון",    callback_data="coupon_redeem"),
+        ],
+        [
+            InlineKeyboardButton("💬 תמיכה",          callback_data="support"),
+        ],
+    ])
+
+
+def get_admin_reply_keyboard():
+    return ReplyKeyboardMarkup(
+        [[KeyboardButton("🛠 פאנל אדמין")]],
+        resize_keyboard=True,
+        one_time_keyboard=False,
+    )
+
+
+def get_admin_inline_keyboard():
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("📊 סטטיסטיקה",      callback_data="admin_stats"),
+            InlineKeyboardButton("🧾 הזמנות",          callback_data="admin_orders"),
+        ],
+        [
+            InlineKeyboardButton("🔍 בדוק משתמש",     callback_data="admin_check"),
+            InlineKeyboardButton("📩 שלח למשתמש",     callback_data="admin_send"),
+        ],
+        [
+            InlineKeyboardButton("✅ אישור תשלום",     callback_data="admin_approve"),
+            InlineKeyboardButton("🎬 גלריית סרטונים",  callback_data="admin_gallery"),
+        ],
+        [
+            InlineKeyboardButton("📢 הודעה לכולם",    callback_data="admin_broadcast"),
+            InlineKeyboardButton("🪙 ניהול מטבעות",   callback_data="admin_coins"),
+        ],
+        [
+            InlineKeyboardButton("🎟 ניהול קופונים",  callback_data="admin_coupons"),
+            InlineKeyboardButton("💱 ערך מטבע",       callback_data="admin_multiplier"),
+        ],
+        [
+            InlineKeyboardButton("💾 גיבוי",           callback_data="admin_backup"),
+            InlineKeyboardButton("🧹 מחק הכל",        callback_data="admin_delete"),
+        ],
+    ])
+
+
+# ─── User: /start ─────────────────────────────────────────────────────────────
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.message and update.message.date:
@@ -232,45 +269,53 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     register_user(user, ref_id)
 
-    text = f"שלום {user.first_name} 👋\nברוכים הבאים לבוט התכנים האסורים 🤫\nבחר אפשרות:"
-
     if user.id == ADMIN_ID:
         await update.message.reply_text(
             "👋 ברוך הבא אדמין!",
             reply_markup=get_admin_reply_keyboard(),
         )
 
-    await update.message.reply_text(text, reply_markup=get_main_keyboard(user.id))
+    await update.message.reply_text(
+        f"שלום {user.first_name} 👋\nברוכים הבאים לבוט התכנים האסורים 🤫\nבחר אפשרות:",
+        reply_markup=get_main_keyboard(user.id),
+    )
 
+
+# ─── User: back to main ───────────────────────────────────────────────────────
+
+async def back_main(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    user = query.from_user
+    await query.edit_message_text(
+        f"שלום {user.first_name} 👋\nברוכים הבאים לבוט התכנים האסורים 🤫\nבחר אפשרות:",
+        reply_markup=get_main_keyboard(user.id),
+    )
+
+
+# ─── User: payment ────────────────────────────────────────────────────────────
 
 async def payment_method_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-
     coins = load_json(COINS_FILE)
     balance = coins.get(str(query.from_user.id), 0)
-
-    buttons = [
-        [InlineKeyboardButton("💳 תשלום בפייפאל", callback_data="paypal_menu")],
-        [InlineKeyboardButton(f"🪙 שלם במטבעות (יתרה: {balance})", callback_data="coins_menu")],
-        [InlineKeyboardButton("🔙 חזרה", callback_data="back_main")],
-    ]
     await query.edit_message_text(
         "💰 *בחר אמצעי תשלום:*",
         parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup(buttons),
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("💳 תשלום בפייפאל", callback_data="paypal_menu")],
+            [InlineKeyboardButton(f"🪙 שלם במטבעות (יתרה: {balance})", callback_data="coins_menu")],
+            [InlineKeyboardButton("🔙 חזרה", callback_data="back_main")],
+        ]),
     )
 
 
 async def paypal_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-
-    buttons = []
-    for i, pkg in enumerate(PACKAGES):
-        buttons.append([InlineKeyboardButton(pkg["label_paypal"], callback_data=f"pp_{i}")])
+    buttons = [[InlineKeyboardButton(p["label_paypal"], callback_data=f"pp_{i}")] for i, p in enumerate(PACKAGES)]
     buttons.append([InlineKeyboardButton("🔙 חזרה", callback_data="payment_method")])
-
     await query.edit_message_text(
         "💳 *תשלום בפייפאל – בחר חבילה:*",
         parse_mode="Markdown",
@@ -281,11 +326,9 @@ async def paypal_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def paypal_package_selected(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-
     idx = int(query.data.split("pp_")[1])
     pkg = PACKAGES[idx]
     user_id = query.from_user.id
-
     paypal_url = f"{PAYPAL_LINK}/{pkg['price']}ILS"
     text = (
         f"📦 *חבילה נבחרת:* {pkg['label_paypal']}\n\n"
@@ -294,12 +337,10 @@ async def paypal_package_selected(update: Update, context: ContextTypes.DEFAULT_
         f"שלח את התשלום וציין את ה-ID שלך: `{user_id}`\n"
         f"לאחר מכן שלח צילום מסך לתמיכה ✅"
     )
-
-    buttons = [[InlineKeyboardButton("🔙 חזרה לחבילות", callback_data="paypal_menu")]]
     await query.edit_message_text(
         text,
         parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup(buttons),
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 חזרה לחבילות", callback_data="paypal_menu")]]),
         disable_web_page_preview=False,
     )
 
@@ -307,20 +348,14 @@ async def paypal_package_selected(update: Update, context: ContextTypes.DEFAULT_
 async def coins_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-
-    user_id = str(query.from_user.id)
+    uid = str(query.from_user.id)
     coins = load_json(COINS_FILE)
-    balance = coins.get(user_id, 0)
-
+    balance = coins.get(uid, 0)
     buttons = []
     for i, pkg in enumerate(PACKAGES):
-        affordable = "✅ " if balance >= pkg["coins"] else "🔒 "
-        buttons.append([InlineKeyboardButton(
-            affordable + pkg["label_coins"],
-            callback_data=f"coin_{i}"
-        )])
+        icon = "✅ " if balance >= pkg["coins"] else "🔒 "
+        buttons.append([InlineKeyboardButton(icon + pkg["label_coins"], callback_data=f"coin_{i}")])
     buttons.append([InlineKeyboardButton("🔙 חזרה", callback_data="payment_method")])
-
     await query.edit_message_text(
         f"🪙 *תשלום במטבעות*\n\n💰 יתרתך: *{balance} מטבעות*\n\n✅ = יש מספיק | 🔒 = אין מספיק\nבחר חבילה:",
         parse_mode="Markdown",
@@ -331,12 +366,10 @@ async def coins_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def coin_package_buy(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-
     idx = int(query.data.split("coin_")[1])
     pkg = PACKAGES[idx]
     user_id = query.from_user.id
     uid = str(user_id)
-
     coins = load_json(COINS_FILE)
     balance = coins.get(uid, 0)
     cost = pkg["coins"]
@@ -344,27 +377,20 @@ async def coin_package_buy(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if balance < cost:
         needed = cost - balance
-        buttons = [
-            [InlineKeyboardButton("💳 שלם בפייפאל במקום", callback_data="paypal_menu")],
-            [InlineKeyboardButton("🔙 חזרה לחבילות", callback_data="coins_menu")],
-        ]
         await query.edit_message_text(
-            f"❌ *אין מספיק מטבעות*\n\n"
-            f"🪙 יתרתך: *{balance}*\n"
-            f"🏷 נדרש: *{cost}*\n"
-            f"חסרים לך: *{needed} מטבעות*\n\n"
-            f"צבור מטבעות על ידי הפניית חברים,\nאו שלם בפייפאל 💳",
+            f"❌ *אין מספיק מטבעות*\n\n🪙 יתרתך: *{balance}*\n🏷 נדרש: *{cost}*\nחסרים לך: *{needed} מטבעות*\n\nצבור מטבעות על ידי הפניית חברים,\nאו שלם בפייפאל 💳",
             parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup(buttons),
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("💳 שלם בפייפאל במקום", callback_data="paypal_menu")],
+                [InlineKeyboardButton("🔙 חזרה לחבילות", callback_data="coins_menu")],
+            ]),
         )
         return
 
     videos = load_json(VIDEOS_FILE)
     if len(videos) < video_count:
         await query.edit_message_text(
-            f"⚠️ *המאגר אינו מכיל מספיק סרטונים כרגע*\n\n"
-            f"יש {len(videos)} סרטונים, נדרשים {video_count}.\n"
-            f"נסה חבילה קטנה יותר או פנה לתמיכה.",
+            f"⚠️ *המאגר אינו מכיל מספיק סרטונים כרגע*\n\nיש {len(videos)} סרטונים, נדרשים {video_count}.\nנסה חבילה קטנה יותר.",
             parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 חזרה", callback_data="coins_menu")]]),
         )
@@ -374,9 +400,7 @@ async def coin_package_buy(update: Update, context: ContextTypes.DEFAULT_TYPE):
     save_json(COINS_FILE, coins)
 
     await query.edit_message_text(
-        f"⏳ *מעבד את הרכישה...*\n\n"
-        f"🪙 נוכו {cost} מטבעות\n"
-        f"📤 שולח {video_count} סרטונים...",
+        f"⏳ *מעבד את הרכישה...*\n\n🪙 נוכו {cost} מטבעות\n📤 שולח {video_count} סרטונים...",
         parse_mode="Markdown",
     )
 
@@ -385,103 +409,134 @@ async def coin_package_buy(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if sent == -1:
         coins[uid] = balance
         save_json(COINS_FILE, coins)
-        await context.bot.send_message(
-            chat_id=user_id,
-            text="❌ שגיאה: אין מספיק סרטונים במאגר. המטבעות הוחזרו.",
-        )
+        await context.bot.send_message(chat_id=user_id, text="❌ שגיאה: אין מספיק סרטונים במאגר. המטבעות הוחזרו.")
         return
 
     record_order(user_id, 0, sent, "coins")
-
-    new_balance = coins.get(uid, balance - cost)
+    new_balance = load_json(COINS_FILE).get(uid, 0)
     await context.bot.send_message(
         chat_id=user_id,
-        text=(
-            f"✅ *רכישה הושלמה בהצלחה!*\n\n"
-            f"🎬 קיבלת *{sent} סרטונים*\n"
-            f"🪙 יתרת מטבעות: *{new_balance}*\n\n"
-            f"תהנה! 🔥"
-        ),
+        text=f"✅ *רכישה הושלמה בהצלחה!*\n\n🎬 קיבלת *{sent} סרטונים*\n🪙 יתרת מטבעות: *{new_balance}*\n\nתהנה! 🔥",
         parse_mode="Markdown",
     )
 
+
+# ─── User: referrals & wallet ─────────────────────────────────────────────────
 
 async def referrals_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-
     user = query.from_user
     bot_info = await context.bot.get_me()
-    bot_username = bot_info.username
-
+    ref_link = f"https://t.me/{bot_info.username}?start=ref_{user.id}"
     referrals = load_json(REFERRALS_FILE)
     coins = load_json(COINS_FILE)
-
     ref_data = referrals.get(str(user.id), {"count": 0})
-    ref_count = ref_data.get("count", 0)
-    ref_coins = coins.get(str(user.id), 0)
-
-    ref_link = f"https://t.me/{bot_username}?start=ref_{user.id}"
-    text = (
-        f"👥 *הפניות שלי*\n\n"
-        f"🔗 הקישור שלך:\n`{ref_link}`\n\n"
-        f"👤 אנשים שנרשמו: *{ref_count}*\n"
-        f"🪙 מטבעות שצברת: *{ref_coins}*\n\n"
-        f"שתף את הקישור - כל הצטרפות מזכה אותך במטבע! 🎉"
-    )
-
-    buttons = [[InlineKeyboardButton("🔙 חזרה", callback_data="back_main")]]
     await query.edit_message_text(
-        text,
+        f"👥 *הפניות שלי*\n\n🔗 הקישור שלך:\n`{ref_link}`\n\n"
+        f"👤 אנשים שנרשמו: *{ref_data.get('count', 0)}*\n"
+        f"🪙 מטבעות שצברת: *{coins.get(str(user.id), 0)}*\n\n"
+        f"שתף את הקישור - כל הצטרפות מזכה אותך במטבע! 🎉",
         parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup(buttons),
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 חזרה", callback_data="back_main")]]),
     )
 
 
 async def wallet_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-
-    user = query.from_user
     coins = load_json(COINS_FILE)
-    balance = coins.get(str(user.id), 0)
+    balance = coins.get(str(query.from_user.id), 0)
     shekel_value = balance / COINS_PER_SHEKEL
-
-    text = (
-        f"💰 *הארנק שלי*\n\n"
-        f"🪙 יתרת מטבעות: *{balance}*\n"
-        f"💵 שווי בשקלים: *₪{shekel_value:.1f}*\n\n"
-        f"_10 מטבעות = ₪1_\n\n"
-        f"💡 צבור מטבעות על ידי הפניית חברים!"
-    )
-
-    buttons = [
-        [InlineKeyboardButton("🪙 קנה עם מטבעות", callback_data="coins_menu")],
-        [InlineKeyboardButton("🔙 חזרה", callback_data="back_main")],
-    ]
     await query.edit_message_text(
-        text,
+        f"💰 *הארנק שלי*\n\n🪙 יתרת מטבעות: *{balance}*\n💵 שווי בשקלים: *₪{shekel_value:.1f}*\n\n_10 מטבעות = ₪1_\n\n💡 צבור מטבעות על ידי הפניית חברים!",
         parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup(buttons),
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("🪙 קנה עם מטבעות", callback_data="coins_menu")],
+            [InlineKeyboardButton("🎟 מימוש קופון",   callback_data="coupon_redeem")],
+            [InlineKeyboardButton("🔙 חזרה",          callback_data="back_main")],
+        ]),
     )
 
+
+# ─── User: coupon redemption ──────────────────────────────────────────────────
+
+async def coupon_redeem_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    await query.edit_message_text(
+        "🎟 *מימוש קופון*\n\nהזן את קוד הקופון שלך:",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ ביטול", callback_data="back_main")]]),
+    )
+    return COUPON_REDEEM
+
+
+async def coupon_redeem_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = str(update.effective_user.id)
+    code = update.message.text.strip().upper()
+    today = str(date.today())
+
+    coupons = load_json(COUPONS_FILE)
+    coupon = coupons.get(code)
+
+    if not coupon:
+        await update.message.reply_text(
+            "❌ קוד קופון לא תקין.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 חזרה", callback_data="back_main")]]),
+        )
+        return ConversationHandler.END
+
+    if coupon.get("expires") and coupon["expires"] < today:
+        await update.message.reply_text(
+            "⏰ קוד הקופון הזה פג תוקפו.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 חזרה", callback_data="back_main")]]),
+        )
+        return ConversationHandler.END
+
+    max_uses = coupon.get("max_uses")
+    used_by = coupon.get("used_by", [])
+    if max_uses is not None and len(used_by) >= max_uses:
+        await update.message.reply_text(
+            "🚫 קוד הקופון מוצה לגמרי.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 חזרה", callback_data="back_main")]]),
+        )
+        return ConversationHandler.END
+
+    if user_id in used_by:
+        await update.message.reply_text(
+            "🔄 כבר השתמשת בקופון הזה בעבר.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 חזרה", callback_data="back_main")]]),
+        )
+        return ConversationHandler.END
+
+    coins_reward = coupon["coins"]
+    used_by.append(user_id)
+    coupon["used_by"] = used_by
+    coupons[code] = coupon
+    save_json(COUPONS_FILE, coupons)
+
+    coins = load_json(COINS_FILE)
+    coins[user_id] = coins.get(user_id, 0) + coins_reward
+    save_json(COINS_FILE, coins)
+
+    await update.message.reply_text(
+        f"✅ *הקופון מומש בהצלחה!*\n\n🪙 קיבלת *{coins_reward} מטבעות*\n💰 יתרתך כעת: *{coins[user_id]}*",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 חזרה", callback_data="back_main")]]),
+    )
+    return ConversationHandler.END
+
+
+# ─── User: support ────────────────────────────────────────────────────────────
 
 async def support_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-
-    text = (
-        "💬 *תמיכה*\n\n"
-        "לכל שאלה או שליחת צילום מסך של תשלום,\n"
-        "פנה למנהל ויחזרו אליך בהקדם האפשרי.\n\n"
-        "שלחו הודעה למנהל 👇"
-    )
-
-    buttons = [[InlineKeyboardButton("🔙 חזרה", callback_data="back_main")]]
     await query.edit_message_text(
-        text,
+        "💬 *תמיכה*\n\nלכל שאלה או שליחת צילום מסך של תשלום,\nפנה למנהל ויחזרו אליך בהקדם האפשרי.\n\nכתוב את הודעתך 👇",
         parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup(buttons),
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 חזרה", callback_data="back_main")]]),
     )
     return SUPPORT_WAITING_MSG
 
@@ -489,50 +544,33 @@ async def support_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def support_receive_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     msg = update.message.text
-
-    reply_button = InlineKeyboardMarkup([
-        [InlineKeyboardButton(
-            f"↩️ תשובה למשתמש {user.id}",
-            callback_data=f"support_reply_{user.id}"
-        )]
-    ])
-
     username_display = f"@{user.username}" if user.username else "ללא יוזרנייים"
-    admin_text = (
-        f"📩 *הודעת תמיכה חדשה*\n\n"
-        f"👤 שם: {user.first_name}\n"
-        f"🔗 יוזרנייים: {username_display}\n"
-        f"🆔 ID: `{user.id}`\n\n"
-        f"💬 ההודעה:\n{msg}"
-    )
-
     await context.bot.send_message(
         chat_id=ADMIN_ID,
-        text=admin_text,
+        text=f"📩 *הודעת תמיכה חדשה*\n\n👤 שם: {user.first_name}\n🔗 יוזרנייים: {username_display}\n🆔 ID: `{user.id}`\n\n💬 ההודעה:\n{msg}",
         parse_mode="Markdown",
-        reply_markup=reply_button,
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton(f"↩️ תשובה למשתמש {user.id}", callback_data=f"support_reply_{user.id}")
+        ]]),
     )
-
     await update.message.reply_text(
-        "✅ ההודעה שלך נשלחה למנהל!\nנחזור אליך בהקדם 🙏"
+        "✅ ההודעה שלך נשלחה למנהל!\nנחזור אליך בהקדם 🙏",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 חזרה", callback_data="back_main")]]),
     )
     return ConversationHandler.END
 
 
+# ─── Admin: support reply ─────────────────────────────────────────────────────
+
 async def admin_support_reply_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-
     if query.from_user.id != ADMIN_ID:
         return ConversationHandler.END
-
     target_id = query.data.replace("support_reply_", "")
     context.user_data["support_reply_target"] = target_id
-
     await query.message.reply_text(
-        f"✏️ *תשובה למשתמש*\n"
-        f"🆔 ID: `{target_id}`\n\n"
-        f"כתוב את ההודעה שברצונך לשלוח למשתמש:",
+        f"✏️ *תשובה למשתמש*\n🆔 ID: `{target_id}`\n\nכתוב את ההודעה שברצונך לשלוח:",
         parse_mode="Markdown",
     )
     return SUPPORT_REPLY_MSG
@@ -541,37 +579,24 @@ async def admin_support_reply_start(update: Update, context: ContextTypes.DEFAUL
 async def admin_support_reply_send(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
         return ConversationHandler.END
-
     target_id = context.user_data.get("support_reply_target")
-    reply_text = update.message.text
-
     try:
         await context.bot.send_message(
             chat_id=int(target_id),
-            text=f"📬 *תשובה מהמנהל:*\n\n{reply_text}",
+            text=f"📬 *תשובה מהמנהל:*\n\n{update.message.text}",
             parse_mode="Markdown",
         )
         await update.message.reply_text(f"✅ התשובה נשלחה למשתמש {target_id} בהצלחה!")
     except Exception as e:
         await update.message.reply_text(f"❌ שגיאה בשליחה: {e}")
-
     return ConversationHandler.END
 
 
-async def back_main(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-
-    user = query.from_user
-    text = f"שלום {user.first_name} 👋\nברוכים הבאים לבוט התכנים האסורים 🤫\nבחר אפשרות:"
-    await query.edit_message_text(text, reply_markup=get_main_keyboard(user.id))
-
+# ─── Admin: panel entry ───────────────────────────────────────────────────────
 
 async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    if user.id != ADMIN_ID:
+    if update.effective_user.id != ADMIN_ID:
         return
-
     await update.message.reply_text(
         "🛠 *פאנל אדמין*\nבחר פעולה:",
         parse_mode="Markdown",
@@ -579,136 +604,132 @@ async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def back_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if query.from_user.id != ADMIN_ID:
+        return
+    await query.edit_message_text(
+        "🛠 *פאנל אדמין*\nבחר פעולה:",
+        parse_mode="Markdown",
+        reply_markup=get_admin_inline_keyboard(),
+    )
+
+
+# ─── Admin: stats (enhanced) ──────────────────────────────────────────────────
+
 async def admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-
     if query.from_user.id != ADMIN_ID:
         return
 
-    users = load_json(USERS_FILE)
-    orders = load_json(ORDERS_FILE)
-    videos = load_json(VIDEOS_FILE)
+    users   = load_json(USERS_FILE)
+    orders  = load_json(ORDERS_FILE)
+    videos  = load_json(VIDEOS_FILE)
+    coins   = load_json(COINS_FILE)
 
-    today = str(date.today())
-    new_today = sum(1 for u in users.values() if u.get("joined") == today)
-    total_revenue = sum(o.get("amount", 0) for o in orders)
-    coin_orders = sum(1 for o in orders if o.get("type") == "coins")
-    paypal_orders = sum(1 for o in orders if o.get("type") in ("manual", "paypal"))
+    today     = str(date.today())
+    week_ago  = str(date.today() - timedelta(days=7))
+
+    new_today  = sum(1 for u in users.values() if u.get("joined") == today)
+    new_week   = sum(1 for u in users.values() if u.get("joined", "") >= week_ago)
+
+    total_revenue   = sum(o.get("amount", 0) for o in orders if o.get("type") in ("manual", "paypal"))
+    coin_orders     = sum(1 for o in orders if o.get("type") == "coins")
+    paypal_orders   = sum(1 for o in orders if o.get("type") in ("manual", "paypal"))
+
+    total_coins_issued = sum(coins.values())
 
     text = (
-        f"📊 *סטטיסטיקה*\n\n"
+        f"📊 *סטטיסטיקה מפורטת*\n\n"
         f"👤 סה\"כ משתמשים: *{len(users)}*\n"
-        f"🆕 משתמשים חדשים היום: *{new_today}*\n"
-        f"💰 הכנסות פייפאל: *₪{total_revenue}*\n"
-        f"🎬 סרטונים במאגר: *{len(videos)}*\n\n"
+        f"🆕 חדשים היום: *{new_today}*\n"
+        f"📅 חדשים השבוע: *{new_week}*\n\n"
+        f"💰 הכנסות פייפאל: *₪{total_revenue:.1f}*\n"
         f"🧾 הזמנות פייפאל: *{paypal_orders}*\n"
-        f"🪙 הזמנות מטבעות: *{coin_orders}*"
+        f"🪙 הזמנות מטבעות: *{coin_orders}*\n\n"
+        f"🪙 מטבעות בידי משתמשים: *{int(total_coins_issued)}*\n"
+        f"🎬 סרטונים במאגר: *{len(videos)}*"
     )
 
-    buttons = [[InlineKeyboardButton("🔙 חזרה לפאנל", callback_data="back_admin")]]
     await query.edit_message_text(
         text,
         parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup(buttons),
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 חזרה לפאנל", callback_data="back_admin")]]),
     )
 
+
+# ─── Admin: orders ────────────────────────────────────────────────────────────
 
 async def admin_orders(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-
     if query.from_user.id != ADMIN_ID:
         return
-
     orders = load_json(ORDERS_FILE)
     last_10 = orders[-10:] if len(orders) > 10 else orders
-
     if not last_10:
         text = "🧾 *הזמנות*\n\nאין הזמנות עדיין."
     else:
         lines = ["🧾 *10 הזמנות אחרונות:*\n"]
         for o in reversed(last_10):
-            type_icon = "🪙" if o.get("type") == "coins" else "💳"
-            lines.append(
-                f"{type_icon} ID: `{o.get('user_id')}` | ₪{o.get('amount')} | 📅 {o.get('date')} | 🎬 {o.get('videos_count')} סרטונים"
-            )
+            icon = "🪙" if o.get("type") == "coins" else "💳"
+            lines.append(f"{icon} ID: `{o.get('user_id')}` | ₪{o.get('amount')} | 📅 {o.get('date')} | 🎬 {o.get('videos_count')}")
         text = "\n".join(lines)
-
-    buttons = [[InlineKeyboardButton("🔙 חזרה לפאנל", callback_data="back_admin")]]
     await query.edit_message_text(
         text,
         parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup(buttons),
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 חזרה לפאנל", callback_data="back_admin")]]),
     )
 
+
+# ─── Admin: check user ────────────────────────────────────────────────────────
 
 async def admin_check_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-
     if query.from_user.id != ADMIN_ID:
-        return
-
-    await query.edit_message_text(
-        "🔍 *בדיקת משתמש*\n\nשלח את ה-ID של המשתמש:",
-        parse_mode="Markdown",
-    )
+        return ConversationHandler.END
+    await query.edit_message_text("🔍 *בדיקת משתמש*\n\nשלח את ה-ID של המשתמש:", parse_mode="Markdown")
     return ADMIN_CHECK_USER
 
 
 async def admin_check_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
         return ConversationHandler.END
-
     target_id = update.message.text.strip()
-
     users = load_json(USERS_FILE)
     coins = load_json(COINS_FILE)
     referrals = load_json(REFERRALS_FILE)
     orders = load_json(ORDERS_FILE)
-
     user_data = users.get(target_id)
     if not user_data:
-        await update.message.reply_text(
-            "❌ משתמש לא נמצא.",
-            reply_markup=get_admin_inline_keyboard(),
-        )
+        await update.message.reply_text("❌ משתמש לא נמצא.", reply_markup=get_admin_inline_keyboard())
         return ConversationHandler.END
-
     balance = coins.get(target_id, 0)
     ref_data = referrals.get(target_id, {"count": 0})
     user_orders = [o for o in orders if str(o.get("user_id")) == target_id]
-    coin_orders = [o for o in user_orders if o.get("type") == "coins"]
-
-    text = (
-        f"🔍 *דוח משתמש*\n\n"
-        f"👤 שם: {user_data.get('first_name')}\n"
-        f"🆔 ID: `{target_id}`\n"
-        f"📅 הצטרף: {user_data.get('joined')}\n"
-        f"🪙 מטבעות: {balance}\n"
-        f"👥 הפניות: {ref_data.get('count', 0)}\n"
-        f"🛒 רכישות סה\"כ: {len(user_orders)}\n"
-        f"   - פייפאל: {len(user_orders) - len(coin_orders)}\n"
-        f"   - מטבעות: {len(coin_orders)}\n"
-        f"💰 סה\"כ הוציא: ₪{sum(o.get('amount', 0) for o in user_orders)}"
-    )
-
+    coin_orders_n = sum(1 for o in user_orders if o.get("type") == "coins")
     await update.message.reply_text(
-        text,
+        f"🔍 *דוח משתמש*\n\n👤 שם: {user_data.get('first_name')}\n🆔 ID: `{target_id}`\n"
+        f"📅 הצטרף: {user_data.get('joined')}\n🪙 מטבעות: {balance}\n"
+        f"👥 הפניות: {ref_data.get('count', 0)}\n🛒 רכישות: {len(user_orders)}\n"
+        f"   - פייפאל: {len(user_orders) - coin_orders_n}\n   - מטבעות: {coin_orders_n}\n"
+        f"💰 סה\"כ הוציא: ₪{sum(o.get('amount', 0) for o in user_orders)}",
         parse_mode="Markdown",
         reply_markup=get_admin_inline_keyboard(),
     )
     return ConversationHandler.END
 
 
+# ─── Admin: send to user ──────────────────────────────────────────────────────
+
 async def admin_send_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-
     if query.from_user.id != ADMIN_ID:
-        return
-
+        return ConversationHandler.END
     await query.edit_message_text("📩 *שליחה למשתמש*\n\nשלח את ההודעה שברצונך לשלוח:", parse_mode="Markdown")
     return ADMIN_SEND_MSG
 
@@ -716,7 +737,6 @@ async def admin_send_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def admin_send_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
         return ConversationHandler.END
-
     context.user_data["msg_to_send"] = update.message.text
     await update.message.reply_text("📲 עכשיו שלח את ה-ID של המשתמש:")
     return ADMIN_SEND_ID
@@ -725,30 +745,27 @@ async def admin_send_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def admin_send_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
         return ConversationHandler.END
-
     try:
         target_id = int(update.message.text.strip())
     except ValueError:
         await update.message.reply_text("❌ ID לא תקין.", reply_markup=get_admin_inline_keyboard())
         return ConversationHandler.END
-
     msg = context.user_data.get("msg_to_send", "")
     try:
         await context.bot.send_message(chat_id=target_id, text=msg)
         await update.message.reply_text("✅ ההודעה נשלחה בהצלחה!", reply_markup=get_admin_inline_keyboard())
     except Exception as e:
         await update.message.reply_text(f"❌ שגיאה בשליחה: {e}", reply_markup=get_admin_inline_keyboard())
-
     return ConversationHandler.END
 
+
+# ─── Admin: approve payment ───────────────────────────────────────────────────
 
 async def admin_approve_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-
     if query.from_user.id != ADMIN_ID:
-        return
-
+        return ConversationHandler.END
     await query.edit_message_text("✅ *אישור תשלום*\n\nכמה סרטונים לשלוח?", parse_mode="Markdown")
     return ADMIN_APPROVE_COUNT
 
@@ -756,14 +773,12 @@ async def admin_approve_start(update: Update, context: ContextTypes.DEFAULT_TYPE
 async def admin_approve_count(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
         return ConversationHandler.END
-
     try:
         count = int(update.message.text.strip())
         context.user_data["approve_count"] = count
     except ValueError:
         await update.message.reply_text("❌ מספר לא תקין.")
         return ADMIN_APPROVE_COUNT
-
     await update.message.reply_text(f"📲 מה ה-ID של המשתמש שיקבל {count} סרטונים?")
     return ADMIN_APPROVE_ID
 
@@ -771,84 +786,146 @@ async def admin_approve_count(update: Update, context: ContextTypes.DEFAULT_TYPE
 async def admin_approve_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
         return ConversationHandler.END
-
     try:
         target_id = int(update.message.text.strip())
     except ValueError:
         await update.message.reply_text("❌ ID לא תקין.")
         return ConversationHandler.END
-
     count = context.user_data.get("approve_count", 0)
     videos = load_json(VIDEOS_FILE)
-
     if len(videos) < count:
-        await update.message.reply_text(
-            f"❌ אין מספיק סרטונים במאגר! יש {len(videos)} סרטונים.",
-            reply_markup=get_admin_inline_keyboard(),
-        )
+        await update.message.reply_text(f"❌ אין מספיק סרטונים! יש {len(videos)}.", reply_markup=get_admin_inline_keyboard())
         return ConversationHandler.END
-
-    await update.message.reply_text(
-        f"📤 שולח {count} סרטונים למשתמש `{target_id}`...",
-        parse_mode="Markdown",
-    )
-
+    await update.message.reply_text(f"📤 שולח {count} סרטונים למשתמש `{target_id}`...", parse_mode="Markdown")
     sent = await send_videos_to_user(context, target_id, count)
-
     if sent == -1:
         await update.message.reply_text("❌ שגיאה בשליחה.", reply_markup=get_admin_inline_keyboard())
         return ConversationHandler.END
-
     record_order(target_id, 0, sent, "manual")
-
     try:
-        await context.bot.send_message(
-            chat_id=target_id,
-            text=f"🎉 תשלומך אושר! קיבלת {sent} סרטונים. תהנה! 🔥",
-        )
+        await context.bot.send_message(chat_id=target_id, text=f"🎉 תשלומך אושר! קיבלת {sent} סרטונים. תהנה! 🔥")
     except Exception:
         pass
-
-    await update.message.reply_text(
-        f"✅ נשלחו {sent} סרטונים בהצלחה!",
-        reply_markup=get_admin_inline_keyboard(),
-    )
+    await update.message.reply_text(f"✅ נשלחו {sent} סרטונים בהצלחה!", reply_markup=get_admin_inline_keyboard())
     return ConversationHandler.END
 
 
-async def admin_videos_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# ─── Admin: video gallery ─────────────────────────────────────────────────────
+
+def _gallery_keyboard(idx: int, total: int):
+    rows = []
+    nav = []
+    if idx > 0:
+        nav.append(InlineKeyboardButton("⬅️ קודם", callback_data=f"vid_page_{idx - 1}"))
+    nav.append(InlineKeyboardButton(f"{idx + 1}/{total}", callback_data="noop"))
+    if idx < total - 1:
+        nav.append(InlineKeyboardButton("הבא ➡️", callback_data=f"vid_page_{idx + 1}"))
+    rows.append(nav)
+    rows.append([InlineKeyboardButton("🗑 מחק סרטון זה", callback_data=f"vid_del_{idx}")])
+    rows.append([InlineKeyboardButton("📤 שלח לי את כל הסרטונים", callback_data="vid_send_all")])
+    rows.append([InlineKeyboardButton("🔙 חזרה לפאנל", callback_data="back_admin")])
+    return InlineKeyboardMarkup(rows)
+
+
+async def admin_gallery(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-
     if query.from_user.id != ADMIN_ID:
         return
-
     videos = load_json(VIDEOS_FILE)
-
     if not videos:
-        text = "📜 *סרטונים במאגר*\n\nאין סרטונים עדיין.\nשלח סרטון לבוט כדי להוסיף."
-    else:
-        lines = [f"📜 *סרטונים במאגר ({len(videos)} סה\"כ):*\n"]
-        for i, v in enumerate(videos, 1):
-            short_id = v[:20] + "..." if len(v) > 20 else v
-            lines.append(f"{i}. `{short_id}`")
-        text = "\n".join(lines[:51])
-
-    buttons = [[InlineKeyboardButton("🔙 חזרה לפאנל", callback_data="back_admin")]]
+        await query.edit_message_text(
+            "🎬 *גלריית סרטונים*\n\nאין סרטונים במאגר.\nשלח סרטון לבוט כדי להוסיף.",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 חזרה לפאנל", callback_data="back_admin")]]),
+        )
+        return
     await query.edit_message_text(
-        text,
+        f"🎬 *גלריית סרטונים*\nסה\"כ: *{len(videos)}* סרטונים\n\nסרטון מספר 1:",
         parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup(buttons),
+        reply_markup=_gallery_keyboard(0, len(videos)),
+    )
+    await context.bot.send_video(chat_id=query.from_user.id, video=videos[0])
+
+
+async def admin_gallery_page(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if query.from_user.id != ADMIN_ID:
+        return
+    idx = int(query.data.split("vid_page_")[1])
+    videos = load_json(VIDEOS_FILE)
+    if not videos or idx >= len(videos):
+        await query.answer("אין סרטון בדף זה.", show_alert=True)
+        return
+    await query.edit_message_text(
+        f"🎬 *גלריית סרטונים*\nסה\"כ: *{len(videos)}* סרטונים\n\nסרטון מספר {idx + 1}:",
+        parse_mode="Markdown",
+        reply_markup=_gallery_keyboard(idx, len(videos)),
+    )
+    await context.bot.send_video(chat_id=query.from_user.id, video=videos[idx])
+
+
+async def admin_gallery_delete(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if query.from_user.id != ADMIN_ID:
+        return
+    idx = int(query.data.split("vid_del_")[1])
+    videos = load_json(VIDEOS_FILE)
+    if idx >= len(videos):
+        await query.answer("הסרטון כבר נמחק.", show_alert=True)
+        return
+    videos.pop(idx)
+    save_json(VIDEOS_FILE, videos)
+    if not videos:
+        await query.edit_message_text(
+            "✅ הסרטון נמחק. המאגר ריק כעת.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 חזרה לפאנל", callback_data="back_admin")]]),
+        )
+        return
+    new_idx = min(idx, len(videos) - 1)
+    await query.edit_message_text(
+        f"✅ הסרטון נמחק!\n\n🎬 *גלריית סרטונים*\nסה\"כ: *{len(videos)}* סרטונים\n\nסרטון מספר {new_idx + 1}:",
+        parse_mode="Markdown",
+        reply_markup=_gallery_keyboard(new_idx, len(videos)),
+    )
+    await context.bot.send_video(chat_id=query.from_user.id, video=videos[new_idx])
+
+
+async def admin_gallery_send_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if query.from_user.id != ADMIN_ID:
+        return
+    videos = load_json(VIDEOS_FILE)
+    if not videos:
+        await query.answer("אין סרטונים במאגר.", show_alert=True)
+        return
+    await query.edit_message_text(f"📤 שולח {len(videos)} סרטונים אליך...")
+    sent = 0
+    for file_id in videos:
+        try:
+            await context.bot.send_video(chat_id=ADMIN_ID, video=file_id)
+            sent += 1
+            await asyncio.sleep(0.05)
+        except Exception:
+            pass
+    await context.bot.send_message(
+        chat_id=ADMIN_ID,
+        text=f"✅ נשלחו *{sent}/{len(videos)}* סרטונים.",
+        parse_mode="Markdown",
+        reply_markup=get_admin_inline_keyboard(),
     )
 
+
+# ─── Admin: broadcast (enhanced) ─────────────────────────────────────────────
 
 async def admin_broadcast_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-
     if query.from_user.id != ADMIN_ID:
-        return
-
+        return ConversationHandler.END
     await query.edit_message_text(
         "📢 *הודעה לכולם*\n\nשלח את ההודעה שברצונך לשלוח לכל המשתמשים:",
         parse_mode="Markdown",
@@ -856,84 +933,115 @@ async def admin_broadcast_start(update: Update, context: ContextTypes.DEFAULT_TY
     return ADMIN_BROADCAST
 
 
-async def admin_broadcast_send(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def admin_broadcast_get_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
+        return ConversationHandler.END
+    context.user_data["broadcast_msg"] = update.message.text
+    await update.message.reply_text(
+        "🔗 *כפתור קישור (אופציונלי)*\n\n"
+        "לצירוף כפתור URL לשלוח בפורמט:\n`טקסט הכפתור|https://הקישור`\n\n"
+        "לדוגמה: `לחץ כאן|https://example.com`\n\n"
+        "או שלח *skip* לדלג:",
+        parse_mode="Markdown",
+    )
+    return ADMIN_BROADCAST_BTN
+
+
+async def admin_broadcast_get_btn(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
         return ConversationHandler.END
 
-    msg = update.message.text
+    raw = update.message.text.strip()
+    reply_markup = None
+
+    if raw.lower() != "skip":
+        if "|" in raw:
+            parts = raw.split("|", 1)
+            btn_text = parts[0].strip()
+            btn_url  = parts[1].strip()
+            if btn_url.startswith("http"):
+                reply_markup = InlineKeyboardMarkup([[InlineKeyboardButton(btn_text, url=btn_url)]])
+            else:
+                await update.message.reply_text("❌ קישור לא תקין. מתחיל חייב ב-http/https.")
+                return ADMIN_BROADCAST_BTN
+        else:
+            await update.message.reply_text("❌ פורמט לא תקין. השתמש ב-`טקסט|קישור` או `skip`.", parse_mode="Markdown")
+            return ADMIN_BROADCAST_BTN
+
+    msg = context.user_data.get("broadcast_msg", "")
     users = load_json(USERS_FILE)
     sent = 0
     failed = 0
 
-    await update.message.reply_text(f"📤 שולח הודעה ל-{len(users)} משתמשים...")
+    progress_msg = await update.message.reply_text(f"📤 שולח הודעה ל-{len(users)} משתמשים...")
 
     for uid in users:
         try:
-            await context.bot.send_message(chat_id=int(uid), text=msg)
+            await context.bot.send_message(
+                chat_id=int(uid),
+                text=msg,
+                reply_markup=reply_markup,
+            )
             sent += 1
         except Exception:
             failed += 1
+        if (sent + failed) % 20 == 0:
+            try:
+                await progress_msg.edit_text(f"📤 נשלח: {sent + failed}/{len(users)}...")
+            except Exception:
+                pass
+        await asyncio.sleep(0.05)
 
     await update.message.reply_text(
-        f"✅ ההודעה נשלחה!\n✔️ הצליח: {sent}\n❌ נכשל: {failed}",
+        f"✅ *שליחה הושלמה!*\n\n✔️ הצליח: *{sent}*\n❌ נכשל: *{failed}*",
+        parse_mode="Markdown",
         reply_markup=get_admin_inline_keyboard(),
     )
     return ConversationHandler.END
 
 
+# ─── Admin: coins management ──────────────────────────────────────────────────
+
 async def admin_coins_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-
     if query.from_user.id != ADMIN_ID:
-        return
-
-    await query.edit_message_text(
-        "🪙 *ניהול מטבעות*\n\nשלח את ה-ID של המשתמש:",
-        parse_mode="Markdown",
-    )
+        return ConversationHandler.END
+    await query.edit_message_text("🪙 *ניהול מטבעות*\n\nשלח את ה-ID של המשתמש:", parse_mode="Markdown")
     return ADMIN_COINS_ID
 
 
 async def admin_coins_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
         return ConversationHandler.END
-
     try:
         uid = str(int(update.message.text.strip()))
         context.user_data["coins_target_id"] = uid
     except ValueError:
         await update.message.reply_text("❌ ID לא תקין.")
         return ConversationHandler.END
-
     users = load_json(USERS_FILE)
     coins = load_json(COINS_FILE)
-    current = coins.get(uid, 0)
     user_name = users.get(uid, {}).get("first_name", "לא ידוע")
-
-    await update.message.reply_text(
-        f"👤 משתמש: {user_name}\n🪙 יתרה נוכחית: {current}\n\nשלח כמות (חיובי להוספה, שלילי להורדה):"
-    )
+    current = coins.get(uid, 0)
+    await update.message.reply_text(f"👤 משתמש: {user_name}\n🪙 יתרה נוכחית: {current}\n\nשלח כמות (חיובי להוספה, שלילי להורדה):")
     return ADMIN_COINS_AMOUNT
 
 
 async def admin_coins_amount(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
         return ConversationHandler.END
-
     try:
         amount = int(update.message.text.strip())
     except ValueError:
         await update.message.reply_text("❌ כמות לא תקינה.")
         return ConversationHandler.END
-
     uid = context.user_data.get("coins_target_id")
     coins = load_json(COINS_FILE)
     current = coins.get(uid, 0)
     new_balance = max(0, current + amount)
     coins[uid] = new_balance
     save_json(COINS_FILE, coins)
-
     action = "נוספו ➕" if amount >= 0 else "הוסרו ➖"
     await update.message.reply_text(
         f"✅ עודכן!\n🪙 {abs(amount)} מטבעות {action}\n💰 יתרה חדשה: {new_balance}",
@@ -942,56 +1050,265 @@ async def admin_coins_amount(update: Update, context: ContextTypes.DEFAULT_TYPE)
     return ConversationHandler.END
 
 
+# ─── Admin: coupon management ─────────────────────────────────────────────────
+
+async def admin_coupons_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if query.from_user.id != ADMIN_ID:
+        return
+    coupons = load_json(COUPONS_FILE)
+    lines = ["🎟 *ניהול קופונים*\n"]
+    if coupons:
+        for code, c in coupons.items():
+            uses = len(c.get("used_by", []))
+            max_u = c.get("max_uses", "∞")
+            exp = c.get("expires", "ללא הגבלה")
+            lines.append(f"• `{code}` — 🪙{c['coins']} | משתמשים: {uses}/{max_u} | תפוגה: {exp}")
+    else:
+        lines.append("אין קופונים עדיין.")
+    buttons = [
+        [InlineKeyboardButton("➕ צור קופון חדש", callback_data="admin_coupon_new")],
+    ]
+    if coupons:
+        for code in list(coupons.keys())[:10]:
+            buttons.append([InlineKeyboardButton(f"🗑 מחק {code}", callback_data=f"coupon_del_{code}")])
+    buttons.append([InlineKeyboardButton("🔙 חזרה לפאנל", callback_data="back_admin")])
+    await query.edit_message_text(
+        "\n".join(lines),
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(buttons),
+    )
+
+
+async def admin_coupon_delete(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if query.from_user.id != ADMIN_ID:
+        return
+    code = query.data.replace("coupon_del_", "")
+    coupons = load_json(COUPONS_FILE)
+    if code in coupons:
+        del coupons[code]
+        save_json(COUPONS_FILE, coupons)
+    await admin_coupons_menu(update, context)
+
+
+async def admin_coupon_new_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if query.from_user.id != ADMIN_ID:
+        return ConversationHandler.END
+    await query.edit_message_text("🎟 *קופון חדש*\n\nשלח את *קוד הקופון* (אותיות ומספרים):", parse_mode="Markdown")
+    return ADMIN_COUPON_CODE
+
+
+async def admin_coupon_get_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
+        return ConversationHandler.END
+    code = update.message.text.strip().upper()
+    if not code.replace("_", "").replace("-", "").isalnum():
+        await update.message.reply_text("❌ קוד לא תקין. רק אותיות ומספרים.")
+        return ADMIN_COUPON_CODE
+    coupons = load_json(COUPONS_FILE)
+    if code in coupons:
+        await update.message.reply_text("❌ קוד כבר קיים. בחר קוד אחר.")
+        return ADMIN_COUPON_CODE
+    context.user_data["new_coupon_code"] = code
+    await update.message.reply_text(f"✅ קוד: `{code}`\n\nכמה 🪙 *מטבעות* יקבל המשתמש?", parse_mode="Markdown")
+    return ADMIN_COUPON_COINS
+
+
+async def admin_coupon_get_coins(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
+        return ConversationHandler.END
+    try:
+        coins_val = int(update.message.text.strip())
+        if coins_val <= 0:
+            raise ValueError
+        context.user_data["new_coupon_coins"] = coins_val
+    except ValueError:
+        await update.message.reply_text("❌ מספר לא תקין (חייב להיות חיובי).")
+        return ADMIN_COUPON_COINS
+    await update.message.reply_text(
+        "📅 *תאריך תפוגה* (אופציונלי)\n\nשלח בפורמט `YYYY-MM-DD` (לדוגמה `2025-12-31`)\nאו `skip` לללא הגבלה:",
+        parse_mode="Markdown",
+    )
+    return ADMIN_COUPON_EXPIRY
+
+
+async def admin_coupon_get_expiry(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
+        return ConversationHandler.END
+    raw = update.message.text.strip()
+    if raw.lower() == "skip":
+        context.user_data["new_coupon_expiry"] = None
+    else:
+        try:
+            datetime.strptime(raw, "%Y-%m-%d")
+            context.user_data["new_coupon_expiry"] = raw
+        except ValueError:
+            await update.message.reply_text("❌ פורמט לא תקין. נסה `YYYY-MM-DD` או `skip`.", parse_mode="Markdown")
+            return ADMIN_COUPON_EXPIRY
+    await update.message.reply_text(
+        "👥 *הגבלת כמות משתמשים* (אופציונלי)\n\nשלח מספר מקסימלי של שימושים, או `skip` לללא הגבלה:",
+        parse_mode="Markdown",
+    )
+    return ADMIN_COUPON_LIMIT
+
+
+async def admin_coupon_get_limit(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
+        return ConversationHandler.END
+    raw = update.message.text.strip()
+    max_uses = None
+    if raw.lower() != "skip":
+        try:
+            max_uses = int(raw)
+            if max_uses <= 0:
+                raise ValueError
+        except ValueError:
+            await update.message.reply_text("❌ מספר לא תקין. נסה שוב או `skip`.", parse_mode="Markdown")
+            return ADMIN_COUPON_LIMIT
+
+    code   = context.user_data["new_coupon_code"]
+    coins_val = context.user_data["new_coupon_coins"]
+    expiry = context.user_data.get("new_coupon_expiry")
+
+    coupons = load_json(COUPONS_FILE)
+    coupons[code] = {
+        "coins":    coins_val,
+        "expires":  expiry,
+        "max_uses": max_uses,
+        "used_by":  [],
+    }
+    save_json(COUPONS_FILE, coupons)
+
+    exp_str  = expiry if expiry else "ללא הגבלה"
+    uses_str = str(max_uses) if max_uses else "ללא הגבלה"
+    await update.message.reply_text(
+        f"✅ *קופון נוצר בהצלחה!*\n\n"
+        f"🎟 קוד: `{code}`\n🪙 מטבעות: {coins_val}\n"
+        f"📅 תפוגה: {exp_str}\n👥 מגבלת שימוש: {uses_str}",
+        parse_mode="Markdown",
+        reply_markup=get_admin_inline_keyboard(),
+    )
+    return ConversationHandler.END
+
+
+# ─── Admin: currency multiplier ───────────────────────────────────────────────
+
+async def admin_multiplier_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if query.from_user.id != ADMIN_ID:
+        return ConversationHandler.END
+    settings = load_settings()
+    current = settings.get("referral_multiplier", 1.0)
+    await query.edit_message_text(
+        f"💱 *שינוי ערך המטבע*\n\n"
+        f"מכפיל נוכחי: *{current}x*\n\n"
+        f"שלח מכפיל חדש (לדוגמה: `1.5` או `2`).\n"
+        f"היתרה של כל משתמש תוכפל ביחס החדש.\n\n"
+        f"⚠️ פעולה זו בלתי הפיכה!",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ ביטול", callback_data="back_admin")]]),
+    )
+    return ADMIN_MULTIPLIER
+
+
+async def admin_multiplier_apply(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
+        return ConversationHandler.END
+    try:
+        new_mult = float(update.message.text.strip().replace(",", "."))
+        if new_mult <= 0:
+            raise ValueError
+    except ValueError:
+        await update.message.reply_text("❌ מספר לא תקין (חייב להיות חיובי).")
+        return ADMIN_MULTIPLIER
+
+    settings = load_settings()
+    old_mult = settings.get("referral_multiplier", 1.0)
+    ratio = new_mult / old_mult
+
+    coins = load_json(COINS_FILE)
+    for uid in coins:
+        old_bal = coins[uid]
+        new_bal = round(old_bal * ratio)
+        coins[uid] = new_bal
+    save_json(COINS_FILE, coins)
+
+    settings["referral_multiplier"] = new_mult
+    save_settings(settings)
+
+    await update.message.reply_text(
+        f"✅ *מכפיל עודכן!*\n\n{old_mult}x → {new_mult}x\n\nשולח הודעה לכל המשתמשים...",
+        parse_mode="Markdown",
+    )
+
+    users = load_json(USERS_FILE)
+    sent = 0
+    for uid in users:
+        user_balance = coins.get(uid, 0)
+        try:
+            await context.bot.send_message(
+                chat_id=int(uid),
+                text=(
+                    f"💱 *ערך המטבעות השתנה!*\n\n"
+                    f"יתרתך עודכנה ל-*{user_balance} מטבעות*.\n"
+                    f"כעת תקבל *{new_mult}x* מטבעות על כל הפניה חדשה! 🎉"
+                ),
+                parse_mode="Markdown",
+            )
+            sent += 1
+        except Exception:
+            pass
+        await asyncio.sleep(0.05)
+
+    await update.message.reply_text(
+        f"✅ הודעות נשלחו ל-{sent} משתמשים.",
+        reply_markup=get_admin_inline_keyboard(),
+    )
+    return ConversationHandler.END
+
+
+# ─── Admin: backup & delete ───────────────────────────────────────────────────
+
 async def admin_backup(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-
     if query.from_user.id != ADMIN_ID:
         return
-
     await query.edit_message_text("💾 שולח גיבוי...")
-
-    for filepath in [USERS_FILE, COINS_FILE, REFERRALS_FILE, VIDEOS_FILE, ORDERS_FILE]:
+    for filepath in [USERS_FILE, COINS_FILE, REFERRALS_FILE, VIDEOS_FILE, ORDERS_FILE, COUPONS_FILE, SETTINGS_FILE]:
         if filepath.exists():
             with open(filepath, "rb") as f:
-                await context.bot.send_document(
-                    chat_id=ADMIN_ID,
-                    document=f,
-                    filename=filepath.name,
-                    caption=f"📁 {filepath.name}",
-                )
-
+                await context.bot.send_document(chat_id=ADMIN_ID, document=f, filename=filepath.name, caption=f"📁 {filepath.name}")
     await context.bot.send_message(chat_id=ADMIN_ID, text="✅ הגיבוי הושלם!", reply_markup=get_admin_inline_keyboard())
 
 
 async def admin_delete_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-
     if query.from_user.id != ADMIN_ID:
         return
-
     videos = load_json(VIDEOS_FILE)
-    buttons = [
-        [
-            InlineKeyboardButton("✅ כן, מחק הכל", callback_data="admin_delete_confirm"),
-            InlineKeyboardButton("❌ ביטול", callback_data="back_admin"),
-        ]
-    ]
     await query.edit_message_text(
-        f"🧹 *מחיקת כל הסרטונים*\n\nיש {len(videos)} סרטונים במאגר.\nהאם אתה בטוח שברצונך למחוק הכל?",
+        f"🧹 *מחיקת כל הסרטונים*\n\nיש {len(videos)} סרטונים.\nהאם אתה בטוח?",
         parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup(buttons),
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("✅ כן, מחק הכל", callback_data="admin_delete_confirm"),
+            InlineKeyboardButton("❌ ביטול",       callback_data="back_admin"),
+        ]]),
     )
 
 
 async def admin_delete_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-
     if query.from_user.id != ADMIN_ID:
         return
-
     save_json(VIDEOS_FILE, [])
     await query.edit_message_text(
         "✅ כל הסרטונים נמחקו בהצלחה!",
@@ -999,46 +1316,36 @@ async def admin_delete_confirm(update: Update, context: ContextTypes.DEFAULT_TYP
     )
 
 
-async def back_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-
-    if query.from_user.id != ADMIN_ID:
-        return
-
-    await query.edit_message_text(
-        "🛠 *פאנל אדמין*\nבחר פעולה:",
-        parse_mode="Markdown",
-        reply_markup=get_admin_inline_keyboard(),
-    )
-
+# ─── Video upload handler ─────────────────────────────────────────────────────
 
 async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    if user.id != ADMIN_ID:
+    if update.effective_user.id != ADMIN_ID:
         return
-
     video = update.message.video
     if not video:
         return
-
     file_id = video.file_id
     videos = load_json(VIDEOS_FILE)
-
     if file_id not in videos:
         videos.append(file_id)
         save_json(VIDEOS_FILE, videos)
-        await update.message.reply_text(
-            f"✅ הסרטון נשמר במאגר!\n📦 סה\"כ סרטונים: {len(videos)}"
-        )
+        await update.message.reply_text(f"✅ הסרטון נשמר!\n📦 סה\"כ סרטונים: {len(videos)}")
     else:
         await update.message.reply_text("ℹ️ סרטון זה כבר קיים במאגר.")
+
+
+# ─── Utility ──────────────────────────────────────────────────────────────────
+
+async def noop_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.callback_query.answer()
 
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("❌ הפעולה בוטלה.", reply_markup=get_admin_inline_keyboard())
     return ConversationHandler.END
 
+
+# ─── Health server ────────────────────────────────────────────────────────────
 
 class _HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
@@ -1059,8 +1366,10 @@ def _start_health_server():
         logger.info(f"Health check server listening on port {port}")
         server.serve_forever()
     except OSError:
-        logger.warning(f"Health server could not bind to port {port} (dev mode — OK in production)")
+        logger.warning(f"Health server could not bind to port {port}")
 
+
+# ─── Main ─────────────────────────────────────────────────────────────────────
 
 def main():
     ensure_data_files()
@@ -1074,53 +1383,72 @@ def main():
 
     app = Application.builder().token(TOKEN).build()
 
+    # ── Conversation handlers (registered first) ──────────────────────────────
+
     check_conv = ConversationHandler(
         entry_points=[CallbackQueryHandler(admin_check_start, pattern="^admin_check$")],
         states={ADMIN_CHECK_USER: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_check_user)]},
         fallbacks=[CommandHandler("cancel", cancel)],
-        per_message=False,
-        per_chat=True,
+        per_message=False, per_chat=True,
     )
 
     send_conv = ConversationHandler(
         entry_points=[CallbackQueryHandler(admin_send_start, pattern="^admin_send$")],
         states={
             ADMIN_SEND_MSG: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_send_msg)],
-            ADMIN_SEND_ID: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_send_id)],
+            ADMIN_SEND_ID:  [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_send_id)],
         },
         fallbacks=[CommandHandler("cancel", cancel)],
-        per_message=False,
-        per_chat=True,
+        per_message=False, per_chat=True,
     )
 
     approve_conv = ConversationHandler(
         entry_points=[CallbackQueryHandler(admin_approve_start, pattern="^admin_approve$")],
         states={
             ADMIN_APPROVE_COUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_approve_count)],
-            ADMIN_APPROVE_ID: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_approve_id)],
+            ADMIN_APPROVE_ID:    [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_approve_id)],
         },
         fallbacks=[CommandHandler("cancel", cancel)],
-        per_message=False,
-        per_chat=True,
+        per_message=False, per_chat=True,
     )
 
     broadcast_conv = ConversationHandler(
         entry_points=[CallbackQueryHandler(admin_broadcast_start, pattern="^admin_broadcast$")],
-        states={ADMIN_BROADCAST: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_broadcast_send)]},
+        states={
+            ADMIN_BROADCAST:     [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_broadcast_get_msg)],
+            ADMIN_BROADCAST_BTN: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_broadcast_get_btn)],
+        },
         fallbacks=[CommandHandler("cancel", cancel)],
-        per_message=False,
-        per_chat=True,
+        per_message=False, per_chat=True,
     )
 
     coins_conv = ConversationHandler(
         entry_points=[CallbackQueryHandler(admin_coins_start, pattern="^admin_coins$")],
         states={
-            ADMIN_COINS_ID: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_coins_id)],
+            ADMIN_COINS_ID:     [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_coins_id)],
             ADMIN_COINS_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_coins_amount)],
         },
         fallbacks=[CommandHandler("cancel", cancel)],
-        per_message=False,
-        per_chat=True,
+        per_message=False, per_chat=True,
+    )
+
+    coupon_new_conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(admin_coupon_new_start, pattern="^admin_coupon_new$")],
+        states={
+            ADMIN_COUPON_CODE:   [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_coupon_get_code)],
+            ADMIN_COUPON_COINS:  [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_coupon_get_coins)],
+            ADMIN_COUPON_EXPIRY: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_coupon_get_expiry)],
+            ADMIN_COUPON_LIMIT:  [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_coupon_get_limit)],
+        },
+        fallbacks=[CommandHandler("cancel", cancel)],
+        per_message=False, per_chat=True,
+    )
+
+    multiplier_conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(admin_multiplier_start, pattern="^admin_multiplier$")],
+        states={ADMIN_MULTIPLIER: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_multiplier_apply)]},
+        fallbacks=[CommandHandler("cancel", cancel)],
+        per_message=False, per_chat=True,
     )
 
     support_conv = ConversationHandler(
@@ -1135,47 +1463,67 @@ def main():
             CommandHandler("cancel", cancel),
             CallbackQueryHandler(back_main, pattern="^back_main$"),
         ],
-        per_message=False,
-        per_chat=True,
+        per_message=False, per_chat=True,
+    )
+
+    coupon_redeem_conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(coupon_redeem_start, pattern="^coupon_redeem$")],
+        states={COUPON_REDEEM: [MessageHandler(filters.TEXT & ~filters.COMMAND, coupon_redeem_input)]},
+        fallbacks=[
+            CommandHandler("cancel", cancel),
+            CallbackQueryHandler(back_main, pattern="^back_main$"),
+        ],
+        per_message=False, per_chat=True,
     )
 
     support_reply_conv = ConversationHandler(
         entry_points=[CallbackQueryHandler(admin_support_reply_start, pattern=r"^support_reply_\d+$")],
-        states={
-            SUPPORT_REPLY_MSG: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_support_reply_send)],
-        },
+        states={SUPPORT_REPLY_MSG: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_support_reply_send)]},
         fallbacks=[CommandHandler("cancel", cancel)],
-        per_message=False,
-        per_chat=True,
+        per_message=False, per_chat=True,
     )
 
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(MessageHandler(filters.Regex("^🛠 פאנל אדמין$"), admin_panel))
-    app.add_handler(MessageHandler(filters.VIDEO, handle_video))
-
+    # ── Register conversation handlers ─────────────────────────────────────────
     app.add_handler(check_conv)
     app.add_handler(send_conv)
     app.add_handler(approve_conv)
     app.add_handler(broadcast_conv)
     app.add_handler(coins_conv)
+    app.add_handler(coupon_new_conv)
+    app.add_handler(multiplier_conv)
     app.add_handler(support_conv)
+    app.add_handler(coupon_redeem_conv)
     app.add_handler(support_reply_conv)
 
-    app.add_handler(CallbackQueryHandler(payment_method_menu, pattern="^payment_method$"))
-    app.add_handler(CallbackQueryHandler(paypal_menu, pattern="^paypal_menu$"))
+    # ── Command handlers ───────────────────────────────────────────────────────
+    app.add_handler(CommandHandler("start", start))
+
+    # ── Message handlers ───────────────────────────────────────────────────────
+    app.add_handler(MessageHandler(filters.Regex("^🛠 פאנל אדמין$"), admin_panel))
+    app.add_handler(MessageHandler(filters.VIDEO, handle_video))
+
+    # ── Standalone callback handlers ───────────────────────────────────────────
+    app.add_handler(CallbackQueryHandler(noop_callback,           pattern="^noop$"))
+    app.add_handler(CallbackQueryHandler(payment_method_menu,     pattern="^payment_method$"))
+    app.add_handler(CallbackQueryHandler(paypal_menu,             pattern="^paypal_menu$"))
     app.add_handler(CallbackQueryHandler(paypal_package_selected, pattern=r"^pp_\d+$"))
-    app.add_handler(CallbackQueryHandler(coins_menu, pattern="^coins_menu$"))
-    app.add_handler(CallbackQueryHandler(coin_package_buy, pattern=r"^coin_\d+$"))
-    app.add_handler(CallbackQueryHandler(referrals_menu, pattern="^referrals$"))
-    app.add_handler(CallbackQueryHandler(wallet_menu, pattern="^wallet$"))
-    app.add_handler(CallbackQueryHandler(back_main, pattern="^back_main$"))
-    app.add_handler(CallbackQueryHandler(admin_stats, pattern="^admin_stats$"))
-    app.add_handler(CallbackQueryHandler(admin_orders, pattern="^admin_orders$"))
-    app.add_handler(CallbackQueryHandler(admin_videos_list, pattern="^admin_videos$"))
-    app.add_handler(CallbackQueryHandler(admin_backup, pattern="^admin_backup$"))
-    app.add_handler(CallbackQueryHandler(admin_delete_start, pattern="^admin_delete$"))
-    app.add_handler(CallbackQueryHandler(admin_delete_confirm, pattern="^admin_delete_confirm$"))
-    app.add_handler(CallbackQueryHandler(back_admin, pattern="^back_admin$"))
+    app.add_handler(CallbackQueryHandler(coins_menu,              pattern="^coins_menu$"))
+    app.add_handler(CallbackQueryHandler(coin_package_buy,        pattern=r"^coin_\d+$"))
+    app.add_handler(CallbackQueryHandler(referrals_menu,          pattern="^referrals$"))
+    app.add_handler(CallbackQueryHandler(wallet_menu,             pattern="^wallet$"))
+    app.add_handler(CallbackQueryHandler(back_main,               pattern="^back_main$"))
+    app.add_handler(CallbackQueryHandler(admin_stats,             pattern="^admin_stats$"))
+    app.add_handler(CallbackQueryHandler(admin_orders,            pattern="^admin_orders$"))
+    app.add_handler(CallbackQueryHandler(admin_gallery,           pattern="^admin_gallery$"))
+    app.add_handler(CallbackQueryHandler(admin_gallery_page,      pattern=r"^vid_page_\d+$"))
+    app.add_handler(CallbackQueryHandler(admin_gallery_delete,    pattern=r"^vid_del_\d+$"))
+    app.add_handler(CallbackQueryHandler(admin_gallery_send_all,  pattern="^vid_send_all$"))
+    app.add_handler(CallbackQueryHandler(admin_coupons_menu,      pattern="^admin_coupons$"))
+    app.add_handler(CallbackQueryHandler(admin_coupon_delete,     pattern=r"^coupon_del_"))
+    app.add_handler(CallbackQueryHandler(admin_backup,            pattern="^admin_backup$"))
+    app.add_handler(CallbackQueryHandler(admin_delete_start,      pattern="^admin_delete$"))
+    app.add_handler(CallbackQueryHandler(admin_delete_confirm,    pattern="^admin_delete_confirm$"))
+    app.add_handler(CallbackQueryHandler(back_admin,              pattern="^back_admin$"))
 
     logger.info("הבוט מופעל... 🚀")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
