@@ -1,3 +1,4 @@
 {
-  "referral_multiplier": 1.0
+  "referral_multiplier": 1.0,
+  "maintenance": true
 }
