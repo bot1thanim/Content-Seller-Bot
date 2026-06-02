@@ -510,7 +510,7 @@ async def wallet_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     coins   = load_json(COINS_FILE)
     balance = coins.get(str(query.from_user.id), 0)
     await query.edit_message_text(
-        f"💰 *הארנק שלי*\n\n🪙 יתרה: *{balance}*\n💵 שווי: *₪{balance / COINS_PER_SHEKEL:.1f}*\n\n_10 מטבעות = ₪1_\n\n💡 צבור מטבעות על ידי הפניית חברים!",
+        f"💰 *הארנק שלי*\n\n🪙 יתרה: *{balance}*\n💵 שווי: *₪{balance / COINS_PER_SHEKEL:.1f}*\n\n_10 מטבעות = ₪1_\n\n💸 צבור מטבעות על ידי הפניית חברים!",
         parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup([
             [InlineKeyboardButton("🪙 קנה עם מטבעות", callback_data="coins_menu")],
