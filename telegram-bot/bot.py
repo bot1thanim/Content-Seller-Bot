@@ -1798,18 +1798,24 @@ def main():
     logger.info("הבוט מופעל... 🚀")
     
     # Fix for asyncio event loop issue in some environments
+    import asyncio
+    import sys
+
+    async def run_application():
+        await app.initialize()
+        await app.start()
+        await app.updater.start_polling(allowed_updates=Update.ALL_TYPES)
+        # Keep the bot running
+        while True:
+            await asyncio.sleep(3600)
+
     try:
-        app.run_polling(allowed_updates=Update.ALL_TYPES)
-    except RuntimeError as e:
-        if "There is no current event loop" in str(e):
-            asyncio.run(app.initialize())
-            asyncio.run(app.start())
-            asyncio.run(app.updater.start_polling(allowed_updates=Update.ALL_TYPES))
-            # Keep the loop running
-            loop = asyncio.get_event_loop()
-            loop.run_forever()
+        if sys.version_info >= (3, 11):
+            asyncio.run(run_application())
         else:
-            raise e
+            app.run_polling(allowed_updates=Update.ALL_TYPES)
+    except Exception as e:
+        logger.error(f"Error starting bot: {e}")
 
 
 if __name__ == "__main__":
