@@ -1796,7 +1796,20 @@ def main():
         app.add_handler(CallbackQueryHandler(handler, pattern=pattern))
 
     logger.info("הבוט מופעל... 🚀")
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+    
+    # Fix for asyncio event loop issue in some environments
+    try:
+        app.run_polling(allowed_updates=Update.ALL_TYPES)
+    except RuntimeError as e:
+        if "There is no current event loop" in str(e):
+            asyncio.run(app.initialize())
+            asyncio.run(app.start())
+            asyncio.run(app.updater.start_polling(allowed_updates=Update.ALL_TYPES))
+            # Keep the loop running
+            loop = asyncio.get_event_loop()
+            loop.run_forever()
+        else:
+            raise e
 
 
 if __name__ == "__main__":
