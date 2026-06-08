@@ -411,22 +411,36 @@ async def daily_bonus(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = str(query.from_user.id)
     users = load_json(USERS_FILE)
     user_data = users.get(uid, {})
-    last_bonus = user_data.get("last_bonus")
-    today = str(date.today())
     
-    if last_bonus == today:
-        await query.answer("❌ כבר קיבלת את המתנה היומית היום! חזור מחר.", show_alert=True)
+    # Use timestamp for exact 24h timer
+    last_bonus_ts = user_data.get("last_bonus_ts", 0)
+    now_ts = time.time()
+    
+    if now_ts - last_bonus_ts < 24 * 3600:
+        remaining = int(24 * 3600 - (now_ts - last_bonus_ts))
+        hours = remaining // 3600
+        minutes = (remaining % 3600) // 60
+        await query.answer(f"⏳ נשאר עוד {hours} שעות ו-{minutes} דקות לקבלת המתנה הבאה!", show_alert=True)
         return
         
-    user_data["last_bonus"] = today
+    bonus_amount = 1
+    user_data["last_bonus_ts"] = now_ts
+    user_data["last_bonus"] = str(date.today()) # Keep for legacy compatibility
     users[uid] = user_data
     save_json(USERS_FILE, users)
     
     coins = load_json(COINS_FILE)
-    coins[uid] = coins.get(uid, 0) + 1
+    old_balance = coins.get(uid, 0)
+    new_balance = old_balance + bonus_amount
+    coins[uid] = new_balance
     save_json(COINS_FILE, coins)
     
-    await query.answer("🎁 קיבלת 1 מטבע מתנה! תתחדש.", show_alert=True)
+    await query.answer(
+        f"🎁 קיבלת {bonus_amount} מטבע מתנה!\n\n"
+        f"💰 יתרה קודמת: {old_balance}\n"
+        f"🆕 יתרה חדשה: {new_balance}",
+        show_alert=True
+    )
     await back_main(update, context)
 
 # ─── VIP Info ────────────────────────────────────────────────────────────────
