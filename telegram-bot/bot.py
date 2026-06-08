@@ -114,7 +114,7 @@ def ensure_data_files():
         (VIDEOS_FILE,    []),
         (ORDERS_FILE,    []),
         (COUPONS_FILE,   {}),
-        (SETTINGS_FILE,  {"referral_multiplier": 1.0, "maintenance": False, "categories": ["כללי"]}),
+        (SETTINGS_FILE,  {"referral_multiplier": 1.0, "maintenance": False}),
     ]
     for filepath, default in defaults:
         if not filepath.exists():
@@ -128,7 +128,7 @@ def load_json(filepath):
             if "videos.json" in str(filepath) and isinstance(data, list) and data and isinstance(data[0], str):
                 new_data = []
                 for fid in data:
-                    new_data.append({"file_id": fid, "category": "כללי", "duration": 0, "preview": None})
+                    new_data.append({"file_id": fid, "duration": 0, "preview": None})
                 return new_data
             return data
     except (json.JSONDecodeError, FileNotFoundError):
@@ -148,7 +148,7 @@ def load_settings() -> dict:
         s = {}
     s.setdefault("referral_multiplier", 1.0)
     s.setdefault("maintenance", False)
-    s.setdefault("categories", ["כללי"])
+        # s.setdefault("categories", ["כללי"])
     return s
 
 def save_settings(s: dict):
@@ -206,18 +206,14 @@ def register_user(user, ref_id=None):
                 save_json(COINS_FILE, coins)
     return users.get(uid, {})
 
-async def send_videos_to_user(context, user_id: int, count: int, category: str = None) -> int:
+async def send_videos_to_user(context, user_id: int, count: int) -> int:
     all_videos = load_json(VIDEOS_FILE)
     users = load_json(USERS_FILE)
     uid = str(user_id)
     user_data = users.get(uid, {})
     seen = user_data.get("seen_videos", [])
     
-    # Filter by category if specified
-    if category:
-        pool = [v for v in all_videos if v.get("category") == category]
-    else:
-        pool = all_videos
+    pool = all_videos
         
     # Sort pool by duration (ascending)
     pool.sort(key=lambda x: x.get("duration", 0))
@@ -1644,15 +1640,11 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data["last_upload_fid"] = file_id
     context.user_data["last_upload_dur"] = duration
     
-    settings = load_settings()
-    cats = settings.get("categories", ["כללי"])
-    btns = [[InlineKeyboardButton(c, callback_data=f"cat_sel_{c}")] for c in cats]
-    
     await update.message.reply_text(
-        f"🎬 סרטון התקבל! (אורך: {duration} שניות)\nבחר קטגוריה:",
-        reply_markup=InlineKeyboardMarkup(btns)
+        f"🎬 סרטון התקבל! (אורך: {duration} שניות)\n\nשלח עכשיו תמונה או סרטון קצר שישמשו כ**דוגמה (Preview)**, או שלח `skip` לדלג:",
+        parse_mode="Markdown"
     )
-    return ADMIN_VIDEO_CAT
+    return ADMIN_VIDEO_PREVIEW
 
 async def admin_video_cat_sel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -1678,18 +1670,16 @@ async def admin_video_preview_receive(update: Update, context: ContextTypes.DEFA
     
     file_id = context.user_data.get("last_upload_fid")
     duration = context.user_data.get("last_upload_dur")
-    cat = context.user_data.get("last_upload_cat")
-    
     videos = load_json(VIDEOS_FILE)
     videos.append({
         "file_id": file_id,
         "duration": duration,
-        "category": cat,
+        "category": "כללי",
         "preview": preview
     })
     save_json(VIDEOS_FILE, videos)
     
-    await update.message.reply_text(f"✅ הסרטון נשמר בהצלחה!\n📂 קטגוריה: {cat}\n⏱ אורך: {duration} שניות\n🖼 דוגמה: {'כן' if preview else 'לא'}")
+    await update.message.reply_text(f"✅ הסרטון נשמר בהצלחה!\n⏱ אורך: {duration} שניות\n🖼 דוגמה: {'כן' if preview else 'לא'}")
     return ConversationHandler.END
 
 # ─── Utility ──────────────────────────────────────────────────────────────────
@@ -1861,7 +1851,6 @@ def main():
     video_upload_conv = ConversationHandler(
         entry_points=[MessageHandler(filters.VIDEO, handle_video)],
         states={
-            ADMIN_VIDEO_CAT: [CallbackQueryHandler(admin_video_cat_sel, pattern="^cat_sel_")],
             ADMIN_VIDEO_PREVIEW: [
                 MessageHandler(filters.PHOTO | filters.VIDEO, admin_video_preview_receive),
                 MessageHandler(filters.Regex("^skip$"), admin_video_preview_receive)
