@@ -1643,57 +1643,43 @@ async def admin_maintenance_toggle(update: Update, context: ContextTypes.DEFAULT
 # ─── Video upload ─────────────────────────────────────────────────────────────
 
 async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """מטפל בסרטון שנשלח על ידי האדמין - מכניס ישירות למערכת ללא שאלות."""
     if update.effective_user.id != ADMIN_ID:
         return
     video = update.message.video
     if not video:
         return
-    
+
     file_id = video.file_id
     duration = video.duration
-    context.user_data["last_upload_fid"] = file_id
-    context.user_data["last_upload_dur"] = duration
-    
+
+    videos = load_json(VIDEOS_FILE)
+    videos.append({
+        "file_id": file_id,
+        "duration": duration,
+        "category": "כללי",
+        "preview": None
+    })
+    save_json(VIDEOS_FILE, videos)
+
     await update.message.reply_text(
-        f"🎬 סרטון התקבל! (אורך: {duration} שניות)\n\nשלח עכשיו תמונה או סרטון קצר שישמשו כ**דוגמה (Preview)**, או שלח `skip` לדלג:",
-        parse_mode="Markdown"
+        f"✅ סרטון נשמר! (אורך: {duration} שניות | סה\"כ בספרייה: {len(videos)})"
     )
-    return ADMIN_VIDEO_PREVIEW
 
 async def admin_video_cat_sel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     cat = query.data.replace("cat_sel_", "")
     context.user_data["last_upload_cat"] = cat
-    
     await query.edit_message_text(
-        f"✅ קטגוריה: *{cat}*\n\nשלח עכשיו תמונה או סרטון קצר שישמשו כ**דוגמה (Preview)**, או שלח `skip` לדלג:",
+        f"✅ קטגוריה: *{cat}* נשמרה.",
         parse_mode="Markdown"
     )
-    return ADMIN_VIDEO_PREVIEW
 
 async def admin_video_preview_receive(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """פונקציה שמורה לתאימות אחורה - לא בשימוש פעיל."""
     if update.effective_user.id != ADMIN_ID:
         return ConversationHandler.END
-    
-    preview = None
-    if update.message.photo:
-        preview = ("photo", update.message.photo[-1].file_id)
-    elif update.message.video:
-        preview = ("video", update.message.video.file_id)
-    
-    file_id = context.user_data.get("last_upload_fid")
-    duration = context.user_data.get("last_upload_dur")
-    videos = load_json(VIDEOS_FILE)
-    videos.append({
-        "file_id": file_id,
-        "duration": duration,
-        "category": "כללי",
-        "preview": preview
-    })
-    save_json(VIDEOS_FILE, videos)
-    
-    await update.message.reply_text(f"✅ הסרטון נשמר בהצלחה!\n⏱ אורך: {duration} שניות\n🖼 דוגמה: {'כן' if preview else 'לא'}")
     return ConversationHandler.END
 
 # ─── Utility ──────────────────────────────────────────────────────────────────
@@ -1862,26 +1848,16 @@ def main():
         fallbacks=[CommandHandler("cancel", cancel)],
         per_message=False, per_chat=True,
     )
-    video_upload_conv = ConversationHandler(
-        entry_points=[MessageHandler(filters.VIDEO, handle_video)],
-        states={
-            ADMIN_VIDEO_PREVIEW: [
-                MessageHandler(filters.PHOTO | filters.VIDEO, admin_video_preview_receive),
-                MessageHandler(filters.Regex("^skip$"), admin_video_preview_receive)
-            ],
-        },
-        fallbacks=[CommandHandler("cancel", cancel)],
-        per_message=False, per_chat=True,
-    )
-
-    # ── Register handlers ─────────────────────────────────────────────────────
+    # ── Register handlers ─────────────────────────────────────────────────────────────────────────────
     for conv in [
         check_conv, send_conv, approve_conv, broadcast_conv, coins_conv,
         coupon_new_conv, multiplier_conv, restore_conv, global_reset_conv,
         video_search_conv, support_conv, coupon_redeem_conv, support_reply_conv,
-        video_upload_conv,
     ]:
         app.add_handler(conv)
+
+    # טיפול ישיר בסרטונים שנשלחים על ידי האדמין - ללא ConversationHandler כדי לתמוך בשליחת מספר סרטונים בו-זמנית
+    app.add_handler(MessageHandler(filters.VIDEO, handle_video))
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.Regex("^🛠 פאנל אדמין$"), admin_panel))
