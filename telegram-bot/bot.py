@@ -100,7 +100,9 @@ VIP_LEVELS = [
     ADMIN_VIDEO_CAT,          # 21
     ADMIN_VIDEO_PREVIEW,      # 22
     ADMIN_BROADCAST_MEDIA,    # 23
-) = range(24)
+    ADMIN_VIP_ID,             # 24
+    ADMIN_VIP_LEVEL,          # 25
+) = range(26)
 
 
 # ─── Data helpers ─────────────────────────────────────────────────────────────
@@ -148,7 +150,7 @@ def load_settings() -> dict:
         s = {}
     s.setdefault("referral_multiplier", 1.0)
     s.setdefault("maintenance", False)
-        # s.setdefault("categories", ["כללי"])
+    s.setdefault("waiting_users", [])
     return s
 
 def save_settings(s: dict):
@@ -338,6 +340,9 @@ def get_admin_inline_keyboard():
             InlineKeyboardButton("🪙 ניהול מטבעות",   callback_data="admin_coins"),
         ],
         [
+            InlineKeyboardButton("💎 ניהול דרגות",    callback_data="admin_vip"),
+        ],
+        [
             InlineKeyboardButton("🎟 ניהול קופונים",  callback_data="admin_coupons"),
             InlineKeyboardButton("💱 ערך מטבע",       callback_data="admin_multiplier"),
         ],
@@ -359,9 +364,18 @@ async def maintenance_gate(update: Update) -> bool:
         return False
     if not is_maintenance():
         return False
-    msg = "🔧 *הבוט בשיפוצים*\n\nנחזור בקרוב! 🙏"
+    
+    # רישום המשתמש ברשימת ההמתנה אם הוא לא שם
+    if update.effective_user:
+        settings = load_settings()
+        uid = update.effective_user.id
+        if uid not in settings.get("waiting_users", []):
+            settings["waiting_users"].append(uid)
+            save_settings(settings)
+            
+    msg = "🔧 *הבוט בשיפוצים*\n\nנחזור בקרוב! 🙏\n\n*אל דאגה! רשמנו אותך, ונשלח לך הודעה ברגע שנחזור לפעילות!* ✅"
     if update.callback_query:
-        await update.callback_query.answer("הבוט בשיפוצים, חזרו בקרוב!", show_alert=True)
+        await update.callback_query.answer("הבוט בשיפוצים, חזרו בקרוב! נשלח לך הודעה כשנחזור.", show_alert=True)
     elif update.message:
         await update.message.reply_text(msg, parse_mode="Markdown")
     return True
@@ -1267,6 +1281,90 @@ async def admin_broadcast_get_delay(update: Update, context: ContextTypes.DEFAUL
     )
     return ConversationHandler.END
 
+# ─── Admin: VIP management ────────────────────────────────────────────────────
+
+async def admin_vip_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if query.from_user.id != ADMIN_ID:
+        return ConversationHandler.END
+    await query.edit_message_text("💎 *ניהול דרגות VIP*\n\nשלח את ה-ID של המשתמש:", parse_mode="Markdown")
+    return ADMIN_VIP_ID
+
+async def admin_vip_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
+        return ConversationHandler.END
+    try:
+        uid = str(int(update.message.text.strip()))
+        context.user_data["vip_target_id"] = uid
+    except ValueError:
+        await update.message.reply_text("❌ ID לא תקין.")
+        return ConversationHandler.END
+    
+    users = load_json(USERS_FILE)
+    if uid not in users:
+        await update.message.reply_text("❌ משתמש לא נמצא במערכת.")
+        return ConversationHandler.END
+        
+    user = users[uid]
+    vip  = get_user_vip(uid)
+    
+    keyboard = []
+    for i, level in enumerate(VIP_LEVELS):
+        keyboard.append([InlineKeyboardButton(f"{level['icon']} {level['name']}", callback_data=f"set_vip_{i}")])
+    keyboard.append([InlineKeyboardButton("❌ ביטול", callback_data="back_admin")])
+    
+    await update.message.reply_text(
+        f"👤 *משתמש:* {user.get('first_name', 'לא ידוע')}\n"
+        f"🆔 *ID:* `{uid}`\n"
+        f"💎 *דרגה נוכחית:* {vip['icon']} {vip['name']}\n"
+        f"🧾 *רכישות:* {user.get('purchases', 0)}\n\n"
+        "בחר את הדרגה החדשה:",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(keyboard)
+    )
+    return ADMIN_VIP_LEVEL
+
+async def admin_vip_level(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if query.from_user.id != ADMIN_ID:
+        return ConversationHandler.END
+        
+    try:
+        level_idx = int(query.data.replace("set_vip_", ""))
+        new_level = VIP_LEVELS[level_idx]
+        uid = context.user_data.get("vip_target_id")
+        
+        users = load_json(USERS_FILE)
+        if uid in users:
+            # שינוי הדרגה מתבצע על ידי עדכון מספר הרכישות המינימלי הנדרש לאותה דרגה
+            users[uid]["purchases"] = new_level["min_purchases"]
+            save_json(USERS_FILE, users)
+            
+            await query.edit_message_text(
+                f"✅ הדרגה של משתמש `{uid}` עודכנה בהצלחה ל-*{new_level['icon']} {new_level['name']}*!",
+                parse_mode="Markdown",
+                reply_markup=get_admin_inline_keyboard()
+            )
+            
+            # שליחת הודעה למשתמש על עדכון הדרגה
+            try:
+                await context.bot.send_message(
+                    chat_id=int(uid),
+                    text=f"🎊 *חדשות טובות!*\nהמנהל עדכן את הדרגה שלך ל-*{new_level['icon']} {new_level['name']}*!\n\nתהנה מההנחות וההטבות החדשות! 💎",
+                    parse_mode="Markdown"
+                )
+            except Exception:
+                pass
+        else:
+            await query.edit_message_text("❌ שגיאה: המשתמש לא נמצא.")
+            
+    except Exception as e:
+        await query.edit_message_text(f"❌ שגיאה בעדכון הדרגה: {str(e)}")
+        
+    return ConversationHandler.END
+
 # ─── Admin: coins management ──────────────────────────────────────────────────
 
 async def admin_coins_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1655,12 +1753,34 @@ async def admin_maintenance_toggle(update: Update, context: ContextTypes.DEFAULT
     
     if data == "maint_on":
         settings["maintenance"] = True
+        # איפוס רשימת המשתמשים המחכים כשמפעילים תחזוקה מחדש
+        settings["waiting_users"] = []
         save_settings(settings)
         await query.answer("✅ מצב תחזוקה הופעל", show_alert=True)
     elif data == "maint_off":
         settings["maintenance"] = False
+        waiting = settings.get("waiting_users", [])
         save_settings(settings)
         await query.answer("✅ מצב תחזוקה כובה", show_alert=True)
+        
+        # שליחת הודעה לכל המשתמשים שחיכו
+        if waiting:
+            count_sent = 0
+            for uid in waiting:
+                try:
+                    await context.bot.send_message(
+                        chat_id=uid,
+                        text="🎉 *הבוט חזר לפעילות!*\n\nמוזמנים להמשיך להשתמש בבוט וליהנות! 🚀",
+                        parse_mode="Markdown"
+                    )
+                    count_sent += 1
+                except Exception:
+                    pass
+            # איפוס הרשימה לאחר השליחה
+            settings = load_settings()
+            settings["waiting_users"] = []
+            save_settings(settings)
+            await query.message.reply_text(f"📢 נשלחה הודעת חזרה לפעילות ל-{count_sent} משתמשים שחיכו.")
         
     status = "🟠 *פעיל (הבוט חסום למשתמשים)*" if settings.get("maintenance") else "🟢 *כבוי (הבוט פתוח לכולם)*"
     
@@ -1819,6 +1939,18 @@ def main():
         fallbacks=[CommandHandler("cancel", cancel)],
         per_message=False, per_chat=True,
     )
+    vip_conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(admin_vip_start, pattern="^admin_vip$")],
+        states={
+            ADMIN_VIP_ID:    [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_vip_id)],
+            ADMIN_VIP_LEVEL: [CallbackQueryHandler(admin_vip_level, pattern="^set_vip_")],
+        },
+        fallbacks=[
+            CommandHandler("cancel", cancel),
+            CallbackQueryHandler(back_admin, pattern="^back_admin$"),
+        ],
+        per_message=False, per_chat=True,
+    )
     coupon_new_conv = ConversationHandler(
         entry_points=[CallbackQueryHandler(admin_coupon_new_start, pattern="^admin_coupon_new$")],
         states={
@@ -1894,7 +2026,7 @@ def main():
     )
     # ── Register handlers ─────────────────────────────────────────────────────────────────────────────
     for conv in [
-        check_conv, send_conv, approve_conv, broadcast_conv, coins_conv,
+        check_conv, send_conv, approve_conv, broadcast_conv, coins_conv, vip_conv,
         coupon_new_conv, multiplier_conv, restore_conv, global_reset_conv,
         video_search_conv, support_conv, coupon_redeem_conv, support_reply_conv,
     ]:
