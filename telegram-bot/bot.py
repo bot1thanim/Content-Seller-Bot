@@ -222,10 +222,19 @@ async def send_videos_to_user(context, user_id: int, count: int) -> int:
     unseen = [v for v in pool if v["file_id"] not in seen]
     
     if len(unseen) >= count:
-        selected = unseen[:count]
+        # Randomly select from unseen videos
+        selected = random.sample(unseen, count)
     else:
-        # If not enough unseen, take all unseen and fill the rest from seen
-        selected = unseen + random.sample([v for v in pool if v["file_id"] in seen], min(count - len(unseen), len(pool) - len(unseen)))
+        # If not enough unseen, take all unseen and fill the rest from seen (randomly)
+        remaining_count = count - len(unseen)
+        seen_pool = [v for v in pool if v["file_id"] in seen]
+        
+        # Take all unseen
+        selected = unseen
+        
+        # Add random videos from seen pool if possible
+        if seen_pool and remaining_count > 0:
+            selected += random.sample(seen_pool, min(remaining_count, len(seen_pool)))
         
     sent = 0
     for v in selected:
@@ -305,8 +314,9 @@ def get_admin_reply_keyboard():
 
 def get_admin_inline_keyboard():
     settings    = load_settings()
-    maint_label = "🔧 כבה תחזוקה" if settings.get("maintenance") else "🔧 מצב תחזוקה"
+    maint_status = "🟠 תחזוקה" if settings.get("maintenance") else "🟢 פעיל"
     return InlineKeyboardMarkup([
+        [InlineKeyboardButton(f"📡 סטטוס בוט: {maint_status}", callback_data="admin_maintenance")],
         [
             InlineKeyboardButton("📊 סטטיסטיקה",      callback_data="admin_stats"),
             InlineKeyboardButton("🧾 הזמנות",          callback_data="admin_orders_page_0"),
@@ -339,7 +349,7 @@ def get_admin_inline_keyboard():
             InlineKeyboardButton("🔄 איפוס נתונים",  callback_data="admin_global_reset"),
             InlineKeyboardButton("🧹 מחק סרטונים",   callback_data="admin_delete"),
         ],
-        [InlineKeyboardButton(maint_label,             callback_data="admin_maintenance")],
+        [InlineKeyboardButton("🔧 ניהול מצב תחזוקה",    callback_data="admin_maintenance")],
     ])
 
 # ─── Maintenance gate ─────────────────────────────────────────────────────────
@@ -751,8 +761,10 @@ async def admin_support_reply_send(update: Update, context: ContextTypes.DEFAULT
 async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
         return
+    settings = load_settings()
+    maint_status = "🟠 *מצב תחזוקה פעיל*" if settings.get("maintenance") else "🟢 *הבוט פעיל כרגיל*"
     await update.message.reply_text(
-        "🛠 *פאנל אדמין*\nבחר פעולה:",
+        f"🛠 *פאנל אדמין*\n\nסטטוס נוכחי: {maint_status}\n\nבחר פעולה:",
         parse_mode="Markdown",
         reply_markup=get_admin_inline_keyboard(),
     )
@@ -762,8 +774,10 @@ async def back_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     if query.from_user.id != ADMIN_ID:
         return
+    settings = load_settings()
+    maint_status = "🟠 *מצב תחזוקה פעיל*" if settings.get("maintenance") else "🟢 *הבוט פעיל כרגיל*"
     await query.edit_message_text(
-        "🛠 *פאנל אדמין*\nבחר פעולה:",
+        f"🛠 *פאנל אדמין*\n\nסטטוס נוכחי: {maint_status}\n\nבחר פעולה:",
         parse_mode="Markdown",
         reply_markup=get_admin_inline_keyboard(),
     )
@@ -940,31 +954,29 @@ async def admin_send_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     if query.from_user.id != ADMIN_ID:
         return ConversationHandler.END
-    await query.edit_message_text("📩 *שליחת סרטונים למשתמש*\n\nכמה סרטונים לשלוח?", parse_mode="Markdown")
+    await query.edit_message_text("📩 *שליחת הודעה למשתמש*\n\nרשום את ההודעה שברצונך לשלוח:", parse_mode="Markdown")
     return ADMIN_SEND_MSG
 
 async def admin_send_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
         return ConversationHandler.END
-    try:
-        count = int(update.message.text.strip())
-        context.user_data["send_v_count"] = count
-    except ValueError:
-        await update.message.reply_text("❌ מספר לא תקין.")
-        return ADMIN_SEND_MSG
-    await update.message.reply_text("שלח את ה-ID של המשתמש:")
+    msg = update.message.text.strip()
+    context.user_data["admin_msg_text"] = msg
+    await update.message.reply_text("שלח את ה-ID של המשתמש אליו תישלח ההודעה:")
     return ADMIN_SEND_ID
 
 async def admin_send_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
         return ConversationHandler.END
     uid   = update.message.text.strip()
-    count = context.user_data.get("send_v_count", 0)
-    sent  = await send_videos_to_user(context, int(uid), count)
-    if sent > 0:
-        await update.message.reply_text(f"✅ נשלחו {sent} סרטונים למשתמש {uid}!", reply_markup=get_admin_inline_keyboard())
-    else:
-        await update.message.reply_text("❌ השליחה נכשלה. וודא שה-ID תקין ויש סרטונים במאגר.", reply_markup=get_admin_inline_keyboard())
+    msg   = context.user_data.get("admin_msg_text", "")
+    
+    try:
+        await context.bot.send_message(chat_id=int(uid), text=f"📩 *הודעה מהמנהל:*\n\n{msg}", parse_mode="Markdown")
+        await update.message.reply_text(f"✅ ההודעה נשלחה בהצלחה למשתמש {uid}!", reply_markup=get_admin_inline_keyboard())
+    except Exception as e:
+        await update.message.reply_text(f"❌ השליחה נכשלה: {str(e)}", reply_markup=get_admin_inline_keyboard())
+    
     return ConversationHandler.END
 
 # ─── Admin: approve payment ───────────────────────────────────────────────────
@@ -974,7 +986,7 @@ async def admin_approve_start(update: Update, context: ContextTypes.DEFAULT_TYPE
     await query.answer()
     if query.from_user.id != ADMIN_ID:
         return ConversationHandler.END
-    await query.edit_message_text("✅ *אישור תשלום ידני*\n\nכמה סרטונים לאשר?", parse_mode="Markdown")
+    await query.edit_message_text("✅ *אישור תשלום ידני*\n\nכמה סרטונים לשלוח למשתמש?", parse_mode="Markdown")
     return ADMIN_APPROVE_COUNT
 
 async def admin_approve_count(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -986,7 +998,7 @@ async def admin_approve_count(update: Update, context: ContextTypes.DEFAULT_TYPE
     except ValueError:
         await update.message.reply_text("❌ מספר לא תקין.")
         return ADMIN_APPROVE_COUNT
-    await update.message.reply_text("שלח את ה-ID של המשתמש:")
+    await update.message.reply_text("שלח את ה-ID של המשתמש לאישור:")
     return ADMIN_APPROVE_ID
 
 async def admin_approve_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -994,16 +1006,21 @@ async def admin_approve_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ConversationHandler.END
     uid   = update.message.text.strip()
     count = context.user_data.get("approve_v_count", 0)
-    sent  = await send_videos_to_user(context, int(uid), count)
-    if sent > 0:
-        record_order(int(uid), 0, sent, "manual")
-        await update.message.reply_text(f"✅ אושר! {sent} סרטונים נשלחו למשתמש {uid}.", reply_markup=get_admin_inline_keyboard())
-        try:
-            await context.bot.send_message(chat_id=int(uid), text=f"✅ התשלום שלך אושר! {sent} סרטונים נשלחו אליך. תהנה!")
-        except Exception:
-            pass
-    else:
-        await update.message.reply_text("❌ השליחה נכשלה.", reply_markup=get_admin_inline_keyboard())
+    
+    try:
+        sent = await send_videos_to_user(context, int(uid), count)
+        if sent > 0:
+            record_order(int(uid), 0, sent, "manual")
+            await update.message.reply_text(f"✅ בוצע! {sent} סרטונים נשלחו למשתמש {uid}.", reply_markup=get_admin_inline_keyboard())
+            try:
+                await context.bot.send_message(chat_id=int(uid), text=f"✅ התשלום שלך אושר! {sent} סרטונים נשלחו אליך. תהנה!")
+            except Exception:
+                pass
+        else:
+            await update.message.reply_text("❌ השליחה נכשלה. וודא שה-ID תקין ויש סרטונים במאגר.", reply_markup=get_admin_inline_keyboard())
+    except Exception as e:
+        await update.message.reply_text(f"❌ שגיאה: {str(e)}", reply_markup=get_admin_inline_keyboard())
+        
     return ConversationHandler.END
 
 # ─── Admin: gallery ───────────────────────────────────────────────────────────
@@ -1082,8 +1099,11 @@ async def admin_gallery_send_all(update: Update, context: ContextTypes.DEFAULT_T
     if not videos:
         return
         
-    await query.edit_message_text(f"📤 שולח {len(videos)} סרטונים עם כפתורי מחיקה...")
-    for i, v in enumerate(videos):
+    # Sort videos by duration for admin (ascending)
+    sorted_videos = sorted(videos, key=lambda x: x.get("duration", 0))
+    
+    await query.edit_message_text(f"📤 שולח {len(videos)} סרטונים (לפי סדר אורך) עם כפתורי מחיקה...")
+    for i, v in enumerate(sorted_videos):
         try:
             await context.bot.send_video(
                 chat_id=ADMIN_ID,
@@ -1629,16 +1649,40 @@ async def admin_maintenance_toggle(update: Update, context: ContextTypes.DEFAULT
     await query.answer()
     if query.from_user.id != ADMIN_ID:
         return
+    
+    data = query.data
     settings = load_settings()
-    new_val  = not settings.get("maintenance", False)
-    settings["maintenance"] = new_val
-    save_settings(settings)
-    status = "🟠 פעיל" if new_val else "🟢 כבוי"
-    await query.edit_message_text(
-        f"🔧 *מצב תחזוקה*\n\nהסטטוס כעת: {status}",
-        parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 חזרה לפאנל", callback_data="back_admin")]]),
+    
+    if data == "maint_on":
+        settings["maintenance"] = True
+        save_settings(settings)
+        await query.answer("✅ מצב תחזוקה הופעל", show_alert=True)
+    elif data == "maint_off":
+        settings["maintenance"] = False
+        save_settings(settings)
+        await query.answer("✅ מצב תחזוקה כובה", show_alert=True)
+        
+    status = "🟠 *פעיל (הבוט חסום למשתמשים)*" if settings.get("maintenance") else "🟢 *כבוי (הבוט פתוח לכולם)*"
+    
+    text = (
+        "🔧 *ניהול מצב תחזוקה*\n\n"
+        "💡 *מה זה אומר?*\n"
+        "• *פועל:* רק האדמין יכול להשתמש בבוט. משתמשים רגילים יראו הודעת תחזוקה.\n"
+        "• *כבוי:* הבוט פתוח לשימוש מלא לכל המשתמשים.\n\n"
+        f"סטטוס נוכחי: {status}"
     )
+    
+    keyboard = [
+        [
+            InlineKeyboardButton("🟢 הפעל בוט (כבה תחזוקה)", callback_data="maint_off"),
+        ],
+        [
+            InlineKeyboardButton("🟠 השבת בוט (הפעל תחזוקה)", callback_data="maint_on"),
+        ],
+        [InlineKeyboardButton("🔙 חזרה לפאנל", callback_data="back_admin")]
+    ]
+    
+    await query.edit_message_text(text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(keyboard))
 
 # ─── Video upload ─────────────────────────────────────────────────────────────
 
@@ -1888,7 +1932,9 @@ def main():
         ("^admin_delete$",              admin_delete_start),
         ("^admin_delete_confirm$",      admin_delete_confirm),
         ("^admin_global_reset$",        admin_global_reset_start),
-        ("^admin_maintenance$",         admin_maintenance_toggle),
+                ("^admin_maintenance$",          admin_maintenance_toggle),
+        ("^maint_on$",                   admin_maintenance_toggle),
+        ("^maint_off$",                  admin_maintenance_toggle),
         ("^back_admin$",                back_admin),
     ]
     for pattern, handler in cbs:
