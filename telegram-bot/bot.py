@@ -645,6 +645,7 @@ async def stars_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def star_package_buy(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    logger.info("--- STARTING STAR PURCHASE FLOW ---")
     query = update.callback_query
     await query.answer()
     uid   = str(query.from_user.id)
@@ -681,6 +682,7 @@ async def star_package_buy(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def pre_checkout_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    logger.info("--- RECEIVED PRE_CHECKOUT_QUERY ---")
     """Respond to the PreCheckoutQuery with ok=True."""
     query = update.pre_checkout_query
     if query.invoice_payload.startswith("star_"):
@@ -689,6 +691,7 @@ async def pre_checkout_callback(update: Update, context: ContextTypes.DEFAULT_TY
         await query.answer(ok=False, error_message="Something went wrong...")
 
 async def successful_payment_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    logger.info("--- RECEIVED SUCCESSFUL_PAYMENT ---")
     """Confirm the successful payment and deliver the content."""
     msg = update.message
     payment = msg.successful_payment
@@ -1987,6 +1990,10 @@ def main():
         return
 
     app = Application.builder().token(TOKEN).build()
+    # IMPORTANT: Payment handlers must be registered early
+    app.add_handler(PreCheckoutQueryHandler(pre_checkout_callback))
+    app.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment_callback))
+
 
     # ── Conversation handlers ─────────────────────────────────────────────────
 
@@ -2134,8 +2141,6 @@ def main():
     app.add_handler(MessageHandler(filters.VIDEO, handle_video))
 
     # Telegram Stars payment handlers
-    app.add_handler(PreCheckoutQueryHandler(pre_checkout_callback))
-    app.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment_callback))
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.Regex("^🛠 פאנל אדמין$"), admin_panel))
