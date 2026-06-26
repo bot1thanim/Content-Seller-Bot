@@ -43,7 +43,7 @@ logger = logging.getLogger(__name__)
 
 TOKEN    = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 ADMIN_ID = int(os.environ.get("ADMIN_ID", "7706183809"))
-PAYPAL_LINK = "https://paypal.me/Eliyas2005"
+# PAYPAL_LINK removed for automation
 PAYPAL_CLIENT_ID = "BAAd231NK9V9yCPlOHY57GWJDlLY_6W6G6ZZS0g3jUh8SzaLG8Q2sdfHcuE_Pi-m3kDZTvcMpahHCcEYlk"
 PAYPAL_CLIENT_SECRET = "EIxM_M8lRQzoIaaxKAa3ugpK_VnFg3wqCoxgUivq-TnLxxGbtVn6m-7c4OWaeAb_tqnOVyd4khvx2LSI"
 PAYPAL_API_BASE = "https://api-m.paypal.com"
@@ -581,7 +581,10 @@ async def paypal_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
     btns.append([InlineKeyboardButton("🔙 חזרה", callback_data="payment_method")])
     await query.edit_message_text(
-        "💳 *תשלום בפייפאל*\n\nבחר חבילה לרכישה:",
+        "💳 *תשלום מאובטח בפייפאל (אוטומטי)*
+
+בחר חבילה לרכישה:
+_הסרטונים יישלחו מיד לאחר אישור התשלום._",
         parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup(btns),
     )
@@ -596,35 +599,41 @@ async def paypal_package_selected(update: Update, context: ContextTypes.DEFAULT_
     
     price = round(pkg["price"] * (1 - vip["discount"]), 2)
     
+    logger.info(f"Creating PayPal order for user {uid}, amount {price}")
+    
     # Create real PayPal order via API
     order_data = create_paypal_order(price)
     if not order_data:
-        await query.edit_message_text("❌ שגיאה ביצירת הזמנה בפייפאל. נסה שוב מאוחר יותר.")
+        logger.error(f"Failed to create PayPal order for user {uid}")
+        await query.edit_message_text("❌ שגיאה בתקשורת עם פייפאל. נא לנסות שוב בעוד דקה.")
         return
         
     order_id, approve_link = order_data
     
     text = (
-        f"✅ בחרת חבילה של *{pkg['videos']} סרטונים*
+        f"✅ *הזמנה נוצרה בהצלחה*
+
 "
-        f"💰 מחיר לאחר הנחה ({int(vip['discount']*100)}%): *₪{price}*
+        f"🎬 חבילה: *{pkg['videos']} סרטונים*
+"
+        f"💰 לתשלום: *₪{price}*
 
 "
         f"1️⃣ לחץ על הכפתור למטה למעבר לתשלום מאובטח.
 "
-        f"2️⃣ לאחר סיום התשלום באתר פייפאל, חזור לכאן ולחץ על כפתור **'✅ אישרתי תשלום'**.
+        f"2️⃣ לאחר סיום התשלום, חזור לכאן ולחץ על **'✅ אישרתי תשלום'**.
 
 "
-        f"⚠️ *הסרטונים יישלחו אוטומטית מיד לאחר האישור!*"
+        f"🚀 *הסרטונים יישלחו אליך אוטומטית!*"
     )
     
     await query.edit_message_text(
         text,
         parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("🔗 מעבר לתשלום מאובטח", url=approve_link)],
+            [InlineKeyboardButton("💳 מעבר לתשלום ב-PayPal", url=approve_link)],
             [InlineKeyboardButton("✅ אישרתי תשלום", callback_data=f"ppverify_{idx}_{order_id}")],
-            [InlineKeyboardButton("🔙 חזרה", callback_data="paypal_menu")],
+            [InlineKeyboardButton("🔙 ביטול וחזרה", callback_data="paypal_menu")],
         ]),
     )
 
