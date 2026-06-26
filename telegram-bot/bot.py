@@ -581,10 +581,7 @@ async def paypal_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
     btns.append([InlineKeyboardButton("🔙 חזרה", callback_data="payment_method")])
     await query.edit_message_text(
-        "💳 *תשלום מאובטח בפייפאל (אוטומטי)*
-
-בחר חבילה לרכישה:
-_הסרטונים יישלחו מיד לאחר אישור התשלום._",
+        "💳 *תשלום מאובטח בפייפאל (אוטומטי)*\n\nבחר חבילה לרכישה:\n_הסרטונים יישלחו מיד לאחר אישור התשלום._",
         parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup(btns),
     )
@@ -611,19 +608,11 @@ async def paypal_package_selected(update: Update, context: ContextTypes.DEFAULT_
     order_id, approve_link = order_data
     
     text = (
-        f"✅ *הזמנה נוצרה בהצלחה*
-
-"
-        f"🎬 חבילה: *{pkg['videos']} סרטונים*
-"
-        f"💰 לתשלום: *₪{price}*
-
-"
-        f"1️⃣ לחץ על הכפתור למטה למעבר לתשלום מאובטח.
-"
-        f"2️⃣ לאחר סיום התשלום, חזור לכאן ולחץ על **'✅ אישרתי תשלום'**.
-
-"
+        f"✅ *הזמנה נוצרה בהצלחה*\n\n"
+        f"🎬 חבילה: *{pkg['videos']} סרטונים*\n"
+        f"💰 לתשלום: *₪{price}*\n\n"
+        f"1️⃣ לחץ על הכפתור למטה למעבר לתשלום מאובטח.\n"
+        f"2️⃣ לאחר סיום התשלום, חזור לכאן ולחץ על **'✅ אישרתי תשלום'**.\n\n"
         f"🚀 *הסרטונים יישלחו אליך אוטומטית!*"
     )
     
@@ -655,27 +644,18 @@ async def paypal_verify_payment(update: Update, context: ContextTypes.DEFAULT_TY
         if sent > 0:
             record_order(query.from_user.id, pkg["price"], sent, "paypal_auto")
             await query.message.reply_text(
-                f"🎉 *התשלום אושר אוטומטית!*
-
-"
-                f"🎬 {sent} סרטונים נשלחו אליך.
-"
+                f"🎉 *התשלום אושר אוטומטית!*\n\n"
+                f"🎬 {sent} סרטונים נשלחו אליך.\n"
                 f"תודה על הרכישה! ❤️",
                 parse_mode="Markdown"
             )
-            await alert_admin(context, f"💳 *רכישה אוטומטית בפייפאל*
-👤 {query.from_user.first_name} (`{uid}`)
-🎬 סרטונים: {sent}
-💰 סכום: ₪{pkg['price']}")
+            await alert_admin(context, f"💳 *רכישה אוטומטית בפייפאל*\n👤 {query.from_user.first_name} (`{uid}`)\n🎬 סרטונים: {sent}\n💰 סכום: ₪{pkg['price']}")
         else:
             await query.message.reply_text("❌ התשלום אושר אך אין מספיק סרטונים. פנה לתמיכה להחזר.")
     else:
         await query.edit_message_text(
-            f"❌ *התשלום טרם הושלם*
-
-"
-            f"נראה שהתשלום עדיין לא בוצע או שלא אושר על ידי פייפאל.
-"
+            f"❌ *התשלום טרם הושלם*\n\n"
+            f"נראה שהתשלום עדיין לא בוצע או שלא אושר על ידי פייפאל.\n"
             f"אם שילמת, המתן דקה ונסה ללחוץ שוב על 'אישרתי תשלום'.",
             parse_mode="Markdown",
             reply_markup=InlineKeyboardMarkup([
