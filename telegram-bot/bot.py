@@ -56,14 +56,14 @@ COINS_PER_SHEKEL = 10
 ORDERS_PER_PAGE  = 10
 
 PACKAGES = [
-    {"price": 2,   "videos": 1,   "coins": 20,   "stars": 23,   "label_paypal": "₪2 – 1 סרטון",       "label_coins": "🪙20 – 1 סרטון",       "label_stars": "⭐23 – 1 סרטון"},
+    {"price": 2,   "videos": 1,   "coins": 20,   "stars": 22,   "label_paypal": "₪2 – 1 סרטון",       "label_coins": "🪙20 – 1 סרטון",       "label_stars": "⭐22 – 1 סרטון"},
     {"price": 9,   "videos": 5,   "coins": 90,   "stars": 101,  "label_paypal": "₪9 – 5 סרטונים",      "label_coins": "🪙90 – 5 סרטונים",      "label_stars": "⭐101 – 5 סרטונים"},
-    {"price": 16,  "videos": 10,  "coins": 160,  "stars": 179,  "label_paypal": "₪16 – 10 סרטונים",    "label_coins": "🪙160 – 10 סרטונים",    "label_stars": "⭐179 – 10 סרטונים"},
-    {"price": 30,  "videos": 20,  "coins": 300,  "stars": 335,  "label_paypal": "₪30 – 20 סרטונים",    "label_coins": "🪙300 – 20 סרטונים",    "label_stars": "⭐335 – 20 סרטונים"},
-    {"price": 65,  "videos": 50,  "coins": 650,  "stars": 725,  "label_paypal": "₪65 – 50 סרטונים",    "label_coins": "🪙650 – 50 סרטונים",    "label_stars": "⭐725 – 50 סרטונים"},
-    {"price": 85,  "videos": 70,  "coins": 850,  "stars": 947,  "label_paypal": "₪85 – 70 סרטונים",    "label_coins": "🪙850 – 70 סרטונים",    "label_stars": "⭐947 – 70 סרטונים"},
-    {"price": 110, "videos": 100, "coins": 1100, "stars": 1227, "label_paypal": "₪110 – 100 סרטונים",  "label_coins": "🪙1100 – 100 סרטונים",  "label_stars": "⭐1227 – 100 סרטונים"},
-    {"price": 180, "videos": 200, "coins": 1800, "stars": 2007, "label_paypal": "₪180 – 200 סרטונים",  "label_coins": "🪙1800 – 200 סרטונים",  "label_stars": "⭐2007 – 200 סרטונים"},
+    {"price": 16,  "videos": 10,  "coins": 160,  "stars": 180,  "label_paypal": "₪16 – 10 סרטונים",    "label_coins": "🪙160 – 10 סרטונים",    "label_stars": "⭐180 – 10 סרטונים"},
+    {"price": 30,  "videos": 20,  "coins": 300,  "stars": 337,  "label_paypal": "₪30 – 20 סרטונים",    "label_coins": "🪙300 – 20 סרטונים",    "label_stars": "⭐337 – 20 סרטונים"},
+    {"price": 65,  "videos": 50,  "coins": 650,  "stars": 730,  "label_paypal": "₪65 – 50 סרטונים",    "label_coins": "🪙650 – 50 סרטונים",    "label_stars": "⭐730 – 50 סרטונים"},
+    {"price": 85,  "videos": 70,  "coins": 850,  "stars": 955,  "label_paypal": "₪85 – 70 סרטונים",    "label_coins": "🪙850 – 70 סרטונים",    "label_stars": "⭐955 – 70 סרטונים"},
+    {"price": 110, "videos": 100, "coins": 1100, "stars": 1236, "label_paypal": "₪110 – 100 סרטונים",  "label_coins": "🪙1100 – 100 סרטונים",  "label_stars": "⭐1236 – 100 סרטונים"},
+    {"price": 185, "videos": 200, "coins": 1800, "stars": 2079, "label_paypal": "₪185 – 200 סרטונים",  "label_coins": "🪙1800 – 200 סרטונים",  "label_stars": "⭐2079 – 200 סרטונים"},
 ]
 
 # VIP Levels
