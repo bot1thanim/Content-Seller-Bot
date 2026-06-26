@@ -1,3 +1,4 @@
+import requests
 import io
 import os
 import json
@@ -43,6 +44,10 @@ logger = logging.getLogger(__name__)
 TOKEN    = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 ADMIN_ID = int(os.environ.get("ADMIN_ID", "7706183809"))
 PAYPAL_LINK = "https://paypal.me/Eliyas2005"
+PAYPAL_CLIENT_ID = "BAAd231NK9V9yCPlOHY57GWJDlLY_6W6G6ZZS0g3jUh8SzaLG8Q2sdfHcuE_Pi-m3kDZTvcMpahHCcEYlk"
+PAYPAL_CLIENT_SECRET = "EIxM_M8lRQzoIaaxKAa3ugpK_VnFg3wqCoxgUivq-TnLxxGbtVn6m-7c4OWaeAb_tqnOVyd4khvx2LSI"
+PAYPAL_API_BASE = "https://api-m.paypal.com"
+
 
 DATA_DIR       = Path("data")
 USERS_FILE     = DATA_DIR / "users.json"
@@ -255,6 +260,51 @@ async def send_videos_to_user(context, user_id: int, count: int) -> int:
     users[uid] = user_data
     save_json(USERS_FILE, users)
     return sent
+
+
+def get_paypal_access_token():
+    try:
+        res = requests.post(
+            f"{PAYPAL_API_BASE}/v1/oauth2/token",
+            auth=(PAYPAL_CLIENT_ID, PAYPAL_CLIENT_SECRET),
+            data={"grant_type": "client_credentials"},
+            timeout=10
+        )
+        if res.status_code == 200:
+            return res.json()["access_token"]
+    except Exception as e:
+        logger.error(f"PayPal Token Error: {e}")
+    return None
+
+def create_paypal_order(amount, currency="ILS"):
+    token = get_paypal_access_token()
+    if not token: return None
+    headers = {"Content-Type": "application/json", "Authorization": f"Bearer {token}"}
+    payload = {"intent": "CAPTURE", "purchase_units": [{"amount": {"currency_code": currency, "value": str(amount)}}]}
+    try:
+        res = requests.post(f"{PAYPAL_API_BASE}/v2/checkout/orders", headers=headers, json=payload, timeout=10)
+        if res.status_code == 201:
+            data = res.json()
+            approve_link = next(link["href"] for link in data["links"] if link["rel"] == "approve")
+            return data["id"], approve_link
+    except Exception as e:
+        logger.error(f"PayPal Create Order Error: {e}")
+    return None
+
+def capture_paypal_order(order_id):
+    token = get_paypal_access_token()
+    if not token: return False, "Token Error"
+    headers = {"Content-Type": "application/json", "Authorization": f"Bearer {token}"}
+    try:
+        res = requests.post(f"{PAYPAL_API_BASE}/v2/checkout/orders/{order_id}/capture", headers=headers, timeout=10)
+        if res.status_code in [200, 201]:
+            data = res.json()
+            if data.get("status") == "COMPLETED":
+                return True, "Success"
+        return False, f"Status: {res.status_code}"
+    except Exception as e:
+        logger.error(f"PayPal Capture Error: {e}")
+        return False, str(e)
 
 def record_order(user_id: int, amount: float, videos_count: int, order_type: str):
     orders = load_json(ORDERS_FILE)
@@ -545,25 +595,86 @@ async def paypal_package_selected(update: Update, context: ContextTypes.DEFAULT_
     pkg = PACKAGES[idx]
     
     price = round(pkg["price"] * (1 - vip["discount"]), 2)
-    # Generate PayPal link with price
-    final_link = f"{PAYPAL_LINK}/{price}"
+    
+    # Create real PayPal order via API
+    order_data = create_paypal_order(price)
+    if not order_data:
+        await query.edit_message_text("❌ שגיאה ביצירת הזמנה בפייפאל. נסה שוב מאוחר יותר.")
+        return
+        
+    order_id, approve_link = order_data
     
     text = (
-        f"✅ בחרת חבילה של *{pkg['videos']} סרטונים*\n"
-        f"💰 מחיר לאחר הנחה ({int(vip['discount']*100)}%): *₪{price}*\n\n"
-        f"1️⃣ לחץ על הכפתור למעבר לתשלום.\n"
-        f"2️⃣ לאחר התשלום, שלח צילום מסך של האישור למנהל דרך כפתור ה'תמיכה'.\n"
-        f"3️⃣ המנהל יאשר את הרכישה והסרטונים יישלחו אליך."
+        f"✅ בחרת חבילה של *{pkg['videos']} סרטונים*
+"
+        f"💰 מחיר לאחר הנחה ({int(vip['discount']*100)}%): *₪{price}*
+
+"
+        f"1️⃣ לחץ על הכפתור למטה למעבר לתשלום מאובטח.
+"
+        f"2️⃣ לאחר סיום התשלום באתר פייפאל, חזור לכאן ולחץ על כפתור **'✅ אישרתי תשלום'**.
+
+"
+        f"⚠️ *הסרטונים יישלחו אוטומטית מיד לאחר האישור!*"
     )
+    
     await query.edit_message_text(
         text,
         parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("🔗 מעבר לתשלום בפייפאל", url=final_link)],
-            [InlineKeyboardButton("💬 שלח אישור למנהל",      callback_data="support")],
-            [InlineKeyboardButton("🔙 חזרה",                 callback_data="paypal_menu")],
+            [InlineKeyboardButton("🔗 מעבר לתשלום מאובטח", url=approve_link)],
+            [InlineKeyboardButton("✅ אישרתי תשלום", callback_data=f"ppverify_{idx}_{order_id}")],
+            [InlineKeyboardButton("🔙 חזרה", callback_data="paypal_menu")],
         ]),
     )
+
+async def paypal_verify_payment(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    data = query.data.split("_")
+    pkg_idx = int(data[1])
+    order_id = data[2]
+    pkg = PACKAGES[pkg_idx]
+    uid = str(query.from_user.id)
+    
+    await query.edit_message_text("⏳ בודק תשלום מול פייפאל... נא להמתין.")
+    
+    success, message = capture_paypal_order(order_id)
+    
+    if success:
+        sent = await send_videos_to_user(context, query.from_user.id, pkg["videos"])
+        if sent > 0:
+            record_order(query.from_user.id, pkg["price"], sent, "paypal_auto")
+            await query.message.reply_text(
+                f"🎉 *התשלום אושר אוטומטית!*
+
+"
+                f"🎬 {sent} סרטונים נשלחו אליך.
+"
+                f"תודה על הרכישה! ❤️",
+                parse_mode="Markdown"
+            )
+            await alert_admin(context, f"💳 *רכישה אוטומטית בפייפאל*
+👤 {query.from_user.first_name} (`{uid}`)
+🎬 סרטונים: {sent}
+💰 סכום: ₪{pkg['price']}")
+        else:
+            await query.message.reply_text("❌ התשלום אושר אך אין מספיק סרטונים. פנה לתמיכה להחזר.")
+    else:
+        await query.edit_message_text(
+            f"❌ *התשלום טרם הושלם*
+
+"
+            f"נראה שהתשלום עדיין לא בוצע או שלא אושר על ידי פייפאל.
+"
+            f"אם שילמת, המתן דקה ונסה ללחוץ שוב על 'אישרתי תשלום'.",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔄 נסה שוב", callback_data=query.data)],
+                [InlineKeyboardButton("🔙 חזרה", callback_data="paypal_menu")],
+            ])
+        )
+
 
 async def coins_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -2151,6 +2262,7 @@ def main():
         ("^payment_method$",            payment_method_menu),
         ("^paypal_menu$",               paypal_menu),
         (r"^pp_\d+$",                   paypal_package_selected),
+        (r"^ppverify_\d+_",           paypal_verify_payment),
         ("^coins_menu$",                coins_menu),
         (r"^coin_\d+$",                 coin_package_buy),
         ("^stars_menu$",                stars_menu),
