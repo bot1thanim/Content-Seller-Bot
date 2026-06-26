@@ -29,6 +29,7 @@ from telegram.ext import (
     ConversationHandler,
     ContextTypes,
     filters,
+    PreCheckoutQueryHandler,
 )
 
 warnings.filterwarnings("ignore", message=".*per_message=False.*CallbackQueryHandler.*")
@@ -2077,6 +2078,10 @@ def main():
 
     # טיפול ישיר בסרטונים שנשלחים על ידי האדמין - ללא ConversationHandler כדי לתמוך בשליחת מספר סרטונים בו-זמנית
     app.add_handler(MessageHandler(filters.VIDEO, handle_video))
+
+    # Telegram Stars payment handlers
+    app.add_handler(PreCheckoutQueryHandler(pre_checkout_callback))
+    app.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment_callback))
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.Regex("^🛠 פאנל אדמין$"), admin_panel))
