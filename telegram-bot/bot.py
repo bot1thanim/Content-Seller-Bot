@@ -653,17 +653,71 @@ async def star_package_buy(update: Update, context: ContextTypes.DEFAULT_TYPE):
     pkg   = PACKAGES[idx]
     cost  = int(pkg["stars"] * (1 - vip["discount"]))
     
-    sent = await send_videos_to_user(context, query.from_user.id, pkg["videos"])
-    if sent > 0:
-        record_order(query.from_user.id, pkg["price"], sent, "stars")
-        await query.message.reply_text(f"✅ רכישה הושלמה! {sent} סרטונים נשלחו אליך. תהנה!")
-        await alert_admin(context, f"⭐ *רכישה בכוכבים*\n👤 {query.from_user.first_name} (`{uid}`)\n🎬 סרטונים: {sent}\n💫 עלות: {cost} כוכבים")
-    else:
-        await query.message.reply_text("❌ מצטערים, אין מספיק סרטונים במאגר כרגע.")
+    # Create invoice for Telegram Stars payment
+    title = f"🎬 {pkg['videos']} סרטונים"
+    description = f"רכישת חבילה של {pkg['videos']} סרטונים"
+    payload = f"star_{idx}_{uid}_{int(time.time())}"
+    currency = "XTR"  # Telegram Stars currency code
+    prices = [{"label": title, "amount": cost}]
+    
+    try:
+        await context.bot.send_invoice(
+            chat_id=query.from_user.id,
+            title=title,
+            description=description,
+            payload=payload,
+            provider_token="",  # Empty for Telegram Stars
+            currency=currency,
+            prices=prices,
+            photo_url=None,
+            is_flexible=False,
+        )
+    except Exception as e:
+        await query.message.reply_text(f"❌ שגיאה בהתחלת התשלום: {str(e)}")
     
     await back_main(update, context)
 
 # ─── Referrals ────────────────────────────────────────────────────────────────
+
+
+async def pre_checkout_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Respond to the PreCheckoutQuery with ok=True."""
+    query = update.pre_checkout_query
+    if query.invoice_payload.startswith("star_"):
+        await query.answer(ok=True)
+    else:
+        await query.answer(ok=False, error_message="Something went wrong...")
+
+async def successful_payment_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Confirm the successful payment and deliver the content."""
+    msg = update.message
+    payment = msg.successful_payment
+    
+    if payment.invoice_payload.startswith("star_"):
+        uid = str(msg.from_user.id)
+        parts = payment.invoice_payload.split("_")
+        if len(parts) >= 2:
+            try:
+                pkg_idx = int(parts[1])
+                pkg = PACKAGES[pkg_idx]
+                sent = await send_videos_to_user(context, msg.from_user.id, pkg["videos"])
+                if sent > 0:
+                    record_order(msg.from_user.id, pkg["price"], sent, "stars")
+                    await msg.reply_text(
+                        f"✅ *תשלום בוצע בהצלחה!*\n\n"
+                        f"⭐ שילמת: {payment.total_amount} כוכבים\n"
+                        f"🎬 קיבלת: {sent} סרטונים\n\n"
+                        f"תהנה! 🎉",
+                        parse_mode="Markdown"
+                    )
+                    await alert_admin(
+                        context,
+                        f"⭐ *רכישה בכוכבים - אוטומטית*\n👤 {msg.from_user.first_name} (`{uid}`)\n🎬 סרטונים: {sent}\n💫 עלות: {payment.total_amount} כוכבים\n✅ סטטוס: הושלם אוטומטית"
+                    )
+                else:
+                    await msg.reply_text("❌ מצטערים, אין מספיק סרטונים במאגר כרגע. יבוצע החזר כספי אוטומטי.")
+            except Exception as e:
+                await msg.reply_text(f"❌ שגיאה בעיבוד התשלום: {str(e)}")
 
 async def referrals_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
