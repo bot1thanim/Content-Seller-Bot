@@ -56,14 +56,14 @@ COINS_PER_SHEKEL = 10
 ORDERS_PER_PAGE  = 10
 
 PACKAGES = [
-    {"price": 2,   "videos": 1,   "coins": 20,   "label_paypal": "₪2 – 1 סרטון",       "label_coins": "🪙20 – 1 סרטון"},
-    {"price": 9,   "videos": 5,   "coins": 90,   "label_paypal": "₪9 – 5 סרטונים",      "label_coins": "🪙90 – 5 סרטונים"},
-    {"price": 16,  "videos": 10,  "coins": 160,  "label_paypal": "₪16 – 10 סרטונים",    "label_coins": "🪙160 – 10 סרטונים"},
-    {"price": 30,  "videos": 20,  "coins": 300,  "label_paypal": "₪30 – 20 סרטונים",    "label_coins": "🪙300 – 20 סרטונים"},
-    {"price": 65,  "videos": 50,  "coins": 650,  "label_paypal": "₪65 – 50 סרטונים",    "label_coins": "🪙650 – 50 סרטונים"},
-    {"price": 85,  "videos": 70,  "coins": 850,  "label_paypal": "₪85 – 70 סרטונים",    "label_coins": "🪙850 – 70 סרטונים"},
-    {"price": 110, "videos": 100, "coins": 1100, "label_paypal": "₪110 – 100 סרטונים",  "label_coins": "🪙1100 – 100 סרטונים"},
-    {"price": 180, "videos": 200, "coins": 1800, "label_paypal": "₪180 – 200 סרטונים",  "label_coins": "🪙1800 – 200 סרטונים"},
+    {"price": 2,   "videos": 1,   "coins": 20,   "stars": 23,   "label_paypal": "₪2 – 1 סרטון",       "label_coins": "🪙20 – 1 סרטון",       "label_stars": "⭐23 – 1 סרטון"},
+    {"price": 9,   "videos": 5,   "coins": 90,   "stars": 101,  "label_paypal": "₪9 – 5 סרטונים",      "label_coins": "🪙90 – 5 סרטונים",      "label_stars": "⭐101 – 5 סרטונים"},
+    {"price": 16,  "videos": 10,  "coins": 160,  "stars": 179,  "label_paypal": "₪16 – 10 סרטונים",    "label_coins": "🪙160 – 10 סרטונים",    "label_stars": "⭐179 – 10 סרטונים"},
+    {"price": 30,  "videos": 20,  "coins": 300,  "stars": 335,  "label_paypal": "₪30 – 20 סרטונים",    "label_coins": "🪙300 – 20 סרטונים",    "label_stars": "⭐335 – 20 סרטונים"},
+    {"price": 65,  "videos": 50,  "coins": 650,  "stars": 725,  "label_paypal": "₪65 – 50 סרטונים",    "label_coins": "🪙650 – 50 סרטונים",    "label_stars": "⭐725 – 50 סרטונים"},
+    {"price": 85,  "videos": 70,  "coins": 850,  "stars": 947,  "label_paypal": "₪85 – 70 סרטונים",    "label_coins": "🪙850 – 70 סרטונים",    "label_stars": "⭐947 – 70 סרטונים"},
+    {"price": 110, "videos": 100, "coins": 1100, "stars": 1227, "label_paypal": "₪110 – 100 סרטונים",  "label_coins": "🪙1100 – 100 סרטונים",  "label_stars": "⭐1227 – 100 סרטונים"},
+    {"price": 180, "videos": 200, "coins": 1800, "stars": 2007, "label_paypal": "₪180 – 200 סרטונים",  "label_coins": "🪙1800 – 200 סרטונים",  "label_stars": "⭐2007 – 200 סרטונים"},
 ]
 
 # VIP Levels
@@ -507,6 +507,7 @@ async def payment_method_menu(update: Update, context: ContextTypes.DEFAULT_TYPE
         reply_markup=InlineKeyboardMarkup([
             [InlineKeyboardButton("💳 תשלום בפייפאל",                        callback_data="paypal_menu")],
             [InlineKeyboardButton(f"🪙 שלם במטבעות (יתרה: {balance})",      callback_data="coins_menu")],
+            [InlineKeyboardButton("⭐ שלם בכוכבי טלגרם",                    callback_data="stars_menu")],
             [InlineKeyboardButton("🔙 חזרה",                                 callback_data="back_main")],
         ]),
     )
@@ -616,6 +617,48 @@ async def coin_package_buy(update: Update, context: ContextTypes.DEFAULT_TYPE):
         coins[uid] = bal # Refund
         save_json(COINS_FILE, coins)
         await query.message.reply_text("❌ מצטערים, אין מספיק סרטונים במאגר כרגע. המטבעות הוחזרו.")
+    
+    await back_main(update, context)
+
+async def stars_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if await maintenance_gate(update):
+        return
+    uid = str(query.from_user.id)
+    vip = get_user_vip(uid)
+    
+    btns = []
+    for i, p in enumerate(PACKAGES):
+        discounted = int(p["stars"] * (1 - vip["discount"]))
+        label = f"⭐{discounted} – {p['videos']} סרטונים"
+        if vip["discount"] > 0:
+            label += f" ({int(vip['discount']*100)}% הנחה)"
+        btns.append([InlineKeyboardButton(label, callback_data=f"star_{i}")])
+        
+    btns.append([InlineKeyboardButton("🔙 חזרה", callback_data="payment_method")])
+    await query.edit_message_text(
+        f"⭐ *רכישה בכוכבי טלגרם*\n\nבחר חבילה:",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(btns),
+    )
+
+async def star_package_buy(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    uid   = str(query.from_user.id)
+    vip   = get_user_vip(uid)
+    idx   = int(query.data.split("_")[1])
+    pkg   = PACKAGES[idx]
+    cost  = int(pkg["stars"] * (1 - vip["discount"]))
+    
+    sent = await send_videos_to_user(context, query.from_user.id, pkg["videos"])
+    if sent > 0:
+        record_order(query.from_user.id, pkg["price"], sent, "stars")
+        await query.message.reply_text(f"✅ רכישה הושלמה! {sent} סרטונים נשלחו אליך. תהנה!")
+        await alert_admin(context, f"⭐ *רכישה בכוכבים*\n👤 {query.from_user.first_name} (`{uid}`)\n🎬 סרטונים: {sent}\n💫 עלות: {cost} כוכבים")
+    else:
+        await query.message.reply_text("❌ מצטערים, אין מספיק סרטונים במאגר כרגע.")
     
     await back_main(update, context)
 
@@ -2046,6 +2089,8 @@ def main():
         (r"^pp_\d+$",                   paypal_package_selected),
         ("^coins_menu$",                coins_menu),
         (r"^coin_\d+$",                 coin_package_buy),
+        ("^stars_menu$",                stars_menu),
+        (r"^star_\d+$",                 star_package_buy),
         ("^referrals$",                 referrals_menu),
         ("^wallet$",                    wallet_menu),
         ("^daily_bonus$",               daily_bonus),
