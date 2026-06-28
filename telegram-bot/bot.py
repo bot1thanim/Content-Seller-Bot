@@ -1322,6 +1322,7 @@ async def admin_support_reply_send(update: Update, context: ContextTypes.DEFAULT
     return ConversationHandler.END
 
 
+
 def main():
     ensure_data_files()
 
@@ -1332,12 +1333,8 @@ def main():
         return
 
     app = Application.builder().token(TOKEN).build()
-    # IMPORTANT: Payment handlers must be registered early
     app.add_handler(PreCheckoutQueryHandler(pre_checkout_callback))
     app.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment_callback))
-
-
-    # ── Conversation handlers ─────────────────────────────────────────────────
 
     check_conv = ConversationHandler(
         entry_points=[CallbackQueryHandler(admin_check_start, pattern="^admin_check$")],
@@ -1377,15 +1374,6 @@ def main():
         fallbacks=[CommandHandler("cancel", cancel)],
         per_message=False, per_chat=True,
     )
-    pass # coins_conv removed\n    _unused_coins_conv = ConversationHandler(
-        entry_points=[CallbackQueryHandler(admin_coins_start, pattern="^admin_coins$")],
-        states={
-            ADMIN_COINS_ID:     [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_coins_id)],
-            ADMIN_COINS_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_coins_amount)],
-        },
-        fallbacks=[CommandHandler("cancel", cancel)],
-        per_message=False, per_chat=True,
-    )
     vip_conv = ConversationHandler(
         entry_points=[CallbackQueryHandler(admin_vip_start, pattern="^admin_vip$")],
         states={
@@ -1396,17 +1384,6 @@ def main():
             CommandHandler("cancel", cancel),
             CallbackQueryHandler(back_admin, pattern="^back_admin$"),
         ],
-        per_message=False, per_chat=True,
-    )
-    pass # coupon_new_conv removed\n    _unused_coupon_new_conv = ConversationHandler(
-        entry_points=[CallbackQueryHandler(admin_coupon_new_start, pattern="^admin_coupon_new$")],
-        states={
-            ADMIN_COUPON_CODE:   [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_coupon_get_code)],
-            ADMIN_COUPON_COINS:  [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_coupon_get_coins)],
-            ADMIN_COUPON_EXPIRY: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_coupon_get_expiry)],
-            ADMIN_COUPON_LIMIT:  [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_coupon_get_limit)],
-        },
-        fallbacks=[CommandHandler("cancel", cancel)],
         per_message=False, per_chat=True,
     )
     multiplier_conv = ConversationHandler(
@@ -1456,51 +1433,33 @@ def main():
         ],
         per_message=False, per_chat=True,
     )
-    pass # coupon_redeem_conv removed\n    _unused_coupon_redeem_conv = ConversationHandler(
-        entry_points=[CallbackQueryHandler(coupon_redeem_start, pattern="^coupon_redeem$")],
-        states={COUPON_REDEEM: [MessageHandler(filters.TEXT & ~filters.COMMAND, coupon_redeem_input)]},
-        fallbacks=[
-            CommandHandler("cancel", cancel),
-            CallbackQueryHandler(back_main, pattern="^back_main$"),
-        ],
-        per_message=False, per_chat=True,
-    )
     support_reply_conv = ConversationHandler(
         entry_points=[CallbackQueryHandler(admin_support_reply_start, pattern=r"^support_reply_\d+$")],
         states={SUPPORT_REPLY_MSG: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_support_reply_send)]},
         fallbacks=[CommandHandler("cancel", cancel)],
         per_message=False, per_chat=True,
     )
-    # ── Register handlers ─────────────────────────────────────────────────────────────────────────────
+
     for conv in [
-        check_conv, send_conv, approve_conv, broadcast_conv,  vip_conv,
-         multiplier_conv, restore_conv, global_reset_conv,
-        video_search_conv, support_conv,  support_reply_conv,
+        check_conv, send_conv, approve_conv, broadcast_conv, vip_conv,
+        multiplier_conv, restore_conv, global_reset_conv,
+        video_search_conv, support_conv, support_reply_conv,
     ]:
         app.add_handler(conv)
 
-    # טיפול ישיר בסרטונים שנשלחים על ידי האדמין - ללא ConversationHandler כדי לתמוך בשליחת מספר סרטונים בו-זמנית
     app.add_handler(MessageHandler(filters.VIDEO, handle_video))
-
-    # Telegram Stars payment handlers
-
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.Regex("^🛠 פאנל אדמין$"), admin_panel))
 
-    # Callback handlers (standalone)
     cbs = [
         ("^noop$",                      noop_callback),
         ("^payment_method$",            payment_method_menu),
         ("^paypal_menu$",               paypal_menu),
         (r"^pp_\d+$",                   paypal_package_selected),
         (r"^ppverify_\d+_",           paypal_verify_payment),
-        ("^coins_menu$",                coins_menu),
-        
         ("^stars_menu$",                stars_menu),
         (r"^star_\d+$",                 star_package_buy),
         ("^referrals$",                 referrals_menu),
-        
-        
         ("^vip_info$",                  vip_info),
         ("^back_main$",                 back_main),
         ("^admin_stats$",               admin_stats),
@@ -1516,7 +1475,7 @@ def main():
         ("^admin_delete$",              admin_delete_start),
         ("^admin_delete_confirm$",      admin_delete_confirm),
         ("^admin_global_reset$",        admin_global_reset_start),
-                ("^admin_maintenance$",          admin_maintenance_toggle),
+        ("^admin_maintenance$",          admin_maintenance_toggle),
         ("^maint_on$",                   admin_maintenance_toggle),
         ("^maint_off$",                  admin_maintenance_toggle),
         ("^back_admin$",                back_admin),
@@ -1544,5 +1503,5 @@ def main():
     except Exception as e:
         logger.error(f"Error starting bot: {e}")
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
