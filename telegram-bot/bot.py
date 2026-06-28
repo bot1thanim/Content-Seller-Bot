@@ -424,9 +424,12 @@ def _srv():
     except: pass
 
 # --- Main ---
-async def main():
+def main():
     ensure_data_files()
     threading.Thread(target=_srv, daemon=True).start()
+    # Create a new event loop explicitly for Python 3.14+ compatibility
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
     app = Application.builder().token(TOKEN).build()
     
     app.add_handler(CommandHandler("start", start))
@@ -445,7 +448,6 @@ async def main():
         states={SUPPORT_WAITING_MSG: [MessageHandler(filters.TEXT & ~filters.COMMAND, support_receive_msg)]},
         fallbacks=[CommandHandler("cancel", cancel), CallbackQueryHandler(back_main, pattern="^back_main$")], per_message=False, per_chat=True
     ))
-
     cbs = [
         ("^payment_method$", payment_method_menu), ("^stars_menu$", stars_menu), (r"^star_\\d+$", star_package_buy),
         ("^paypal_menu$", paypal_menu), (r"^pp_\\d+$", paypal_package_selected), (r"^ppverify_\\d+_", paypal_verify_payment),
@@ -453,9 +455,8 @@ async def main():
         ("^noop$", noop_callback)
     ]
     for p, h in cbs: app.add_handler(CallbackQueryHandler(h, pattern=p))
-    
     logger.info("Bot started...")
-    await app.run_polling()
+    app.run_polling()
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
