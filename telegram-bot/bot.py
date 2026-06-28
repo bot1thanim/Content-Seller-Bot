@@ -424,7 +424,7 @@ def _srv():
     except: pass
 
 # --- Main ---
-def main():
+async def main():
     ensure_data_files()
     threading.Thread(target=_srv, daemon=True).start()
     app = Application.builder().token(TOKEN).build()
@@ -455,7 +455,7 @@ def main():
     for p, h in cbs: app.add_handler(CallbackQueryHandler(h, pattern=p))
     
     logger.info("Bot started...")
-    app.run_polling()
+    await app.run_polling()
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
