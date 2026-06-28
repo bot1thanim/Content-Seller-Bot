@@ -79,25 +79,28 @@ VIP_LEVELS = [
     {"name": "יהלום", "min_purchases": 31, "discount": 0.40, "icon": "💎"},
 ]
 
-# ── Conversation states ────────────────────────────────────────────────────────
+# ── Conversation states ──
 (
-    ADMIN_SEND_MSG,           # 0
-    ADMIN_SEND_ID,            # 1
-    ADMIN_APPROVE_COUNT,      # 2
-    ADMIN_APPROVE_ID,         # 3
-    ADMIN_CHECK_USER,         # 4
-           # 15
-                # 16
-    ADMIN_MULTIPLIER,         # 17
-    ADMIN_RESTORE,            # 18
-    ADMIN_GLOBAL_RESET_CONFIRM, # 19
-    ADMIN_VIDEO_SEARCH,       # 20
-    ADMIN_VIDEO_CAT,          # 21
-    ADMIN_VIDEO_PREVIEW,      # 22
-    ADMIN_BROADCAST_MEDIA,    # 23
-    ADMIN_VIP_ID,             # 24
-    ADMIN_VIP_LEVEL,          # 25
-) = range(26)
+    ADMIN_SEND_MSG,
+    ADMIN_SEND_ID,
+    ADMIN_APPROVE_COUNT,
+    ADMIN_APPROVE_ID,
+    ADMIN_CHECK_USER,
+    ADMIN_BROADCAST,
+    ADMIN_BROADCAST_BTN,
+    ADMIN_BROADCAST_DELAY,
+    SUPPORT_WAITING_MSG,
+    SUPPORT_REPLY_MSG,
+    ADMIN_MULTIPLIER,
+    ADMIN_RESTORE,
+    ADMIN_GLOBAL_RESET_CONFIRM,
+    ADMIN_VIDEO_SEARCH,
+    ADMIN_VIDEO_CAT,
+    ADMIN_VIDEO_PREVIEW,
+    ADMIN_BROADCAST_MEDIA,
+    ADMIN_VIP_ID,
+    ADMIN_VIP_LEVEL
+) = range(19)
 
 
 # ─── Data helpers ─────────────────────────────────────────────────────────────
