@@ -781,6 +781,48 @@ async def admin_multiplier_apply(update: Update, context: ContextTypes.DEFAULT_T
     await update.message.reply_text(f"✅ הודעות נשלחו ל-{sent} משתמשים.", reply_markup=get_admin_inline_keyboard())
     return ConversationHandler.END
 
+
+async def pre_checkout_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    logger.info("--- RECEIVED PRE_CHECKOUT_QUERY ---")
+    """Respond to the PreCheckoutQuery with ok=True."""
+    query = update.pre_checkout_query
+    if query.invoice_payload.startswith("star_"):
+        await query.answer(ok=True)
+    else:
+        await query.answer(ok=False, error_message="Something went wrong...")
+
+async def successful_payment_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    logger.info("--- RECEIVED SUCCESSFUL_PAYMENT ---")
+    """Confirm the successful payment and deliver the content."""
+    msg = update.message
+    payment = msg.successful_payment
+    
+    if payment.invoice_payload.startswith("star_"):
+        uid = str(msg.from_user.id)
+        parts = payment.invoice_payload.split("_")
+        if len(parts) >= 2:
+            try:
+                pkg_idx = int(parts[1])
+                pkg = PACKAGES[pkg_idx]
+                sent = await send_videos_to_user(context, msg.from_user.id, pkg["videos"])
+                if sent > 0:
+                    record_order(msg.from_user.id, pkg["price"], sent, "stars")
+                    await msg.reply_text(
+                        f"✅ *תשלום בוצע בהצלחה!*\n\n"
+                        f"⭐ שילמת: {payment.total_amount} כוכבים\n"
+                        f"🎬 קיבלת: {sent} סרטונים\n\n"
+                        f"תהנה! 🎉",
+                        parse_mode="Markdown"
+                    )
+                    await alert_admin(
+                        context,
+                        f"⭐ *רכישה בכוכבים - אוטומטית*\n👤 {msg.from_user.first_name} (`{uid}`)\n🎬 סרטונים: {sent}\n💫 עלות: {payment.total_amount} כוכבים\n✅ סטטוס: הושלם אוטומטית"
+                    )
+                else:
+                    await msg.reply_text("❌ מצטערים, אין מספיק סרטונים במאגר כרגע. יבוצע החזר כספי אוטומטי.")
+            except Exception as e:
+                await msg.reply_text(f"❌ שגיאה בעיבוד התשלום: {str(e)}")
+
 # ─── Admin: backup ZIP ────────────────────────────────────────────────────────
 
 async def admin_backup(update: Update, context: ContextTypes.DEFAULT_TYPE):
