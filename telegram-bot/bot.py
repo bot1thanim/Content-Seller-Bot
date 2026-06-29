@@ -52,6 +52,7 @@ PAYPAL_API_BASE = "https://api-m.paypal.com"
 
 DATA_DIR       = Path("data")
 USERS_FILE     = DATA_DIR / "users.json"
+REFERRALS_FILE = DATA_DIR / "referrals.json"
 VIDEOS_FILE    = DATA_DIR / "videos.json"
 ORDERS_FILE    = DATA_DIR / "orders.json"
 SETTINGS_FILE  = DATA_DIR / "settings.json"
@@ -88,16 +89,20 @@ VIP_LEVELS = [
     ADMIN_VIP_ID,
     ADMIN_VIP_LEVEL,
     ADMIN_DELETE_VIDEO,
-) = range(11)
+    ADMIN_COINS_ID,
+    ADMIN_COINS_VAL,
+    ADMIN_MULTIPLIER,
+) = range(14)
 
 # --- Data Helpers ---
 def ensure_data_files():
     DATA_DIR.mkdir(exist_ok=True)
     defaults = [
         (USERS_FILE,     {}),
+        (REFERRALS_FILE, {}),
         (VIDEOS_FILE,    []),
         (ORDERS_FILE,    []),
-        (SETTINGS_FILE,  {"maintenance": False}),
+        (SETTINGS_FILE,  {"referral_multiplier": 1.0, "maintenance": False, "daily_gift": 1}),
     ]
     for filepath, default in defaults:
         if not filepath.exists():
@@ -117,7 +122,9 @@ def save_json(filepath, data):
 def load_settings():
     s = load_json(SETTINGS_FILE)
     if not isinstance(s, dict): s = {}
+    s.setdefault("referral_multiplier", 1.0)
     s.setdefault("maintenance", False)
+    s.setdefault("daily_gift", 1)
     return s
 
 def save_settings(s):
@@ -134,7 +141,7 @@ def get_user_vip(user_id):
             current_vip = level
     return current_vip
 
-def register_user(user):
+def register_user(user, ref_id=None):
     users = load_json(USERS_FILE)
     uid = str(user.id)
     if uid not in users:
@@ -145,9 +152,25 @@ def register_user(user):
             "joined": str(date.today()),
             "purchases": 0,
             "total_spent": 0,
+            "coins": 0,
+            "last_daily": None,
             "seen_videos": []
         }
         save_json(USERS_FILE, users)
+        if ref_id and str(ref_id) != uid:
+            referrals = load_json(REFERRALS_FILE)
+            rk = str(ref_id)
+            if rk not in referrals: referrals[rk] = {"count": 0, "referred_ids": []}
+            if uid not in referrals[rk]["referred_ids"]:
+                referrals[rk]["count"] += 1
+                referrals[rk]["referred_ids"].append(uid)
+                save_json(REFERRALS_FILE, referrals)
+                # Give referral bonus
+                s = load_settings()
+                ref_user = users.get(rk)
+                if ref_user:
+                    ref_user["coins"] = ref_user.get("coins", 0) + int(s.get("referral_multiplier", 1.0))
+                    save_json(USERS_FILE, users)
     return users.get(uid)
 
 async def send_videos_to_user(context, user_id, count):
@@ -221,9 +244,14 @@ def capture_paypal_order(order_id):
 # --- Keyboards ---
 def get_main_keyboard(user_id):
     vip = get_user_vip(user_id)
+    users = load_json(USERS_FILE)
+    u = users.get(str(user_id), {})
+    coins = u.get("coins", 0)
     return InlineKeyboardMarkup([
         [InlineKeyboardButton(f"{vip['icon']} רמת {vip['name']}", callback_data="vip_info")],
-        [InlineKeyboardButton("💳 תשלום", callback_data="payment_method"), InlineKeyboardButton("💬 תמיכה", callback_data="support")]
+        [InlineKeyboardButton(f"💰 מטבעות: {coins}", callback_data="coins_info"), InlineKeyboardButton("🎁 מתנה יומית", callback_data="daily_gift")],
+        [InlineKeyboardButton("💳 תשלום", callback_data="payment_method"), InlineKeyboardButton("👥 הפניות", callback_data="referrals")],
+        [InlineKeyboardButton("💬 תמיכה", callback_data="support")]
     ])
 
 def get_admin_inline_keyboard():
@@ -236,13 +264,15 @@ def get_admin_inline_keyboard():
         [InlineKeyboardButton("📩 שלח למשתמש", callback_data="admin_send"), InlineKeyboardButton("✅ אישור ידני", callback_data="admin_approve")],
         [InlineKeyboardButton("🎬 גלריה", callback_data="admin_gallery_0"), InlineKeyboardButton("🔢 חיפוש וידאו", callback_data="admin_video_search")],
         [InlineKeyboardButton("📢 שלח לכולם", callback_data="admin_broadcast"), InlineKeyboardButton("💎 דרגות VIP", callback_data="admin_vip")],
+        [InlineKeyboardButton("💰 ניהול מטבעות", callback_data="admin_coins"), InlineKeyboardButton("💱 מכפיל הפניות", callback_data="admin_multiplier")],
         [InlineKeyboardButton("💾 גיבוי", callback_data="admin_backup"), InlineKeyboardButton("🔙 חזרה", callback_data="back_main")]
     ])
 
 # --- Handlers ---
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    ref_id = context.args[0] if context.args else None
     user = update.effective_user
-    register_user(user)
+    register_user(user, ref_id)
     s = load_settings()
     if s.get("maintenance") and user.id != ADMIN_ID:
         await update.message.reply_text("🔧 הבוט בתחזוקה כרגע. נחזור בקרוב!")
@@ -254,6 +284,65 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("ניהול:", reply_markup=kb)
     else:
         await update.message.reply_text(txt, reply_markup=kb)
+
+async def daily_gift(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    uid = str(query.from_user.id)
+    users = load_json(USERS_FILE)
+    u = users.get(uid)
+    if not u: return
+    
+    today = str(date.today())
+    if u.get("last_daily") == today:
+        await query.answer("❌ כבר קיבלת את המתנה היומית היום!", show_alert=True)
+        return
+    
+    s = load_settings()
+    gift = s.get("daily_gift", 1)
+    u["coins"] = u.get("coins", 0) + gift
+    u["last_daily"] = today
+    save_json(USERS_FILE, users)
+    await query.answer(f"🎁 קיבלת {gift} מטבעות במתנה!", show_alert=True)
+    await query.edit_message_reply_markup(reply_markup=get_main_keyboard(query.from_user.id))
+
+async def coins_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    uid = str(query.from_user.id)
+    users = load_json(USERS_FILE)
+    u = users.get(uid, {})
+    coins = u.get("coins", 0)
+    txt = (
+        f"💰 *המטבעות שלך*\n\n"
+        f"יש לך כרגע: {coins} מטבעות.\n\n"
+        f"ניתן להשיג מטבעות על ידי:\n"
+        f"1. 🎁 מתנה יומית\n"
+        f"2. 👥 הפניית חברים\n\n"
+        f"בעתיד תוכל להמיר מטבעות לסרטונים!"
+    )
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 חזרה", callback_data="back_main")]])
+    await query.edit_message_text(txt, parse_mode="Markdown", reply_markup=kb)
+
+async def referrals_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    uid = str(query.from_user.id)
+    referrals = load_json(REFERRALS_FILE)
+    s = load_settings()
+    ref_data = referrals.get(uid, {"count": 0})
+    count = ref_data.get("count", 0)
+    multiplier = s.get("referral_multiplier", 1.0)
+    link = f"https://t.me/{(await context.bot.get_me()).username}?start={uid}"
+    txt = (
+        f"👥 *מערכת הפניות*\n\n"
+        f"הפנית {count} חברים\n"
+        f"בונוס לכל הפניה: {int(multiplier)} מטבעות\n\n"
+        f"🔗 הקישור שלך:\n`{link}`\n\n"
+        f"כל חבר שמצטרף דרך הקישור שלך מזכה אותך במטבעות!"
+    )
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 חזרה", callback_data="back_main")]])
+    await query.edit_message_text(txt, parse_mode="Markdown", reply_markup=kb)
 
 async def payment_method_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -376,11 +465,14 @@ async def admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     u, o, v = load_json(USERS_FILE), load_json(ORDERS_FILE), load_json(VIDEOS_FILE)
+    referrals = load_json(REFERRALS_FILE)
+    total_refs = sum(r.get("count", 0) for r in referrals.values())
     txt = (
         f"📊 *סטטיסטיקה:*\n"
         f"👥 משתמשים: {len(u)}\n"
         f"🧾 הזמנות: {len(o)}\n"
-        f"🎬 סרטונים בגלריה: {len(v)}"
+        f"🎬 סרטונים בגלריה: {len(v)}\n"
+        f"🔗 סה\"כ הפניות: {total_refs}"
     )
     await query.edit_message_text(txt, parse_mode="Markdown", reply_markup=get_admin_inline_keyboard())
 
@@ -426,6 +518,8 @@ async def admin_check_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
     u = load_json(USERS_FILE).get(uid)
     if u:
         vip = get_user_vip(int(uid))
+        referrals = load_json(REFERRALS_FILE)
+        ref_count = referrals.get(uid, {}).get("count", 0)
         txt = (
             f"👤 *משתמש {uid}*\n"
             f"שם: {u.get('first_name', 'לא ידוע')}\n"
@@ -433,6 +527,8 @@ async def admin_check_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"הצטרף: {u.get('joined', 'לא ידוע')}\n"
             f"רכישות: {u.get('purchases', 0)}\n"
             f"שילם: ₪{u.get('total_spent', 0)}\n"
+            f"מטבעות: {u.get('coins', 0)}\n"
+            f"הפניות: {ref_count}\n"
             f"דרגה: {vip['icon']} {vip['name']}"
         )
         await update.message.reply_text(txt, parse_mode="Markdown", reply_markup=get_admin_inline_keyboard())
@@ -456,7 +552,7 @@ async def users_page(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lines = [f"👥 *משתמשים (עמוד {page+1}):*\n"]
     for u in chunk:
         uname = f"@{u['username']}" if u.get("username") else "אין יוזר"
-        lines.append(f"• `{u['id']}` – {u['first_name']} ({uname}) | {u.get('purchases',0)} רכישות")
+        lines.append(f"• `{u['id']}` – {u['first_name']} ({uname}) | {u.get('coins',0)} מטבעות")
     nav = []
     if page > 0:
         nav.append(InlineKeyboardButton("◀️ הקודם", callback_data=f"users_page_{page-1}"))
@@ -654,13 +750,59 @@ async def admin_vip_set_level(update: Update, context: ContextTypes.DEFAULT_TYPE
     await update.message.reply_text(f"✅ דרגת המשתמש עודכנה.", reply_markup=get_admin_inline_keyboard())
     return ConversationHandler.END
 
+async def admin_coins_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.callback_query.answer()
+    await update.callback_query.edit_message_text("💰 שלח ID משתמש להוספת/הורדת מטבעות:")
+    return ADMIN_COINS_ID
+
+async def admin_coins_get_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    uid = update.message.text.strip()
+    users = load_json(USERS_FILE)
+    if uid not in users:
+        await update.message.reply_text("❌ לא נמצא. נסה שוב:")
+        return ADMIN_COINS_ID
+    context.user_data["coins_target_id"] = uid
+    await update.message.reply_text(f"✅ נמצא: {users[uid]['first_name']} (מטבעות: {users[uid].get('coins',0)})\nכמה מטבעות להוסיף? (לדוגמה: 5 או -5):")
+    return ADMIN_COINS_VAL
+
+async def admin_coins_set(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        val = int(update.message.text.strip())
+    except:
+        await update.message.reply_text("❌ מספר לא תקין:")
+        return ADMIN_COINS_VAL
+    uid = context.user_data.get("coins_target_id")
+    users = load_json(USERS_FILE)
+    users[uid]["coins"] = users[uid].get("coins", 0) + val
+    save_json(USERS_FILE, users)
+    await update.message.reply_text(f"✅ עודכן! סה\"כ מטבעות: {users[uid]['coins']}", reply_markup=get_admin_inline_keyboard())
+    return ConversationHandler.END
+
+async def admin_multiplier_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.callback_query.answer()
+    s = load_settings()
+    await update.callback_query.edit_message_text(f"💱 מכפיל הפניות נוכחי: x{s.get('referral_multiplier',1.0)}\nשלח ערך חדש:")
+    return ADMIN_MULTIPLIER
+
+async def admin_multiplier_set(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        val = float(update.message.text.strip())
+    except:
+        await update.message.reply_text("❌ ערך לא תקין:")
+        return ADMIN_MULTIPLIER
+    s = load_settings()
+    s["referral_multiplier"] = val
+    save_settings(s)
+    await update.message.reply_text(f"✅ מכפיל עודכן ל-x{val}", reply_markup=get_admin_inline_keyboard())
+    return ConversationHandler.END
+
 async def admin_backup(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     try:
         buf = io.BytesIO()
         with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
-            for f in [USERS_FILE, ORDERS_FILE, VIDEOS_FILE, SETTINGS_FILE]:
+            for f in [USERS_FILE, ORDERS_FILE, VIDEOS_FILE, REFERRALS_FILE, SETTINGS_FILE]:
                 if f.exists(): zf.write(f, f.name)
         buf.seek(0)
         await context.bot.send_document(chat_id=ADMIN_ID, document=buf, filename=f"backup_{date.today()}.zip")
@@ -767,6 +909,19 @@ def main():
         fallbacks=[CommandHandler("cancel", cancel)], per_message=False, per_chat=True
     ))
     app.add_handler(ConversationHandler(
+        entry_points=[CallbackQueryHandler(admin_coins_start, pattern="^admin_coins$")],
+        states={
+            ADMIN_COINS_ID:  [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_coins_get_id)],
+            ADMIN_COINS_VAL: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_coins_set)],
+        },
+        fallbacks=[CommandHandler("cancel", cancel)], per_message=False, per_chat=True
+    ))
+    app.add_handler(ConversationHandler(
+        entry_points=[CallbackQueryHandler(admin_multiplier_start, pattern="^admin_multiplier$")],
+        states={ADMIN_MULTIPLIER: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_multiplier_set)]},
+        fallbacks=[CommandHandler("cancel", cancel)], per_message=False, per_chat=True
+    ))
+    app.add_handler(ConversationHandler(
         entry_points=[CallbackQueryHandler(admin_video_search_start, pattern="^admin_video_search$")],
         states={ADMIN_VIDEO_SEARCH: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_video_search_result)]},
         fallbacks=[CommandHandler("cancel", cancel)], per_message=False, per_chat=True
@@ -794,7 +949,10 @@ def main():
         ("^admin_vip$",             admin_vip_menu),
         (r"^users_page_\d+$",       users_page),
         (r"^admin_gallery_\d+$",    admin_gallery),
+        ("^referrals$",             referrals_menu),
         ("^vip_info$",              vip_info),
+        ("^daily_gift$",            daily_gift),
+        ("^coins_info$",            coins_info),
         ("^noop$",                  noop_callback),
     ]
     for p, h in cbs:
