@@ -90,7 +90,7 @@ VIP_LEVELS = [
     ADMIN_BROADCAST_MEDIA,    # 23
     ADMIN_VIP_ID,             # 24
     ADMIN_VIP_LEVEL,          # 25
-) = range(26)
+) = range(23)
 # ─── Data helpers ─────────────────────────────────────────────────────────────
 def ensure_data_files():
     DATA_DIR.mkdir(exist_ok=True)
