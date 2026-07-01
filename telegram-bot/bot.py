@@ -35,6 +35,7 @@ warnings.filterwarnings("ignore", message=".*per_message=False.*CallbackQueryHan
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+if not TOKEN: logger.error("TELEGRAM_BOT_TOKEN is missing!")
     level=logging.INFO,
 )
 logger = logging.getLogger(__name__)
@@ -1879,6 +1880,9 @@ def _start_health_server():
 
 # ─── Main ─────────────────────────────────────────────────────────────────────
 
+    logger.info("Starting main function...")
+    logger.info(f"Token present: {bool(TOKEN)}")
+    logger.info(f"Admin ID: {ADMIN_ID}")
 def main():
     ensure_data_files()
 
