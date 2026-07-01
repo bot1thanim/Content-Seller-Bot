@@ -2080,7 +2080,7 @@ def main():
     async def run_application():
         await app.initialize()
         await app.start()
-        await app.updater.start_polling(allowed_updates=Update.ALL_TYPES)
+        await app.updater.start_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=False)
         while True:
             await asyncio.sleep(3600)
 
@@ -2088,7 +2088,7 @@ def main():
         if sys.version_info >= (3, 11):
             asyncio.run(run_application())
         else:
-            app.run_polling(allowed_updates=Update.ALL_TYPES)
+            app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=False)
     except Exception as e:
         logger.error(f"Error starting bot: {e}")
 
