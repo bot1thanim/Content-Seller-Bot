@@ -1770,7 +1770,7 @@ async def admin_maintenance_toggle(update: Update, context: ContextTypes.DEFAULT
                 try:
                     await context.bot.send_message(
                         chat_id=uid,
-                        text="🎉 *הבוט חזר לפעילות!*\n\nמוזמנים להמשיך להשתמש בבוט וליהנות! 🚀",
+                        text="📢 *הבוט חזר לפעילות!*\n\nלחצו על /start כדי להתחיל! ✅",
                         parse_mode="Markdown"
                     )
                     count_sent += 1
