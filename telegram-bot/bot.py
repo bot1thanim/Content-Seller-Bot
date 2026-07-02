@@ -11,7 +11,6 @@ import time
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from datetime import datetime, date, timezone, timedelta
 from pathlib import Path
-
 from telegram import (
     Update,
     InlineKeyboardButton,
@@ -35,7 +34,6 @@ warnings.filterwarnings("ignore", message=".*per_message=False.*CallbackQueryHan
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-if not TOKEN: logger.error("TELEGRAM_BOT_TOKEN is missing!")
     level=logging.INFO,
 )
 logger = logging.getLogger(__name__)
