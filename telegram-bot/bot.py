@@ -2083,7 +2083,43 @@ def main():
     async def run_application():
         await app.initialize()
         await app.start()
+        
+        # הודעת חזרה לפעילות למשתמשים ששלחו הודעות כשהבוט היה כבוי
+        async def notify_back_online():
+            try:
+                # נחכה רגע שהפולניג יתחיל לקבל עדכונים
+                await asyncio.sleep(5)
+                settings = load_settings()
+                waiting = settings.get("waiting_users", [])
+                if waiting:
+                    logger.info(f"Sending restart notification to {len(waiting)} users...")
+                    count_sent = 0
+                    for uid in waiting:
+                        try:
+                            await app.bot.send_message(
+                                chat_id=uid,
+                                text="📢 *הבוט חזר לפעילות!*\n\nלחצו על /start כדי להתחיל! ✅",
+                                parse_mode="Markdown"
+                            )
+                            count_sent += 1
+                            await asyncio.sleep(0.05) # מניעת ספאם
+                        except Exception:
+                            pass
+                    
+                    # איפוס הרשימה
+                    settings = load_settings()
+                    settings["waiting_users"] = []
+                    save_settings(settings)
+                    logger.info(f"Restart notification sent to {count_sent} users.")
+            except Exception as e:
+                logger.error(f"Error in notify_back_online: {e}")
+
+        # הפעלת הפולינג
         await app.updater.start_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=False)
+        
+        # הפעלת משימת ההודעות ברקע
+        asyncio.create_task(notify_back_online())
+        
         while True:
             await asyncio.sleep(3600)
 
