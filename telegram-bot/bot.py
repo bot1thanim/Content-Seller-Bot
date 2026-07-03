@@ -274,8 +274,8 @@ def record_order(user_id: int, amount: float, videos_count: int, order_type: str
 async def alert_admin(context, text: str):
     try:
         await context.bot.send_message(chat_id=ADMIN_ID, text=text, parse_mode="Markdown")
-    except Exception:
-        pass
+    except Exception as e:
+        logger.warning(f"Failed to alert admin: {e}")
 
 def build_zip_of_data() -> io.BytesIO:
     buf = io.BytesIO()
@@ -1264,7 +1264,8 @@ async def admin_broadcast_get_delay(update: Update, context: ContextTypes.DEFAUL
             else:
                 await context.bot.send_message(chat_id=int(uid), text=msg, reply_markup=markup)
             sent += 1
-        except Exception:
+        except Exception as e:
+            logger.warning(f"Failed to send broadcast to {uid}: {e}")
             failed += 1
         if (sent + failed) % 20 == 0:
             try:
@@ -1878,10 +1879,10 @@ def _start_health_server():
 
 # ─── Main ─────────────────────────────────────────────────────────────────────
 
+def main():
     logger.info("Starting main function...")
     logger.info(f"Token present: {bool(TOKEN)}")
     logger.info(f"Admin ID: {ADMIN_ID}")
-def main():
     ensure_data_files()
 
     threading.Thread(target=_start_health_server, daemon=True).start()
