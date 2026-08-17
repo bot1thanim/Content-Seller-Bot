@@ -3060,7 +3060,6 @@ def main():
                 await app.updater.start_polling(
                     allowed_updates=Update.ALL_TYPES,
                     drop_pending_updates=False,
-                    error_callback=handle_polling_error,
                 )
                 # Keep the async task alive
                 while app.updater.running:
