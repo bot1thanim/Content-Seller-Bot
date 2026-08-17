@@ -10,6 +10,7 @@ import warnings
 import zipfile
 import time
 import uuid
+import sys
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from datetime import datetime, date, timezone, timedelta
 from pathlib import Path
@@ -1412,11 +1413,32 @@ def main():
     for pattern, handler in cbs:
         app.add_handler(CallbackQueryHandler(handler, pattern=pattern))
 
-    def handle_polling_error(error):
-        if isinstance(error, Conflict):
-            os._exit(0)
+    async def run_application():
+        await app.initialize()
+        await app.start()
+        
+        def handle_polling_error(error):
+            if isinstance(error, Conflict):
+                logger.info("Polling conflict: exiting cleanly.")
+                os._exit(0)
+            logger.error("Recoverable polling error: %s", error)
 
-    app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=False, error_callback=handle_polling_error)
+        await app.updater.start_polling(
+            allowed_updates=Update.ALL_TYPES,
+            drop_pending_updates=False,
+            error_callback=handle_polling_error,
+        )
+        
+        while True:
+            await asyncio.sleep(3600)
+
+    try:
+        if sys.version_info >= (3, 11):
+            asyncio.run(run_application())
+        else:
+            app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=False)
+    except Exception as e:
+        logger.error(f"Error starting bot: {e}")
 
 if __name__ == "__main__":
     main()
