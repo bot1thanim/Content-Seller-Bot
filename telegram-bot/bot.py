@@ -3040,7 +3040,7 @@ def main():
             except Exception as e:
                 logger.error(f"Error in notify_back_online: {e}")
 
-        async def handle_polling_error(error):
+        def handle_polling_error(error):
             """Exit a superseded Render instance instead of leaving it alive without polling."""
             if isinstance(error, Conflict):
                 logger.info(
@@ -3049,7 +3049,7 @@ def main():
                 )
                 # During a Render rolling deployment Telegram terminates the previous long-poll.
                 # A hard exit is deliberate: it prevents an HTTP-only process that no longer handles updates.
-                await asyncio.sleep(10)
+                time.sleep(10)
             logger.error("Recoverable polling error: %s", error)
 
         # הפעלת הפולינג
