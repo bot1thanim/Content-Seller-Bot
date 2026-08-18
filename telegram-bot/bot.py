@@ -2226,11 +2226,202 @@ async def admin_categories_menu(update: Update, context: ContextTypes.DEFAULT_TY
     text = "🏷 *קטגוריות — כלי ניהול פרטי*\n\nהקטגוריות הקיימות:\n" + "\n".join(f"• {category}" for category in categories)
     text += "\n\nהקטגוריות אינן מוצגות למשתמשים ואינן משפיעות על הבחירה האקראית שלהם."
     buttons = [
+        [InlineKeyboardButton("📂 עיון ושליחה לפי קטגוריה", callback_data="admin_cat_browse")],
         [InlineKeyboardButton("✏️ עריכת קטגוריות", callback_data="admin_cat_edit")],
         [InlineKeyboardButton("🏷 מיון לקטגוריות", callback_data="admin_cat_sort_start")],
         [InlineKeyboardButton("🔙 חזרה לגלריה", callback_data="admin_gallery")],
     ]
     await query.edit_message_text(text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(buttons))
+
+
+
+def _category_videos(category: str) -> list[dict]:
+    """Return all entries of one private admin category, ordered by duration."""
+    return sorted(
+        [
+            video for video in load_videos_with_entry_ids()
+            if video.get("category", "כללי") == category
+        ],
+        key=lambda video: (video.get("duration", 0), video.get("added_at", "")),
+    )
+
+
+async def admin_cat_browse_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if query.from_user.id != ADMIN_ID:
+        return
+
+    categories = _admin_categories()
+    buttons = []
+    for index, category in enumerate(categories):
+        count = len(_category_videos(category))
+        buttons.append([
+            InlineKeyboardButton(f"📁 {category} ({count})", callback_data=f"cat_browse_pick_{index}")
+        ])
+    buttons.append([InlineKeyboardButton("🔙 חזרה לקטגוריות", callback_data="admin_categories")])
+    await query.edit_message_text(
+        "📂 *עיון ושליחה לפי קטגוריה*\n\nבחר קטגוריה כדי לראות את מספר הסרטונים שבה, לעיין בהם, או לשלוח את כולם אליך.",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(buttons),
+    )
+
+
+async def admin_cat_browse_category(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if query.from_user.id != ADMIN_ID:
+        return
+
+    try:
+        index = int(query.data.rsplit("_", 1)[1])
+    except ValueError:
+        await admin_cat_browse_menu(update, context)
+        return
+    categories = _admin_categories()
+    if not 0 <= index < len(categories):
+        await query.answer("הקטגוריה אינה זמינה. חזור ובחר מחדש.", show_alert=True)
+        await admin_cat_browse_menu(update, context)
+        return
+
+    category = categories[index]
+    context.user_data["category_browse_name"] = category
+    videos = _category_videos(category)
+    buttons = []
+    if videos:
+        buttons.append([InlineKeyboardButton("🎬 עיון בסרטונים", callback_data="cat_browse_page_0")])
+        buttons.append([InlineKeyboardButton(f"📤 שלח את כל {len(videos)} הסרטונים בקטגוריה", callback_data="cat_browse_send_all")])
+    buttons.append([InlineKeyboardButton("🔙 בחירת קטגוריה אחרת", callback_data="admin_cat_browse")])
+    buttons.append([InlineKeyboardButton("🔙 חזרה לקטגוריות", callback_data="admin_categories")])
+
+    await query.edit_message_text(
+        f"📁 *קטגוריה: {category}*\n\n🎬 נמצאו *{len(videos)}* סרטונים בקטגוריה זו.\n\n"
+        "אפשר לעבור עליהם אחד־אחד או לשלוח את כולם ברצף ישירות אליך.",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(buttons),
+    )
+
+
+async def admin_cat_browse_page(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if query.from_user.id != ADMIN_ID:
+        return
+    try:
+        page = int(query.data.rsplit("_", 1)[1])
+    except ValueError:
+        page = 0
+
+    category = context.user_data.get("category_browse_name")
+    if not category:
+        await admin_cat_browse_menu(update, context)
+        return
+    videos = _category_videos(category)
+    if not videos:
+        await query.answer("אין כרגע סרטונים בקטגוריה זו.", show_alert=True)
+        await admin_cat_browse_category(update, context)
+        return
+
+    page = max(0, min(page, len(videos) - 1))
+    video = videos[page]
+    await clear_sent_duplicate_group_media(context)
+
+    navigation = []
+    if page > 0:
+        navigation.append(InlineKeyboardButton("⬅️ הקודם", callback_data=f"cat_browse_page_{page - 1}"))
+    navigation.append(InlineKeyboardButton(f"{page + 1}/{len(videos)}", callback_data="noop"))
+    if page < len(videos) - 1:
+        navigation.append(InlineKeyboardButton("הבא ➡️", callback_data=f"cat_browse_page_{page + 1}"))
+
+    buttons = [
+        navigation,
+        [InlineKeyboardButton("📤 שלח את כל הקטגוריה", callback_data="cat_browse_send_all")],
+        [InlineKeyboardButton("🔙 חזרה לקטגוריה", callback_data="cat_browse_current")],
+    ]
+    await query.edit_message_text(
+        f"📂 *{category}* — סרטון *{page + 1}/{len(videos)}*\n\n"
+        f"⏱ אורך: {video.get('duration', 0)} שניות",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(buttons),
+    )
+    sent = await send_admin_video_with_delete_button(context.bot, video["file_id"], video["entry_id"])
+    if sent and sent != "INVALID_FILE_ID":
+        context.user_data["dup_sent_media_message_ids"] = [sent.message_id]
+
+
+async def admin_cat_browse_current(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    category = context.user_data.get("category_browse_name")
+    if not category:
+        await admin_cat_browse_menu(update, context)
+        return
+    categories = _admin_categories()
+    if category not in categories:
+        await admin_cat_browse_menu(update, context)
+        return
+    query.data = f"cat_browse_pick_{categories.index(category)}"
+    await admin_cat_browse_category(update, context)
+
+
+async def admin_cat_browse_send_all(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Immediately send every video of the selected private category to the admin."""
+    query = update.callback_query
+    await query.answer()
+    if query.from_user.id != ADMIN_ID:
+        return
+
+    category = context.user_data.get("category_browse_name")
+    if not category:
+        await query.answer("בחר תחילה קטגוריה.", show_alert=True)
+        await admin_cat_browse_menu(update, context)
+        return
+    videos = _category_videos(category)
+    if not videos:
+        await query.answer("אין סרטונים בקטגוריה זו.", show_alert=True)
+        await admin_cat_browse_category(update, context)
+        return
+
+    await clear_sent_duplicate_group_media(context)
+    try:
+        await query.delete_message()
+    except Exception:
+        pass
+
+    success = 0
+    broken = 0
+    for video in videos:
+        sent = await send_admin_video_with_delete_button(context.bot, video["file_id"], video["entry_id"])
+        if sent == "INVALID_FILE_ID":
+            video["file_status"] = "broken"
+            video["file_checked_at"] = datetime.now(timezone.utc).isoformat()
+            broken += 1
+        elif sent:
+            video["file_status"] = "valid"
+            video["file_checked_at"] = datetime.now(timezone.utc).isoformat()
+            success += 1
+        await asyncio.sleep(0.15)
+
+    all_videos = load_videos_with_entry_ids()
+    statuses = {video.get("entry_id"): video for video in videos}
+    for video in all_videos:
+        updated = statuses.get(video.get("entry_id"))
+        if updated:
+            video.update({
+                "file_status": updated.get("file_status"),
+                "file_checked_at": updated.get("file_checked_at"),
+            })
+    save_json(VIDEOS_FILE, all_videos)
+
+    report = f"✅ נשלחו {success}/{len(videos)} סרטונים מהקטגוריה ׳{category}׳."
+    if broken:
+        report += f"\n⚠️ {broken} סרטונים עם מזהים שבורים סומנו לתיקון."
+    await context.bot.send_message(
+        chat_id=ADMIN_ID,
+        text=report,
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("📂 בחירת קטגוריה", callback_data="admin_cat_browse")],
+            [InlineKeyboardButton("🔙 חזרה לקטגוריות", callback_data="admin_categories")],
+        ]),
+    )
 
 
 async def admin_cat_edit_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -3571,6 +3762,11 @@ def main():
         (r"^vid_del_\d+$",              admin_gallery_delete),
         ("^vid_send_all$",              admin_gallery_send_all),
         ("^admin_categories$",          admin_categories_menu),
+        ("^admin_cat_browse$",          admin_cat_browse_menu),
+        (r"^cat_browse_pick_\d+$",      admin_cat_browse_category),
+        (r"^cat_browse_page_\d+$",      admin_cat_browse_page),
+        ("^cat_browse_current$",        admin_cat_browse_current),
+        ("^cat_browse_send_all$",       admin_cat_browse_send_all),
         ("^admin_cat_edit$",            admin_cat_edit_menu),
         ("^admin_cat_rename$",          admin_cat_rename_start),
         ("^admin_cat_delete$",          admin_cat_delete_start),
