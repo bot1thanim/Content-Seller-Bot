@@ -127,7 +127,8 @@ VIP_LEVELS = [
     ADMIN_VIDEO_CAT_ADD,     # 28
     ADMIN_VIDEO_CAT_SORT,    # 29
     ADMIN_REPAIR_UPLOAD,     # 30
-) = range(31)
+    ADMIN_CATEGORY_RENAME,   # 31
+) = range(32)
 
 
 # ─── Data helpers ─────────────────────────────────────────────────────────────
@@ -304,6 +305,7 @@ def load_settings() -> dict:
     s.setdefault("referral_multiplier", 1.0)
     s.setdefault("maintenance", False)
     s.setdefault("waiting_users", [])
+    s.setdefault("categories", ["כללי"])
     return s
 
 def save_settings(s: dict):
@@ -403,48 +405,59 @@ def register_user(user, ref_id=None):
                 save_json(COINS_FILE, coins)
     return users.get(uid, {})
 
+def count_unseen_videos(user_id: int) -> int:
+    """Count usable videos that a user has not received before."""
+    users = load_json(USERS_FILE)
+    seen = set(users.get(str(user_id), {}).get("seen_videos", []))
+    return sum(
+        1
+        for video in load_json(VIDEOS_FILE)
+        if isinstance(video, dict)
+        and video.get("file_id")
+        and video.get("file_status") not in {"broken", "broken_skipped"}
+        and video.get("file_id") not in seen
+    )
+
+
 async def send_videos_to_user(context, user_id: int, count: int) -> int:
+    """Send a random selection of strictly unseen, usable videos to one user.
+
+    The function intentionally never falls back to previously sent videos.
+    """
     all_videos = load_json(VIDEOS_FILE)
     users = load_json(USERS_FILE)
     uid = str(user_id)
     user_data = users.get(uid, {})
     seen = user_data.get("seen_videos", [])
-    
-    pool = all_videos
-        
-    # Sort pool by duration (ascending)
-    pool.sort(key=lambda x: x.get("duration", 0))
-    
-    # Duplicate prevention: find unseen videos
-    unseen = [v for v in pool if v["file_id"] not in seen]
-    
-    if len(unseen) >= count:
-        # Randomly select from unseen videos
-        selected = random.sample(unseen, count)
-    else:
-        # If not enough unseen, take all unseen and fill the rest from seen (randomly)
-        remaining_count = count - len(unseen)
-        seen_pool = [v for v in pool if v["file_id"] in seen]
-        
-        # Take all unseen
-        selected = unseen
-        
-        # Add random videos from seen pool if possible
-        if seen_pool and remaining_count > 0:
-            selected += random.sample(seen_pool, min(remaining_count, len(seen_pool)))
-        
+    seen_set = set(seen)
+
+    pool = [
+        video for video in all_videos
+        if isinstance(video, dict)
+        and video.get("file_id")
+        and video.get("file_status") not in {"broken", "broken_skipped"}
+    ]
+    unseen = [video for video in pool if video["file_id"] not in seen_set]
+    selected = random.sample(unseen, min(count, len(unseen)))
+
     sent = 0
-    for v in selected:
+    for video in selected:
         try:
-            file_id = v["file_id"]
+            file_id = video["file_id"]
             await context.bot.send_video(chat_id=user_id, video=file_id)
-            if file_id not in seen:
-                seen.append(file_id)
+            seen.append(file_id)
+            seen_set.add(file_id)
             sent += 1
             await asyncio.sleep(0.05)
-        except Exception:
-            pass
-            
+        except BadRequest as exc:
+            # A file that fails here cannot be used by the current bot. Mark it for repair.
+            if "file" in str(exc).lower() or "identifier" in str(exc).lower():
+                video["file_status"] = "broken"
+            logger.warning("Could not send a library video to user %s: %s", user_id, exc)
+        except Exception as exc:
+            logger.warning("Could not send a library video to user %s: %s", user_id, exc)
+
+    save_json(VIDEOS_FILE, all_videos)
     user_data["seen_videos"] = seen
     users[uid] = user_data
     save_json(USERS_FILE, users)
@@ -492,14 +505,15 @@ def get_main_keyboard(user_id):
             InlineKeyboardButton("🎁 מתנה יומית", callback_data="daily_bonus"),
         ],
         [
-            InlineKeyboardButton("💳 תשלום",       callback_data="payment_method"),
-            InlineKeyboardButton("👥 הפניות שלי",   callback_data="referrals"),
+            InlineKeyboardButton("💳 תשלום", callback_data="payment_method"),
+            InlineKeyboardButton("ℹ️ איך זה עובד?", callback_data="purchase_help"),
         ],
         [
             InlineKeyboardButton("💰 ארנק מטבעות", callback_data="wallet"),
-            InlineKeyboardButton("🎟 מימוש קופון",  callback_data="coupon_redeem"),
+            InlineKeyboardButton("🎟 מימוש קופון", callback_data="coupon_redeem"),
         ],
-        [InlineKeyboardButton("💬 תמיכה",           callback_data="support")],
+        [InlineKeyboardButton("👥 הפניות שלי", callback_data="referrals")],
+        [InlineKeyboardButton("💬 תמיכה", callback_data="support")],
     ])
 
 def get_admin_reply_keyboard():
@@ -526,10 +540,7 @@ def get_admin_inline_keyboard():
             InlineKeyboardButton("📩 שלח למשתמש",     callback_data="admin_send"),
             InlineKeyboardButton("✅ אישור תשלום",     callback_data="admin_approve"),
         ],
-        [
-            InlineKeyboardButton("🎬 גלריית סרטונים",  callback_data="admin_gallery"),
-            InlineKeyboardButton("🔢 חיפוש (לפי מס')", callback_data="admin_video_search"),
-        ],
+        [InlineKeyboardButton("🎬 גלריית סרטונים", callback_data="admin_gallery")],
         [
             InlineKeyboardButton("📢 הודעה לכולם",    callback_data="admin_broadcast"),
             InlineKeyboardButton("🪙 ניהול מטבעות",   callback_data="admin_coins"),
@@ -709,20 +720,47 @@ async def vip_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ─── Payment ──────────────────────────────────────────────────────────────────
 
+async def purchase_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if await maintenance_gate(update):
+        return
+    text = (
+        "ℹ️ *איך קונים ומקבלים סרטונים?*\n\n"
+        "1️⃣ בוחרים חבילה ותשלום בפייפאל או במטבעות.\n"
+        "2️⃣ לאחר אישור התשלום, הבוט שולח את כמות הסרטונים שבחבילה.\n"
+        "3️⃣ הסרטונים נבחרים *באקראי* מתוך המאגר. לא בוחרים סרטון ספציפי.\n"
+        "4️⃣ הבוט שולח לכל משתמש רק סרטונים שעדיין לא קיבל, כך שאין חזרות.\n\n"
+        "בתשלום בפייפאל יש לשלוח צילום מסך של אישור התשלום דרך התמיכה. "
+        "בתשלום במטבעות הסרטונים נשלחים מיד לאחר אישור הפעולה."
+    )
+    await query.edit_message_text(
+        text,
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("💳 לרכישה", callback_data="payment_method")],
+            [InlineKeyboardButton("🔙 חזרה", callback_data="back_main")],
+        ]),
+    )
+
+
 async def payment_method_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     if await maintenance_gate(update):
         return
-    coins   = load_json(COINS_FILE)
+    coins = load_json(COINS_FILE)
     balance = coins.get(str(query.from_user.id), 0)
     await query.edit_message_text(
-        "💰 *בחר אמצעי תשלום:*",
+        "💰 *רכישת סרטונים*\n\n"
+        "הסרטונים נשלחים באקראי ורק כאלה שעדיין לא קיבלת. "
+        "בחר אמצעי תשלום:",
         parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("💳 תשלום בפייפאל",                        callback_data="paypal_menu")],
-            [InlineKeyboardButton(f"🪙 שלם במטבעות (יתרה: {balance})",      callback_data="coins_menu")],
-            [InlineKeyboardButton("🔙 חזרה",                                 callback_data="back_main")],
+            [InlineKeyboardButton("💳 תשלום בפייפאל", callback_data="paypal_menu")],
+            [InlineKeyboardButton(f"🪙 שלם במטבעות (יתרה: {balance})", callback_data="coins_menu")],
+            [InlineKeyboardButton("ℹ️ הסבר על הרכישה", callback_data="purchase_help")],
+            [InlineKeyboardButton("🔙 חזרה", callback_data="back_main")],
         ]),
     )
 
@@ -757,6 +795,15 @@ async def paypal_package_selected(update: Update, context: ContextTypes.DEFAULT_
     idx = int(query.data.split("_")[1])
     pkg = PACKAGES[idx]
     
+    available = count_unseen_videos(query.from_user.id)
+    if available < pkg["videos"]:
+        await query.edit_message_text(
+            f"כרגע נשארו לך רק {available} סרטונים חדשים שעדיין לא קיבלת. "
+            "בחר חבילה קטנה יותר או חזור מאוחר יותר לאחר הוספת תוכן חדש.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 חזרה", callback_data="paypal_menu")]]),
+        )
+        return
+
     price = round(pkg["price"] * (1 - vip["discount"]), 2)
     # Generate PayPal link with price
     final_link = f"{PAYPAL_LINK}/{price}"
@@ -817,6 +864,14 @@ async def coin_package_buy(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     if bal < cost:
         await query.answer(f"❌ אין לך מספיק מטבעות. חסרים {cost - bal}.", show_alert=True)
+        return
+
+    available = count_unseen_videos(query.from_user.id)
+    if available < pkg["videos"]:
+        await query.answer(
+            f"❌ נשארו לך רק {available} סרטונים חדשים. בחר חבילה קטנה יותר או המתן לתוכן חדש.",
+            show_alert=True,
+        )
         return
         
     coins[uid] = bal - cost
@@ -1237,6 +1292,13 @@ async def admin_approve_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
     count = context.user_data.get("approve_v_count", 0)
     
     try:
+        available = count_unseen_videos(int(uid))
+        if available < count:
+            await update.message.reply_text(
+                f"❌ למשתמש נותרו רק {available} סרטונים חדשים. לא נשלחה חבילה כדי למנוע חזרות.",
+                reply_markup=get_admin_inline_keyboard(),
+            )
+            return ConversationHandler.END
         sent = await send_videos_to_user(context, int(uid), count)
         if sent > 0:
             record_order(int(uid), 0, sent, "manual")
@@ -1265,13 +1327,13 @@ async def admin_gallery(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     keyboard = [
         [InlineKeyboardButton("🎬 עיון בספריה", callback_data="vid_page_0")],
+        [InlineKeyboardButton("🏷 קטגוריות", callback_data="admin_categories")],
         [
             InlineKeyboardButton("🔎 מצא כפילויות", callback_data="admin_dup_scan"),
             InlineKeyboardButton("🔄 מצא כפילויות מחדש", callback_data="admin_dup_rescan"),
         ],
         [InlineKeyboardButton("🗑 סל מיחזור", callback_data="admin_trash_page_0")],
         [InlineKeyboardButton("📤 שלח את כל הסרטונים", callback_data="vid_send_all")],
-        [InlineKeyboardButton("🔍 חיפוש לפי שניות", callback_data="admin_search_sec_start")],
         [InlineKeyboardButton("🛠 תיקון מזהים שבורים", callback_data="admin_repair_start")],
         [InlineKeyboardButton("🔙 חזור לפאנל", callback_data="back_admin")]
     ]
@@ -1301,8 +1363,7 @@ async def admin_gallery_page(update: Update, context: ContextTypes.DEFAULT_TYPE,
     text = f"""🎬 *גלריית סרטונים ({page+1}/{total})*
 
 📁 קטגוריה: {v.get('category', 'כללי')}
-⏱ אורך: {v.get('duration', 0)} שניות
-🖼 דוגמה: {'יש' if v.get('preview') else 'אין'}"""
+⏱ אורך: {v.get('duration', 0)} שניות"""
     
     nav = []
     if page > 0:
@@ -1313,6 +1374,10 @@ async def admin_gallery_page(update: Update, context: ContextTypes.DEFAULT_TYPE,
         
     btns = [
         nav,
+        [
+            InlineKeyboardButton("🔢 חיפוש לפי מספר", callback_data="admin_video_search"),
+            InlineKeyboardButton("⏱ חיפוש לפי זמן", callback_data="admin_search_sec_start"),
+        ],
         [InlineKeyboardButton("🗑 מחק סרטון זה", callback_data=f"vid_del_{page}")],
         [InlineKeyboardButton("🔙 חזרה לגלריה", callback_data="admin_gallery")]
     ]
@@ -2029,7 +2094,7 @@ async def admin_video_search_start(update: Update, context: ContextTypes.DEFAULT
     await query.edit_message_text(
         f"🔢 *חיפוש סרטון לפי מספר*\n\nיש {len(videos)} סרטונים.\nשלח מספר (1–{len(videos)}):",
         parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ ביטול / חזור", callback_data="back_admin")]]),
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ ביטול / חזור לעיון", callback_data="admin_gallery")]]),
     )
     return ADMIN_VIDEO_SEARCH
 
@@ -2046,13 +2111,25 @@ async def admin_video_search_input(update: Update, context: ContextTypes.DEFAULT
         return ADMIN_VIDEO_SEARCH
     idx     = num - 1
     v = videos[idx]
+    await clear_sent_duplicate_group_media(context)
     await update.message.reply_text(f"🎬 סרטון {num}/{len(videos)}:")
-    await context.bot.send_video(
+    sent = await context.bot.send_video(
         chat_id=ADMIN_ID,
         video=v["file_id"],
         reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(f"🗑 מחק סרטון {num}", callback_data=f"vid_del_{idx}")]]),
     )
-    await update.message.reply_text("חפש עוד סרטון או לחץ ביטול:", reply_markup=get_admin_inline_keyboard())
+    if sent:
+        context.user_data["dup_sent_media_message_ids"] = [sent.message_id]
+    await update.message.reply_text(
+        "🔍 החיפוש הסתיים.",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("🎬 חזרה לעיון בספריה", callback_data=f"vid_page_{idx}")],
+            [
+                InlineKeyboardButton("🔢 חיפוש לפי מספר", callback_data="admin_video_search"),
+                InlineKeyboardButton("⏱ חיפוש לפי זמן", callback_data="admin_search_sec_start"),
+            ],
+        ]),
+    )
     return ConversationHandler.END
 
 # ─── Admin: video search by seconds ───────────────────────────────────────────
@@ -2120,94 +2197,283 @@ async def admin_search_sec_input(update: Update, context: ContextTypes.DEFAULT_T
     await update.message.reply_text(f"✅ סיימתי לשלוח את תוצאות החיפוש ({success}/{len(results)} נשלחו).", reply_markup=get_admin_inline_keyboard())
     return ConversationHandler.END
 
-# ─── Admin: Category Management ───────────────────────────────────────────
+# ─── Admin: Private Category Management ───────────────────────────────────────
+
+
+def _admin_categories() -> list[str]:
+    settings = load_settings()
+    categories = settings.get("categories", ["כללי"])
+    if not isinstance(categories, list):
+        categories = ["כללי"]
+    categories = [str(category).strip() for category in categories if str(category).strip()]
+    if "כללי" not in categories:
+        categories.insert(0, "כללי")
+    # Preserve order while discarding repeated names.
+    return list(dict.fromkeys(categories))
+
+
+def _valid_category_name(name: str) -> str | None:
+    name = name.strip()
+    if not name or len(name) > 32 or "\n" in name:
+        return None
+    return name
+
 
 async def admin_categories_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    settings = load_settings()
-    cats = settings.get("categories", ["כללי"])
-    text = "📂 *ניהול קטגוריות*\n\nהקטגוריות הקיימות:\n" + "\n".join([f"• {c}" for c in cats])
-    
-    btns = [
-        [InlineKeyboardButton("➕ הוסף קטגוריה", callback_data="admin_cat_add")],
-        [InlineKeyboardButton("🏷 מיון סרטונים", callback_data="admin_cat_sort_start")],
-        [InlineKeyboardButton("🔙 חזרה לגלריה", callback_data="admin_gallery")]
+    categories = _admin_categories()
+    text = "🏷 *קטגוריות — כלי ניהול פרטי*\n\nהקטגוריות הקיימות:\n" + "\n".join(f"• {category}" for category in categories)
+    text += "\n\nהקטגוריות אינן מוצגות למשתמשים ואינן משפיעות על הבחירה האקראית שלהם."
+    buttons = [
+        [InlineKeyboardButton("✏️ עריכת קטגוריות", callback_data="admin_cat_edit")],
+        [InlineKeyboardButton("🏷 מיון לקטגוריות", callback_data="admin_cat_sort_start")],
+        [InlineKeyboardButton("🔙 חזרה לגלריה", callback_data="admin_gallery")],
     ]
-    await query.edit_message_text(text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(btns))
+    await query.edit_message_text(text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(buttons))
+
+
+async def admin_cat_edit_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    await query.edit_message_text(
+        "✏️ *עריכת קטגוריות*\n\nאפשר להוסיף קטגוריה, לשנות שם של קטגוריה קיימת או להסיר קטגוריה. "
+        "בעת הסרה, הסרטונים שלה עוברים אוטומטית ל׳כללי׳.",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("➕ הוסף קטגוריה", callback_data="admin_cat_add")],
+            [InlineKeyboardButton("✏️ שנה שם קטגוריה", callback_data="admin_cat_rename")],
+            [InlineKeyboardButton("🗑 הסר קטגוריה", callback_data="admin_cat_delete")],
+            [InlineKeyboardButton("🔙 חזרה", callback_data="admin_categories")],
+        ]),
+    )
+
 
 async def admin_cat_add_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    await query.edit_message_text("✍️ שלח את שם הקטגוריה החדשה:", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ ביטול", callback_data="admin_categories")]]))
+    await query.edit_message_text(
+        "✍️ שלח את שם הקטגוריה החדשה:",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ ביטול", callback_data="admin_cat_edit")]]),
+    )
     return ADMIN_VIDEO_CAT_ADD
 
+
 async def admin_cat_add_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    name = update.message.text.strip()
+    name = _valid_category_name(update.message.text)
+    if not name:
+        await update.message.reply_text("❌ שם קטגוריה לא תקין. שלח שם באורך של עד 32 תווים.")
+        return ADMIN_VIDEO_CAT_ADD
+    categories = _admin_categories()
+    if name in categories:
+        await update.message.reply_text("⚠️ קטגוריה בשם זה כבר קיימת.")
+        return ADMIN_VIDEO_CAT_ADD
+    categories.append(name)
     settings = load_settings()
-    cats = settings.get("categories", ["כללי"])
-    if name not in cats:
-        cats.append(name)
-        settings["categories"] = cats
-        save_settings(settings)
-        await update.message.reply_text(f"✅ הקטגוריה '{name}' נוספה בהצלחה!", reply_markup=get_admin_inline_keyboard())
-    else:
-        await update.message.reply_text(f"⚠️ הקטגוריה '{name}' כבר קיימת.", reply_markup=get_admin_inline_keyboard())
+    settings["categories"] = categories
+    save_settings(settings)
+    await update.message.reply_text(
+        f"✅ הקטגוריה ׳{name}׳ נוספה.",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 חזרה לקטגוריות", callback_data="admin_categories")]]),
+    )
     return ConversationHandler.END
 
-async def admin_cat_sort_page(update: Update, context: ContextTypes.DEFAULT_TYPE, page=0):
-    videos = load_json(VIDEOS_FILE)
-    if not videos:
-        await update.callback_query.edit_message_text("אין סרטונים למיון.", reply_markup=get_admin_inline_keyboard())
-        return
-    
-    page = max(0, min(page, len(videos) - 1))
-    v = videos[page]
-    await clear_sent_duplicate_group_media(context)
-    
-    text = f"🏷 *מיון סרטונים ({page+1}/{len(videos)})*\n\nקטגוריה נוכחית: {v.get('category', 'כללי')}\nבחר קטגוריה חדשה לסרטון זה:"
-    
+
+async def admin_cat_rename_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    categories = _admin_categories()
+    buttons = [
+        [InlineKeyboardButton(category, callback_data=f"cat_rename_pick_{index}")]
+        for index, category in enumerate(categories)
+        if category != "כללי"
+    ]
+    buttons.append([InlineKeyboardButton("🔙 חזרה", callback_data="admin_cat_edit")])
+    if len(buttons) == 1:
+        await query.edit_message_text("אין עדיין קטגוריות שניתן לשנות. ׳כללי׳ היא קטגוריית ברירת המחדל הקבועה.", reply_markup=InlineKeyboardMarkup(buttons))
+        return ConversationHandler.END
+    await query.edit_message_text("בחר קטגוריה לשינוי שם:", reply_markup=InlineKeyboardMarkup(buttons))
+
+
+async def admin_cat_rename_pick(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    index = int(query.data.rsplit("_", 1)[1])
+    categories = _admin_categories()
+    if not 0 <= index < len(categories) or categories[index] == "כללי":
+        await query.answer("הקטגוריה אינה זמינה לשינוי.", show_alert=True)
+        return ConversationHandler.END
+    context.user_data["category_rename_old"] = categories[index]
+    await query.edit_message_text(
+        f"שלח שם חדש עבור הקטגוריה ׳{categories[index]}׳:",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ ביטול", callback_data="admin_cat_edit")]]),
+    )
+    return ADMIN_CATEGORY_RENAME
+
+
+async def admin_cat_rename_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    old_name = context.user_data.get("category_rename_old")
+    new_name = _valid_category_name(update.message.text)
+    if not old_name:
+        return ConversationHandler.END
+    if not new_name:
+        await update.message.reply_text("❌ שם קטגוריה לא תקין. שלח שם באורך של עד 32 תווים.")
+        return ADMIN_CATEGORY_RENAME
+    categories = _admin_categories()
+    if new_name in categories:
+        await update.message.reply_text("⚠️ קטגוריה בשם זה כבר קיימת.")
+        return ADMIN_CATEGORY_RENAME
+    if old_name not in categories or old_name == "כללי":
+        await update.message.reply_text("❌ לא ניתן לשנות את הקטגוריה הזו.")
+        return ConversationHandler.END
+
     settings = load_settings()
-    cats = settings.get("categories", ["כללי"])
-    btns = []
+    settings["categories"] = [new_name if category == old_name else category for category in categories]
+    save_settings(settings)
+    videos = load_json(VIDEOS_FILE)
+    for video in videos:
+        if isinstance(video, dict) and video.get("category") == old_name:
+            video["category"] = new_name
+    save_json(VIDEOS_FILE, videos)
+    context.user_data.pop("category_rename_old", None)
+    await update.message.reply_text(
+        f"✅ שם הקטגוריה שונה מ׳{old_name}׳ ל׳{new_name}׳ וכל הסרטונים הקשורים עודכנו.",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 חזרה לקטגוריות", callback_data="admin_categories")]]),
+    )
+    return ConversationHandler.END
+
+
+async def admin_cat_delete_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    categories = _admin_categories()
+    buttons = [
+        [InlineKeyboardButton(f"🗑 {category}", callback_data=f"cat_delete_pick_{index}")]
+        for index, category in enumerate(categories)
+        if category != "כללי"
+    ]
+    buttons.append([InlineKeyboardButton("🔙 חזרה", callback_data="admin_cat_edit")])
+    if len(buttons) == 1:
+        await query.edit_message_text("אין עדיין קטגוריות שניתן להסיר. ׳כללי׳ היא קטגוריית ברירת המחדל הקבועה.", reply_markup=InlineKeyboardMarkup(buttons))
+        return
+    await query.edit_message_text("בחר קטגוריה להסרה. הסרטונים שלה יעברו ל׳כללי׳:", reply_markup=InlineKeyboardMarkup(buttons))
+
+
+async def admin_cat_delete_pick(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    index = int(query.data.rsplit("_", 1)[1])
+    categories = _admin_categories()
+    if not 0 <= index < len(categories) or categories[index] == "כללי":
+        await query.answer("הקטגוריה אינה זמינה להסרה.", show_alert=True)
+        return
+    category = categories[index]
+    await query.edit_message_text(
+        f"האם להסיר את הקטגוריה ׳{category}׳? כל הסרטונים שלה יעברו ל׳כללי׳.",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("✅ כן, הסר", callback_data=f"cat_delete_confirm_{index}")],
+            [InlineKeyboardButton("❌ ביטול", callback_data="admin_cat_edit")],
+        ]),
+    )
+
+
+async def admin_cat_delete_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    index = int(query.data.rsplit("_", 1)[1])
+    categories = _admin_categories()
+    if not 0 <= index < len(categories) or categories[index] == "כללי":
+        await query.answer("הקטגוריה אינה זמינה להסרה.", show_alert=True)
+        return
+    removed = categories[index]
+    settings = load_settings()
+    settings["categories"] = [category for category in categories if category != removed]
+    save_settings(settings)
+    videos = load_json(VIDEOS_FILE)
+    moved = 0
+    for video in videos:
+        if isinstance(video, dict) and video.get("category") == removed:
+            video["category"] = "כללי"
+            moved += 1
+    save_json(VIDEOS_FILE, videos)
+    await query.answer(f"הקטגוריה הוסרה; {moved} סרטונים עברו לכללי.", show_alert=True)
+    await admin_categories_menu(update, context)
+
+
+async def admin_cat_sort_page(update: Update, context: ContextTypes.DEFAULT_TYPE, page=0):
+    videos = load_videos_with_entry_ids()
+    query = update.callback_query
+    if not videos:
+        await query.edit_message_text("אין סרטונים למיון.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 חזרה", callback_data="admin_categories")]]))
+        return
+
+    page = max(0, min(page, len(videos) - 1))
+    video = videos[page]
+    await clear_sent_duplicate_group_media(context)
+    current_category = video.get("category", "כללי")
+    text = (
+        f"🏷 *מיון לקטגוריות ({page + 1}/{len(videos)})*\n\n"
+        f"📁 קטגוריה נוכחית: *{current_category}*\n"
+        "בחר קטגוריה לסרטון זה. הקטגוריה הנוכחית מסומנת ב־✅."
+    )
+
+    categories = _admin_categories()
+    buttons = []
     row = []
-    for c in cats:
-        row.append(InlineKeyboardButton(c, callback_data=f"cat_assign_{page}_{c}"))
+    for index, category in enumerate(categories):
+        label = f"✅ {category}" if category == current_category else category
+        row.append(InlineKeyboardButton(label, callback_data=f"cat_assign_{page}_{index}"))
         if len(row) == 2:
-            btns.append(row)
+            buttons.append(row)
             row = []
-    if row: btns.append(row)
-    
-    nav = []
-    if page > 0: nav.append(InlineKeyboardButton("⬅️", callback_data=f"cat_sort_page_{page-1}"))
-    nav.append(InlineKeyboardButton(f"{page+1}/{len(videos)}", callback_data="noop"))
-    if page < len(videos) - 1: nav.append(InlineKeyboardButton("➡️", callback_data=f"cat_sort_page_{page+1}"))
-    btns.append(nav)
-    btns.append([InlineKeyboardButton("🔙 סיום", callback_data="admin_categories")])
-    
-    await update.callback_query.edit_message_text(text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(btns))
-    sent = await context.bot.send_video(chat_id=ADMIN_ID, video=v["file_id"])
-    if sent:
+    if row:
+        buttons.append(row)
+
+    navigation = []
+    if page > 0:
+        navigation.append(InlineKeyboardButton("⬅️ הקודם", callback_data=f"cat_sort_page_{page - 1}"))
+    navigation.append(InlineKeyboardButton(f"{page + 1}/{len(videos)}", callback_data="noop"))
+    if page < len(videos) - 1:
+        navigation.append(InlineKeyboardButton("הבא ➡️", callback_data=f"cat_sort_page_{page + 1}"))
+    buttons.append(navigation)
+    buttons.append([InlineKeyboardButton("🔙 סיום", callback_data="admin_categories")])
+
+    await query.edit_message_text(text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(buttons))
+    try:
+        sent = await context.bot.send_video(chat_id=ADMIN_ID, video=video["file_id"])
         context.user_data["dup_sent_media_message_ids"] = [sent.message_id]
+    except Exception as exc:
+        logger.warning("Could not show video %s during category sorting: %s", video.get("entry_id"), exc)
+
 
 async def admin_cat_assign(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    # Format: cat_assign_PAGE_CATNAME
+    await query.answer()
     parts = query.data.split("_")
+    if len(parts) != 4:
+        return
     page = int(parts[2])
-    cat = "_".join(parts[3:])
-    
-    videos = load_json(VIDEOS_FILE)
-    if 0 <= page < len(videos):
-        videos[page]["category"] = cat
-        save_json(VIDEOS_FILE, videos)
-        await query.answer(f"✅ שונה ל-{cat}")
-        
-        if page < len(videos) - 1:
-            await admin_cat_sort_page(update, context, page + 1)
-        else:
-            await query.edit_message_text("✅ סיימת למיין את כל הסרטונים!", reply_markup=get_admin_inline_keyboard())
+    category_index = int(parts[3])
+    categories = _admin_categories()
+    if not 0 <= category_index < len(categories):
+        await query.answer("הקטגוריה כבר אינה זמינה. חזור ונסה שוב.", show_alert=True)
+        return
 
+    videos = load_videos_with_entry_ids()
+    if not 0 <= page < len(videos):
+        await query.answer("הסרטון כבר אינו זמין. חזור ונסה שוב.", show_alert=True)
+        return
+    videos[page]["category"] = categories[category_index]
+    save_json(VIDEOS_FILE, videos)
+
+    if page < len(videos) - 1:
+        await admin_cat_sort_page(update, context, page + 1)
+    else:
+        await clear_sent_duplicate_group_media(context)
+        await query.edit_message_text(
+            "✅ סיימת לעבור על כל הסרטונים. אפשר להיכנס שוב למיון בכל עת.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 חזרה לקטגוריות", callback_data="admin_categories")]]),
+        )
 
 # ─── Admin: broadcast (enhanced + media) ──────────────────────────────────────
 
@@ -2899,34 +3165,36 @@ async def admin_maintenance_toggle(update: Update, context: ContextTypes.DEFAULT
 # ─── Video upload ─────────────────────────────────────────────────────────────
 
 async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """העלאת סרטון עם בחירת קטגוריה ודוגמה."""
+    """Store every admin-uploaded video immediately in the private default category."""
     if update.effective_user.id != ADMIN_ID:
         return ConversationHandler.END
     video = update.message.video
     if not video:
         return ConversationHandler.END
 
-    context.user_data["last_upload_fid"] = video.file_id
-    context.user_data["last_upload_fuid"] = getattr(video, "file_unique_id", None)
-    context.user_data["last_upload_dur"] = video.duration
-    context.user_data["last_upload_size"] = video.file_size
-    
-    settings = load_settings()
-    cats = settings.get("categories", ["כללי"])
-    btns = []
-    row = []
-    for c in cats:
-        row.append(InlineKeyboardButton(c, callback_data=f"cat_sel_{c}"))
-        if len(row) == 2:
-            btns.append(row)
-            row = []
-    if row: btns.append(row)
-    
+    videos = load_videos_with_entry_ids()
+    entry_id = uuid.uuid4().hex
+    videos.append({
+        "entry_id": entry_id,
+        "file_id": video.file_id,
+        "file_unique_id": getattr(video, "file_unique_id", None),
+        "file_name": getattr(video, "file_name", None),
+        "duration": video.duration or 0,
+        "file_size": video.file_size,
+        "category": "כללי",
+        "preview": None,
+        "file_status": "valid",
+        "added_at": datetime.now(timezone.utc).isoformat(),
+    })
+    save_json(VIDEOS_FILE, videos)
+
     await update.message.reply_text(
-        f"🎬 סרטון התקבל! (אורך: {video.duration} שניות)\nבחר קטגוריה לסרטון:",
-        reply_markup=InlineKeyboardMarkup(btns)
+        f"✅ הסרטון נוסף למאגר ({len(videos)} בסך הכול).\n"
+        f"⏱ אורך: {video.duration or 0} שניות\n"
+        "📁 קטגוריה: כללי\n\n"
+        "אפשר לשייך קטגוריה אחר כך דרך גלריית סרטונים ← קטגוריות ← מיון לקטגוריות."
     )
-    return ADMIN_VIDEO_CAT
+    return ConversationHandler.END
 
 async def admin_video_cat_sel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -3163,6 +3431,7 @@ def main():
         states={ADMIN_VIDEO_SEARCH: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_video_search_input)]},
         fallbacks=[
             CommandHandler("cancel", cancel),
+            CallbackQueryHandler(admin_gallery, pattern="^admin_gallery$"),
             CallbackQueryHandler(back_admin, pattern="^back_admin$"),
         ],
         per_message=False, per_chat=True,
@@ -3233,23 +3502,30 @@ def main():
         fallbacks=[CallbackQueryHandler(admin_categories_menu, pattern="^admin_categories$")],
         per_message=False, per_chat=True,
     )
+    cat_rename_conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(admin_cat_rename_pick, pattern=r"^cat_rename_pick_\d+$")],
+        states={ADMIN_CATEGORY_RENAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_cat_rename_input)]},
+        fallbacks=[
+            CommandHandler("cancel", cancel),
+            CallbackQueryHandler(admin_cat_edit_menu, pattern="^admin_cat_edit$"),
+            CallbackQueryHandler(admin_categories_menu, pattern="^admin_categories$"),
+        ],
+        per_message=False,
+        per_chat=True,
+    )
     video_upload_conv = ConversationHandler(
         entry_points=[MessageHandler(filters.VIDEO, handle_video)],
-        states={
-            ADMIN_VIDEO_CAT: [CallbackQueryHandler(admin_video_cat_sel, pattern="^cat_sel_")],
-            ADMIN_VIDEO_PREVIEW: [
-                MessageHandler(filters.PHOTO | filters.VIDEO | filters.Regex("^skip$"), admin_video_preview_receive)
-            ],
-        },
+        states={},
         fallbacks=[CommandHandler("cancel", cancel)],
-        per_message=False, per_chat=True,
+        per_message=False,
+        per_chat=True,
     )
     
     for conv in [
         check_conv, send_conv, approve_conv, broadcast_conv, coins_conv, vip_conv,
         coupon_new_conv, multiplier_conv, restore_conv, global_reset_conv,
         video_search_conv, video_search_sec_conv, repair_conv, support_conv, coupon_redeem_conv, support_reply_conv,
-        cat_add_conv, video_upload_conv
+        cat_add_conv, cat_rename_conv, video_upload_conv
     ]:
         app.add_handler(conv)
 
@@ -3262,6 +3538,7 @@ def main():
     cbs = [
         ("^noop$",                      noop_callback),
         ("^payment_method$",            payment_method_menu),
+        ("^purchase_help$",             purchase_help),
         ("^paypal_menu$",               paypal_menu),
         (r"^pp_\d+$",                   paypal_package_selected),
         ("^coins_menu$",                coins_menu),
@@ -3294,6 +3571,11 @@ def main():
         (r"^vid_del_\d+$",              admin_gallery_delete),
         ("^vid_send_all$",              admin_gallery_send_all),
         ("^admin_categories$",          admin_categories_menu),
+        ("^admin_cat_edit$",            admin_cat_edit_menu),
+        ("^admin_cat_rename$",          admin_cat_rename_start),
+        ("^admin_cat_delete$",          admin_cat_delete_start),
+        (r"^cat_delete_pick_\d+$",    admin_cat_delete_pick),
+        (r"^cat_delete_confirm_\d+$", admin_cat_delete_confirm),
         (r"^cat_sort_page_\d+$",       admin_cat_sort_page),
         ("^admin_cat_sort_start$",      lambda u, c: admin_cat_sort_page(u, c, 0)),
         (r"^cat_assign_",               admin_cat_assign),
