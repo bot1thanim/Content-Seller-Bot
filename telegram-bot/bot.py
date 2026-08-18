@@ -1724,11 +1724,18 @@ async def admin_gallery_send_all(update: Update, context: ContextTypes.DEFAULT_T
             sent = await send_admin_video_with_delete_button(context.bot, v["file_id"], v["entry_id"])
             if sent == "INVALID_FILE_ID":
                 broken += 1
+                v["file_status"] = "broken"
+                v["file_checked_at"] = datetime.now(timezone.utc).isoformat()
             elif sent:
                 success += 1
+                v["file_status"] = "valid"
+                v["file_checked_at"] = datetime.now(timezone.utc).isoformat()
             await asyncio.sleep(0.15) # שליחה מהירה אך בטוחה
         except Exception:
             await asyncio.sleep(1.0)
+
+    # sorted_videos holds the same dictionaries as videos, so statuses are persisted safely.
+    save_json(VIDEOS_FILE, videos)
             
     report = f"✅ סיימתי לשלוח את המאגר! ({success}/{total} נשלחו בהצלחה)"
     if broken > 0:
@@ -1746,139 +1753,269 @@ async def admin_gallery_send_all(update: Update, context: ContextTypes.DEFAULT_T
 
 # ─── Admin: Database Repair & Re-upload ───────────────────────────────────────
 
+BROKEN_FILE_STATUSES = {"broken", "broken_skipped"}
+
+
+def _invalid_file_id_error(error: Exception) -> bool:
+    """Return True only for Telegram errors that prove the file_id is unusable."""
+    message = str(error).lower()
+    markers = (
+        "wrong file identifier",
+        "wrong file_id",
+        "file_id",
+        "file identifier",
+        "failed to get http url content",
+    )
+    return isinstance(error, BadRequest) and any(marker in message for marker in markers)
+
+
+async def _check_video_file_id(bot, video: dict, attempts: int = 3):
+    """Validate a stored file_id without sending media into the administrator chat.
+
+    Returns True for a valid identifier, False for a proven broken identifier and
+    None for a temporary/unknown Telegram error.
+    """
+    file_id = video.get("file_id")
+    if not isinstance(file_id, str) or not file_id:
+        return False
+
+    for attempt in range(1, attempts + 1):
+        try:
+            await bot.get_file(file_id)
+            return True
+        except RetryAfter as exc:
+            retry_after = exc.retry_after
+            delay = retry_after.total_seconds() if hasattr(retry_after, "total_seconds") else float(retry_after)
+            await asyncio.sleep(delay + 1)
+        except BadRequest as exc:
+            if _invalid_file_id_error(exc):
+                return False
+            logger.warning("Unexpected Telegram validation error for video %s: %s", video.get("entry_id"), exc)
+            return None
+        except (TimedOut, NetworkError) as exc:
+            if attempt == attempts:
+                logger.warning("Temporary error validating video %s: %s", video.get("entry_id"), exc)
+                return None
+            await asyncio.sleep(min(2 ** attempt, 10))
+        except Exception as exc:
+            logger.warning("Could not validate video %s: %s", video.get("entry_id"), exc)
+            return None
+    return None
+
+
+def _broken_video_entries(videos: list[dict]) -> list[str]:
+    return [
+        video.get("entry_id")
+        for video in videos
+        if isinstance(video, dict) and video.get("entry_id") and video.get("file_status") in BROKEN_FILE_STATUSES
+    ]
+
+
 async def admin_repair_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Open the repair menu. This handler is deliberately standalone, not a conversation entry point."""
     query = update.callback_query
     await query.answer()
-    
-    keyboard = [
-        [InlineKeyboardButton("🔍 סרוק מזהים שבורים", callback_data="admin_repair_scan")],
-        [InlineKeyboardButton("🔙 חזרה", callback_data="admin_gallery")]
-    ]
-    
-    text = """🛠 *מערכת תיקון מזהי קבצים*
+    if query.from_user.id != ADMIN_ID:
+        return
 
-בשל החלפת טוקן הבוט, סרטונים ישנים עלולים להיות עם מזהים שבורים.
-מערכת זו תעזור לך לזהות אותם ולעדכן אותם במזהים חדשים."""
-    
-    await query.edit_message_text(text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(keyboard))
+    videos = load_videos_with_entry_ids()
+    broken = _broken_video_entries(videos)
+    lines = [
+        "🛠 *תיקון סרטונים מהבוט הישן*",
+        "",
+        "לאחר החלפת טוקן, Telegram לא מאפשר לבוט החדש להשתמש במזהי הקבצים של הבוט הישן.",
+        "הסריקה בודקת את המזהים בלי לשלוח סרטונים לצ׳אט. לאחר מכן אפשר להעלות מחדש כל קובץ חסר, והבוט מחליף רק את המזהה שלו במאגר.",
+        "",
+        f"📚 סרטונים במאגר: {len(videos)}",
+        f"⚠️ כבר זוהו כמזהים שבורים: {len(broken)}",
+    ]
+    keyboard = [[InlineKeyboardButton("🔍 סריקה מלאה של המזהים", callback_data="admin_repair_scan")]]
+    if broken:
+        keyboard.append([InlineKeyboardButton(f"▶️ המשך תיקון של {len(broken)} סרטונים", callback_data="admin_repair_cached")])
+    keyboard.append([InlineKeyboardButton("🔙 חזרה לגלריה", callback_data="admin_gallery")])
+    await query.edit_message_text("\n".join(lines), parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(keyboard))
+
 
 async def admin_repair_scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Scan all stored identifiers through getFile and begin the re-upload flow."""
     query = update.callback_query
-    await query.answer()
-    
-    videos = load_json(VIDEOS_FILE)
-    if not videos:
-        await query.edit_message_text("אין סרטונים לסריקה.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 חזרה", callback_data="admin_gallery")]]))
-        return
-        
-    await query.edit_message_text(f"🔍 סורק {len(videos)} סרטונים... זה עשוי לקחת זמן מה.")
-    
-    broken = []
-    # נבצע סריקה מדגמית או מלאה - כאן ננסה לשלוח action או פשוט לזהות שגיאות שליחה קודמות
-    # לצורך העניין, נסמן את כולם כחשודים אם הם הגיעו מהגיבוי הישן (ללא entry_id מקורי או לפי לוגיקה אחרת)
-    # אבל הדרך הכי בטוחה היא לנסות לשלוח.
-    
-    # כדי לא להציף, נבדוק רק את אלו שבאמת לא נשלחים
-    count = 0
-    for v in videos:
-        count += 1
-        if count % 20 == 0:
-            await query.edit_message_text(f"🔍 סורק... ({count}/{len(videos)})")
-        
-        try:
-            # ננסה לשלוח action - אם ה-file_id לא תקין, טלגרם לפעמים זורק שגיאה כבר כאן
-            # אבל הדרך הכי טובה היא send_video עם chat_id של הבוט עצמו או משהו כזה
-            # נשתמש ב-send_chat_action כבדיקה ראשונית (פחות כבד)
-            pass 
-        except:
-            pass
-            
-    # כרגע, פשוט נציע להתחיל לעבור על סרטונים שבורים שנתגלו בזמן אמת או פשוט להתחיל תהליך רענון
-    context.user_data['repair_list'] = [v['entry_id'] for v in videos]
-    context.user_data['repair_index'] = 0
-    
-    await admin_repair_next(update, context)
-
-async def admin_repair_next(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    repair_list = context.user_data.get('repair_list', [])
-    idx = context.user_data.get('repair_index', 0)
-    
-    if idx >= len(repair_list):
-        text = "✅ סיימת לעבור על כל הסרטונים!"
-        reply_markup = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 חזרה", callback_data="admin_gallery")]])
-        if update.callback_query:
-            await update.callback_query.edit_message_text(text, reply_markup=reply_markup)
-        else:
-            await update.message.reply_text(text, reply_markup=reply_markup)
+    await query.answer("הסריקה התחילה")
+    if query.from_user.id != ADMIN_ID:
         return ConversationHandler.END
 
-    videos = load_json(VIDEOS_FILE)
-    entry_id = repair_list[idx]
-    video = next((v for v in videos if v['entry_id'] == entry_id), None)
-    
-    if not video:
-        context.user_data['repair_index'] += 1
-        return await admin_repair_next(update, context)
+    videos = load_videos_with_entry_ids()
+    if not videos:
+        await query.edit_message_text("אין סרטונים במאגר.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 חזרה", callback_data="admin_gallery")]]))
+        return ConversationHandler.END
 
-    # ננסה לשלוח כדי לראות אם הוא באמת שבור
-    sent = await send_admin_video_with_delete_button(context.bot, video['file_id'], video['entry_id'], max_attempts=1)
-    
-    if sent == "INVALID_FILE_ID":
-        text = f"""❌ *סרטון שבור נמצא!* ({idx+1}/{len(repair_list)})
+    total = len(videos)
+    broken_ids = []
+    valid = 0
+    unknown = 0
+    now = datetime.now(timezone.utc).isoformat()
 
-⏱ אורך: {video.get('duration', 0)} שניות
-📁 קטגוריה: {video.get('category', 'כללי')}
-
-*אנא שלח את קובץ הווידאו המקורי כדי לעדכן אותו במאגר.*
-(או לחץ 'דלג' כדי להמשיך)"""
-        keyboard = [
-            [InlineKeyboardButton("⏭ דלג", callback_data="admin_repair_skip")],
-            [InlineKeyboardButton("❌ ביטול", callback_data="admin_gallery")]
-        ]
-        if update.callback_query:
-            await update.callback_query.edit_message_text(text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(keyboard))
+    await query.edit_message_text(f"🔍 בודק את מזהי הקבצים: 0/{total}")
+    for index, video in enumerate(videos, start=1):
+        result = await _check_video_file_id(context.bot, video)
+        video["file_checked_at"] = now
+        if result is True:
+            video["file_status"] = "valid"
+            valid += 1
+        elif result is False:
+            video["file_status"] = "broken"
+            broken_ids.append(video["entry_id"])
         else:
-            await update.message.reply_text(text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(keyboard))
-        return ADMIN_REPAIR_UPLOAD
+            video["file_status"] = "unknown"
+            unknown += 1
+
+        if index % 20 == 0 or index == total:
+            save_json(VIDEOS_FILE, videos)
+            try:
+                await query.edit_message_text(f"🔍 בודק את מזהי הקבצים: {index}/{total}")
+            except BadRequest as exc:
+                if "Message is not modified" not in str(exc):
+                    raise
+
+        # A short pause avoids a request burst while keeping a 500+ library practical.
+        await asyncio.sleep(0.04)
+
+    save_json(VIDEOS_FILE, videos)
+    context.user_data["repair_list"] = broken_ids
+    context.user_data["repair_index"] = 0
+    context.user_data["repair_scan_summary"] = {"valid": valid, "broken": len(broken_ids), "unknown": unknown}
+    return await admin_repair_show_current(update, context)
+
+
+async def admin_repair_cached(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Resume the re-upload queue built by a prior full scan."""
+    query = update.callback_query
+    await query.answer()
+    if query.from_user.id != ADMIN_ID:
+        return ConversationHandler.END
+
+    videos = load_videos_with_entry_ids()
+    broken_ids = _broken_video_entries(videos)
+    if not broken_ids:
+        await query.edit_message_text(
+            "✅ אין כרגע סרטונים שסומנו כשבורים. אפשר לבצע סריקה מלאה חדשה.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 חזרה", callback_data="admin_repair_start")]]),
+        )
+        return ConversationHandler.END
+
+    context.user_data["repair_list"] = broken_ids
+    context.user_data["repair_index"] = 0
+    return await admin_repair_show_current(update, context)
+
+
+async def admin_repair_show_current(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Prompt for the original file of the current broken video; never sends the broken file_id."""
+    repair_list = context.user_data.get("repair_list", [])
+    index = int(context.user_data.get("repair_index", 0))
+
+    while index < len(repair_list):
+        entry_id = repair_list[index]
+        videos = load_videos_with_entry_ids()
+        video = next((item for item in videos if item.get("entry_id") == entry_id), None)
+        if video and video.get("file_status") in BROKEN_FILE_STATUSES:
+            break
+        index += 1
+        context.user_data["repair_index"] = index
+
+    if index >= len(repair_list):
+        summary = context.user_data.get("repair_scan_summary", {})
+        text = "✅ *הטיפול ברשימת הסרטונים השבורים הסתיים.*"
+        if summary:
+            text += f"\n\nבסריקה: {summary.get('valid', 0)} תקינים, {summary.get('broken', 0)} שבורים, {summary.get('unknown', 0)} ללא תוצאה ודאית."
+        text += "\n\nאם דילגת על סרטונים, אפשר לבצע סריקה מלאה שוב כדי להציג אותם מחדש."
+        markup = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 חזרה לגלריה", callback_data="admin_gallery")]])
+        if update.callback_query:
+            await update.callback_query.edit_message_text(text, parse_mode="Markdown", reply_markup=markup)
+        else:
+            await update.effective_message.reply_text(text, parse_mode="Markdown", reply_markup=markup)
+        context.user_data.pop("repair_list", None)
+        context.user_data.pop("repair_index", None)
+        return ConversationHandler.END
+
+    context.user_data["repair_index"] = index
+    duration = video.get("duration", 0)
+    category = video.get("category", "כללי")
+    size_bytes = video.get("file_size")
+    size_text = f"\n📦 גודל: {size_bytes / (1024 * 1024):.2f} MB" if isinstance(size_bytes, (int, float)) and size_bytes else ""
+    text = (
+        f"⚠️ *סרטון עם מזהה שבור ({index + 1}/{len(repair_list)})*\n\n"
+        f"⏱ אורך במאגר: {duration} שניות\n"
+        f"📁 קטגוריה: {category}{size_text}\n\n"
+        "שלח עכשיו את *אותו קובץ וידאו מקורי* לבוט.\n"
+        "הבוט יעדכן רק את מזהה הקובץ, וישמור את שאר פרטי הסרטון."
+    )
+    markup = InlineKeyboardMarkup([
+        [InlineKeyboardButton("⏭ דלג כרגע", callback_data="admin_repair_skip")],
+        [InlineKeyboardButton("❌ ביטול", callback_data="admin_repair_cancel")],
+    ])
+    if update.callback_query:
+        await update.callback_query.edit_message_text(text, parse_mode="Markdown", reply_markup=markup)
     else:
-        # הסרטון תקין, עוברים לבא
-        context.user_data['repair_index'] += 1
-        # אם שלחנו הודעה, נמחק אותה
-        if sent and hasattr(sent, 'delete'):
-            try: await sent.delete()
-            except: pass
-        return await admin_repair_next(update, context)
+        await update.effective_message.reply_text(text, parse_mode="Markdown", reply_markup=markup)
+    return ADMIN_REPAIR_UPLOAD
+
 
 async def admin_repair_handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Save the fresh file_id supplied by the administrator for the current item."""
+    if update.effective_user.id != ADMIN_ID:
+        return ConversationHandler.END
     if not update.message.video:
-        await update.message.reply_text("אנא שלח קובץ וידאו בלבד.")
+        await update.message.reply_text("יש לשלוח קובץ וידאו בלבד, או ללחוץ על ׳דלג כרגע׳.")
         return ADMIN_REPAIR_UPLOAD
-        
-    new_file_id = update.message.video.file_id
-    new_duration = update.message.video.duration
-    
-    repair_list = context.user_data.get('repair_list', [])
-    idx = context.user_data.get('repair_index', 0)
-    entry_id = repair_list[idx]
-    
-    videos = load_json(VIDEOS_FILE)
-    for v in videos:
-        if v['entry_id'] == entry_id:
-            v['file_id'] = new_file_id
-            v['duration'] = new_duration
-            break
-    
+
+    repair_list = context.user_data.get("repair_list", [])
+    index = int(context.user_data.get("repair_index", 0))
+    if index >= len(repair_list):
+        return await admin_repair_show_current(update, context)
+
+    entry_id = repair_list[index]
+    videos = load_videos_with_entry_ids()
+    video = next((item for item in videos if item.get("entry_id") == entry_id), None)
+    if video is None:
+        context.user_data["repair_index"] = index + 1
+        return await admin_repair_show_current(update, context)
+
+    incoming = update.message.video
+    video["file_id"] = incoming.file_id
+    video["duration"] = incoming.duration or video.get("duration", 0)
+    video["file_size"] = incoming.file_size
+    video["file_status"] = "valid"
+    video["file_checked_at"] = datetime.now(timezone.utc).isoformat()
+    video["repaired_at"] = datetime.now(timezone.utc).isoformat()
     save_json(VIDEOS_FILE, videos)
-    await update.message.reply_text("✅ הסרטון עודכן בהצלחה!")
-    
-    context.user_data['repair_index'] += 1
-    return await admin_repair_next(update, context)
+
+    context.user_data["repair_index"] = index + 1
+    await update.message.reply_text("✅ הסרטון עודכן ונשמר במאגר החדש.")
+    return await admin_repair_show_current(update, context)
+
 
 async def admin_repair_skip(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    context.user_data['repair_index'] += 1
-    return await admin_repair_next(update, context)
+    repair_list = context.user_data.get("repair_list", [])
+    index = int(context.user_data.get("repair_index", 0))
+    if index < len(repair_list):
+        videos = load_videos_with_entry_ids()
+        for video in videos:
+            if video.get("entry_id") == repair_list[index]:
+                video["file_status"] = "broken_skipped"
+                break
+        save_json(VIDEOS_FILE, videos)
+    context.user_data["repair_index"] = index + 1
+    return await admin_repair_show_current(update, context)
+
+
+async def admin_repair_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    context.user_data.pop("repair_list", None)
+    context.user_data.pop("repair_index", None)
+    await admin_gallery(update, context)
+    return ConversationHandler.END
 
 
 # ─── Admin: video search ──────────────────────────────────────────────────────
@@ -3040,6 +3177,26 @@ def main():
         ],
         per_message=False, per_chat=True,
     )
+    repair_conv = ConversationHandler(
+        entry_points=[
+            CallbackQueryHandler(admin_repair_scan, pattern="^admin_repair_scan$"),
+            CallbackQueryHandler(admin_repair_cached, pattern="^admin_repair_cached$"),
+        ],
+        states={
+            ADMIN_REPAIR_UPLOAD: [
+                MessageHandler(filters.VIDEO, admin_repair_handle_file),
+                CallbackQueryHandler(admin_repair_skip, pattern="^admin_repair_skip$"),
+                CallbackQueryHandler(admin_repair_cancel, pattern="^admin_repair_cancel$"),
+            ],
+        },
+        fallbacks=[
+            CommandHandler("cancel", cancel),
+            CallbackQueryHandler(admin_repair_cancel, pattern="^admin_repair_cancel$"),
+            CallbackQueryHandler(admin_repair_cancel, pattern="^admin_gallery$"),
+        ],
+        per_message=False,
+        per_chat=True,
+    )
     support_conv = ConversationHandler(
         entry_points=[CallbackQueryHandler(support_menu, pattern="^support$")],
         states={
@@ -3091,7 +3248,7 @@ def main():
     for conv in [
         check_conv, send_conv, approve_conv, broadcast_conv, coins_conv, vip_conv,
         coupon_new_conv, multiplier_conv, restore_conv, global_reset_conv,
-        video_search_conv, video_search_sec_conv, support_conv, coupon_redeem_conv, support_reply_conv,
+        video_search_conv, video_search_sec_conv, repair_conv, support_conv, coupon_redeem_conv, support_reply_conv,
         cat_add_conv, video_upload_conv
     ]:
         app.add_handler(conv)
@@ -3118,6 +3275,7 @@ def main():
         (r"^admin_orders_page_\d+$",    admin_orders_page),
         (r"^users_page_\d+$",           users_page),
         ("^admin_gallery$",             admin_gallery),
+        ("^admin_repair_start$",        admin_repair_start),
         ("^admin_dup_scan$",             admin_dup_scan),
         ("^admin_dup_rescan$",           admin_dup_rescan),
         (r"^dup_page_\d+$",            admin_dup_page),
