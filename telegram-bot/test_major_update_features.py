@@ -128,10 +128,10 @@ async def run():
         keyboard = bot.get_admin_inline_keyboard(12345)
         callback_data = [button.callback_data for row in keyboard.inline_keyboard for button in row]
         assert callback_data == ["admin_gallery"], callback_data
-        # The owner sees a compact set of section buttons rather than all operations.
-        owner_callbacks = [button.callback_data for row in bot.get_admin_inline_keyboard(owner).inline_keyboard for button in row]
-        assert "admin_menu_users" in owner_callbacks and "admin_menu_system" in owner_callbacks
-        assert "admin_backup" not in owner_callbacks and "admin_stats" not in owner_callbacks
+        # The owner retains the familiar detailed panel with direct day-to-day actions.
+        owner_callbacks = button_callbacks(bot.get_admin_inline_keyboard(owner))
+        assert {"admin_stats", "admin_gallery", "admin_backup", "admin_actions_page_0", "admin_managers"}.issubset(owner_callbacks)
+        assert "admin_menu_users" not in owner_callbacks and "admin_menu_system" not in owner_callbacks
         # A manager with only user messaging permission sees only that section's allowed controls.
         settings = bot.load_settings()
         settings["admin_managers"]["12345"]["permissions"] = ["user_messages"]
@@ -140,25 +140,26 @@ async def run():
         await bot.admin_menu_users(user_menu_update, SimpleNamespace())
         user_menu_buttons = [button.callback_data for row in user_menu_update.callback_query.edits[-1][1]["reply_markup"].inline_keyboard for button in row]
         assert "admin_send" in user_menu_buttons and "admin_check" not in user_menu_buttons
-        # Every partial-permission manager sees only the relevant top-level section.
-        permission_sections = {
-            "gallery": ("admin_gallery", "admin_backup"),
-            "duplicates": ("admin_gallery", "admin_backup"),
-            "users": ("admin_menu_users", "admin_backup"),
-            "user_messages": ("admin_menu_users", "admin_backup"),
-            "broadcast": ("admin_menu_communications", "admin_backup"),
-            "coins": ("admin_menu_rewards", "admin_backup"),
-            "maintenance": ("admin_menu_system", "admin_backup"),
-            "audit_log": ("admin_menu_system", "admin_backup"),
-            "backup": ("admin_menu_system", "admin_delete"),
-            "dangerous_delete": ("admin_menu_system", "admin_backup"),
+        # Every partial-permission manager sees only the direct controls for their own permission.
+        permission_controls = {
+            "gallery": (["admin_gallery"], "admin_backup"),
+            "duplicates": (["admin_gallery"], "admin_backup"),
+            "users": (["admin_stats", "admin_orders_page_0", "admin_check", "users_page_0"], "admin_backup"),
+            "user_messages": (["admin_send", "admin_approve"], "admin_backup"),
+            "broadcast": (["admin_broadcast"], "admin_backup"),
+            "coins": (["admin_coins", "admin_vip", "admin_coupons", "admin_multiplier"], "admin_backup"),
+            "maintenance": (["admin_maintenance"], "admin_backup"),
+            "audit_log": (["admin_actions_page_0"], "admin_backup"),
+            "backup": (["admin_backup", "admin_restore"], "admin_delete"),
+            "dangerous_delete": (["admin_global_reset", "admin_delete"], "admin_backup"),
         }
-        for permission, (expected_section, blocked_callback) in permission_sections.items():
+        for permission, (expected_controls, blocked_callback) in permission_controls.items():
             settings = bot.load_settings()
             settings["admin_managers"]["12345"]["permissions"] = [permission]
             bot.save_settings(settings)
-            assert button_callbacks(bot.get_admin_inline_keyboard(12345)) == [expected_section]
-            assert await gate_allows(expected_section, 12345), permission
+            assert button_callbacks(bot.get_admin_inline_keyboard(12345)) == expected_controls
+            for allowed_callback in expected_controls:
+                assert await gate_allows(allowed_callback, 12345), (permission, allowed_callback)
             assert not await gate_allows("admin_managers", 12345), permission
             assert not await gate_allows(blocked_callback, 12345), permission
 

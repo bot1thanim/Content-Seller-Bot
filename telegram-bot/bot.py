@@ -707,21 +707,31 @@ def get_admin_reply_keyboard():
 
 
 def get_admin_inline_keyboard(user_id: int = ADMIN_ID):
-    """Compact private admin panel; detailed actions live in permission-aware submenus."""
+    """Return the familiar detailed admin panel, filtered strictly by each manager's permissions."""
+    settings = load_settings()
+    maint_status = "🟠 תחזוקה" if settings.get("maintenance") else "🟢 פעיל"
     rows = []
-    permissions = admin_permissions(user_id)
-    if "gallery" in permissions or "duplicates" in permissions:
-        rows.append([InlineKeyboardButton("🎬 ניהול תוכן וגלריה", callback_data="admin_gallery")])
-    if {"users", "user_messages"} & permissions:
-        rows.append([InlineKeyboardButton("👥 משתמשים ומכירות", callback_data="admin_menu_users")])
-    if "coins" in permissions:
-        rows.append([InlineKeyboardButton("🪙 מטבעות, קופונים ודרגות", callback_data="admin_menu_rewards")])
-    if "broadcast" in permissions:
-        rows.append([InlineKeyboardButton("📢 הודעות ופרסום", callback_data="admin_menu_communications")])
-    if {"maintenance", "audit_log", "backup", "dangerous_delete"} & permissions:
-        rows.append([InlineKeyboardButton("⚙️ מערכת, בטיחות וגיבויים", callback_data="admin_menu_system")])
+
+    def add(permission: str, buttons: list[InlineKeyboardButton]):
+        if has_admin_permission(user_id, permission):
+            rows.append(buttons)
+
+    # Existing day-to-day controls stay visible on the main panel.
+    add("maintenance", [InlineKeyboardButton(f"📡 סטטוס בוט: {maint_status}", callback_data="admin_maintenance")])
+    add("users", [InlineKeyboardButton("📊 סטטיסטיקה", callback_data="admin_stats"), InlineKeyboardButton("🧾 הזמנות", callback_data="admin_orders_page_0")])
+    add("users", [InlineKeyboardButton("🔍 בדוק משתמש", callback_data="admin_check"), InlineKeyboardButton("👥 רשימת משתמשים", callback_data="users_page_0")])
+    add("user_messages", [InlineKeyboardButton("📩 שלח למשתמש", callback_data="admin_send"), InlineKeyboardButton("✅ אישור תשלום", callback_data="admin_approve")])
+    add("gallery", [InlineKeyboardButton("🎬 גלריית סרטונים", callback_data="admin_gallery")])
+    add("duplicates", [InlineKeyboardButton("🔎 כפילויות וסל מיחזור", callback_data="admin_gallery")])
+    add("audit_log", [InlineKeyboardButton("📜 יומן פעולות", callback_data="admin_actions_page_0")])
+    add("broadcast", [InlineKeyboardButton("📢 הודעה לכולם", callback_data="admin_broadcast")])
+    add("coins", [InlineKeyboardButton("🪙 ניהול מטבעות", callback_data="admin_coins"), InlineKeyboardButton("💎 ניהול דרגות", callback_data="admin_vip")])
+    add("coins", [InlineKeyboardButton("🎟 ניהול קופונים", callback_data="admin_coupons"), InlineKeyboardButton("💱 ערך מטבע", callback_data="admin_multiplier")])
+    add("backup", [InlineKeyboardButton("💾 גיבוי ZIP", callback_data="admin_backup"), InlineKeyboardButton("📥 שחזור גיבוי", callback_data="admin_restore")])
+    add("dangerous_delete", [InlineKeyboardButton("🔄 איפוס נתונים", callback_data="admin_global_reset"), InlineKeyboardButton("🧹 מחק סרטונים", callback_data="admin_delete")])
     if is_owner(user_id):
         rows.append([InlineKeyboardButton("👑 ניהול מנהלים", callback_data="admin_managers")])
+
     return InlineKeyboardMarkup(rows or [[InlineKeyboardButton("ℹ️ אין הרשאות פעילות", callback_data="noop")]])
 
 
