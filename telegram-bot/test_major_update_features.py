@@ -108,10 +108,32 @@ async def run():
         update = FakeUpdate("admin_dup_scan", owner)
         await bot.show_duplicate_scan(update, context, include_reviewed=False)
         assert len(fake_bot.sent_videos) == 2, fake_bot.sent_videos
+        first_control_callbacks = button_callbacks(fake_bot.sent_texts[-1][2]["reply_markup"])
+        assert {"dup_send_0", "dup_mark_0", "dup_back_gallery", "dup_page_1"}.issubset(first_control_callbacks)
         update.callback_query.data = "dup_page_1"
         await bot.admin_dup_page(update, context)
         assert len(fake_bot.sent_videos) == 4
-        assert len(fake_bot.deleted) == 2
+        # Navigation removes the two prior preview videos and their lower action panel.
+        assert len(fake_bot.deleted) == 3
+        assert len(fake_bot.sent_texts) == 2
+        second_control_callbacks = button_callbacks(fake_bot.sent_texts[-1][2]["reply_markup"])
+        assert {"dup_send_1", "dup_mark_1", "dup_back_gallery", "dup_page_0"}.issubset(second_control_callbacks)
+
+        # A library preview is removed when the administrator returns to the gallery.
+        preview_context = SimpleNamespace(bot=fake_bot, user_data={})
+        gallery_preview = FakeUpdate("vid_page_0", owner)
+        deleted_before_gallery_back = len(fake_bot.deleted)
+        await bot.admin_gallery_page(gallery_preview, preview_context, 0)
+        await bot.admin_gallery(FakeUpdate("admin_gallery", owner), preview_context)
+        assert len(fake_bot.deleted) == deleted_before_gallery_back + 1
+
+        # A trash preview follows the same clean-up rule on the Back button.
+        write(bot.TRASH_FILE, [{"file_id": "t1", "duration": 12, "entry_id": "trash-a", "deleted_at": "today"}])
+        trash_preview = FakeUpdate("admin_trash_page_0", owner)
+        deleted_before_trash_back = len(fake_bot.deleted)
+        await bot.admin_trash_page(trash_preview, preview_context, 0)
+        await bot.admin_gallery(FakeUpdate("admin_gallery", owner), preview_context)
+        assert len(fake_bot.deleted) == deleted_before_trash_back + 1
         # Safety snapshot and audit persistence are created before dangerous work.
         snapshot = bot.create_auto_backup("test_dangerous_action", owner)
         assert snapshot and snapshot.exists()
@@ -176,7 +198,7 @@ async def run():
         settings["admin_managers"]["12345"]["permissions"] = ["gallery"]
         bot.save_settings(settings)
         gallery_update = FakeUpdate("admin_gallery", 12345)
-        await bot.admin_gallery(gallery_update, SimpleNamespace())
+        await bot.admin_gallery(gallery_update, SimpleNamespace(user_data={}))
         gallery_buttons = button_callbacks(gallery_update.callback_query.edits[-1][1]["reply_markup"])
         assert "vid_page_0" in gallery_buttons and "admin_dup_scan" not in gallery_buttons
         assert await gate_allows("vid_page_0", 12345)
@@ -186,7 +208,7 @@ async def run():
         settings["admin_managers"]["12345"]["permissions"] = ["duplicates"]
         bot.save_settings(settings)
         duplicates_update = FakeUpdate("admin_gallery", 12345)
-        await bot.admin_gallery(duplicates_update, SimpleNamespace())
+        await bot.admin_gallery(duplicates_update, SimpleNamespace(user_data={}))
         duplicate_buttons = button_callbacks(duplicates_update.callback_query.edits[-1][1]["reply_markup"])
         assert "admin_dup_scan" in duplicate_buttons and "vid_page_0" not in duplicate_buttons
         assert await gate_allows("admin_gallery", 12345)

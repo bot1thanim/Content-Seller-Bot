@@ -1751,6 +1751,12 @@ async def admin_approve_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def admin_gallery(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
+    # Leaving library, trash, or duplicate review must remove the preview video from the chat.
+    await clear_sent_duplicate_group_media(context)
+    # When this callback is the lower duplicate-review control, it becomes the gallery message.
+    user_data = getattr(context, "user_data", None)
+    if isinstance(user_data, dict):
+        user_data.pop("dup_review_control_message_id", None)
     user_id = query.from_user.id
     can_manage_gallery = has_admin_permission(user_id, "gallery")
     can_manage_duplicates = has_admin_permission(user_id, "duplicates")
@@ -1892,7 +1898,6 @@ async def admin_dup_mark_not_duplicate(update: Update, context: ContextTypes.DEF
 
     group = groups[page]
     was_added = mark_group_as_not_duplicate(group)
-    await clear_sent_duplicate_group_media(context)
     groups.pop(page)
     context.user_data["dup_groups"] = groups
     await query.answer(
@@ -1905,6 +1910,8 @@ async def admin_dup_mark_not_duplicate(update: Update, context: ContextTypes.DEF
         await admin_dup_page(update, context, min(page, len(groups) - 1))
         return
 
+    await clear_sent_duplicate_group_media(context)
+    context.user_data.pop("dup_review_control_message_id", None)
     await query.edit_message_text(
         "✅ הקבוצה סומנה כלא כפולה. אין עוד חשדות פתוחים בסריקה זו.",
         reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 חזרה לגלריה", callback_data="admin_gallery")]]),
@@ -1930,8 +1937,11 @@ def duplicate_group_keyboard(page: int, total: int) -> InlineKeyboardMarkup:
 
 
 async def clear_sent_duplicate_group_media(context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Remove only videos previously sent for the duplicate group being left."""
-    message_ids = context.user_data.pop("dup_sent_media_message_ids", [])
+    """Remove preview videos sent for the current library, trash, or duplicate-review item."""
+    user_data = getattr(context, "user_data", None)
+    if not isinstance(user_data, dict):
+        return 0
+    message_ids = user_data.pop("dup_sent_media_message_ids", [])
     removed_count = 0
     for message_id in message_ids:
         try:
@@ -1939,14 +1949,34 @@ async def clear_sent_duplicate_group_media(context: ContextTypes.DEFAULT_TYPE) -
             removed_count += 1
         except Exception as exc:
             # A video may already have been deleted manually; this must not block navigation.
-            logger.info(f"Could not remove prior duplicate-review media message {message_id}: {exc}")
+            logger.info(f"Could not remove prior preview media message {message_id}: {exc}")
     return removed_count
+
+
+async def clear_duplicate_review_control_message(context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """Remove the old lower action panel before placing the next group and its controls."""
+    user_data = getattr(context, "user_data", None)
+    if not isinstance(user_data, dict):
+        return False
+    message_id = user_data.pop("dup_review_control_message_id", None)
+    if not message_id:
+        return False
+    try:
+        await context.bot.delete_message(chat_id=ADMIN_ID, message_id=message_id)
+        return True
+    except Exception as exc:
+        logger.info(f"Could not remove prior duplicate-review control message {message_id}: {exc}")
+        return False
 
 
 async def admin_dup_back_to_gallery(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     await clear_sent_duplicate_group_media(context)
+    # Keep the lower control itself: it is edited into the gallery menu by admin_gallery.
+    user_data = getattr(context, "user_data", None)
+    if isinstance(user_data, dict):
+        user_data.pop("dup_review_control_message_id", None)
     await admin_gallery(update, context)
 
 
@@ -1976,47 +2006,59 @@ async def admin_dup_page(update: Update, context: ContextTypes.DEFAULT_TYPE, pag
     query = update.callback_query
     if page is None:
         page = int(query.data.split("dup_page_")[1])
-        # Moving back or forward means the previous group is no longer being reviewed.
-        await clear_sent_duplicate_group_media(context)
+        await query.answer()
+
+    # A navigation click comes from the lower control message. Remove it and the old media,
+    # then send the next group's controls after its videos instead of leaving them above.
+    had_lower_control = bool(context.user_data.get("dup_review_control_message_id"))
+    await clear_sent_duplicate_group_media(context)
+    if had_lower_control:
+        await clear_duplicate_review_control_message(context)
 
     groups = context.user_data.get("dup_groups", [])
     total = len(groups)
     if page >= total:
-        await query.edit_message_text(
-            "✅ סיימת לעבור על כל הכפילויות!",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 חזרה", callback_data="dup_back_gallery")]]),
-        )
+        completion_markup = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 חזרה", callback_data="dup_back_gallery")]])
+        if had_lower_control:
+            await context.bot.send_message(chat_id=ADMIN_ID, text="✅ סיימת לעבור על כל הכפילויות!", reply_markup=completion_markup)
+        else:
+            await query.edit_message_text("✅ סיימת לעבור על כל הכפילויות!", reply_markup=completion_markup)
         return
 
     group = groups[page]
     duration = group[0].get("duration", 0)
-    await query.edit_message_text(
-        f"🔎 *חשד לכפילות ({page + 1}/{total})*\n\n⏱ אורך משותף: {duration} שניות\n"
-        f"👥 מספר סרטונים בקבוצה: {len(group)}\n\n⏳ שולח את סרטוני הקבוצה אוטומטית לבדיקה...",
-        parse_mode="Markdown",
-        reply_markup=duplicate_group_keyboard(page, total),
-    )
+    if not had_lower_control:
+        await query.edit_message_text(
+            f"🔎 *חשד לכפילות ({page + 1}/{total})*\n\n⏱ אורך משותף: {duration} שניות\n"
+            f"👥 מספר סרטונים בקבוצה: {len(group)}\n\n⏳ שולח את סרטוני הקבוצה אוטומטית לבדיקה...",
+            parse_mode="Markdown",
+        )
+
     success_count, failed_count = await send_duplicate_group_media(context, group)
-    status = f"✅ נשלחו אוטומטית {success_count}/{len(group)} סרטונים חשודים. אפשר למחוק סרטון, לסמן כלא כפול או לעבור לקבוצה הבאה."
+    status = (
+        f"✅ נשלחו אוטומטית {success_count}/{len(group)} סרטונים חשודים. "
+        "אפשר למחוק סרטון, לסמן כלא כפול או לעבור לקבוצה הבאה."
+    )
     if failed_count:
         status += f"\n⚠️ {failed_count} סרטונים לא נשלחו וסומנו לבדיקה."
-    await query.edit_message_text(status, reply_markup=duplicate_group_keyboard(page, total))
+    lower_control = await context.bot.send_message(
+        chat_id=ADMIN_ID,
+        text=status,
+        reply_markup=duplicate_group_keyboard(page, total),
+    )
+    if lower_control:
+        context.user_data["dup_review_control_message_id"] = lower_control.message_id
 
 
 async def admin_dup_send_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Optional manual resend for the currently open group."""
+    """Resend the group while keeping its action controls below the newly sent videos."""
     query = update.callback_query
-    await query.answer()
     page = int(query.data.replace("dup_send_", ""))
     groups = context.user_data.get("dup_groups", [])
     if not (0 <= page < len(groups)):
         await query.answer("הקבוצה כבר אינה זמינה. יש לבצע סריקה מחדש.", show_alert=True)
         return
-    success_count, failed_count = await send_duplicate_group_media(context, groups[page])
-    status = f"✅ נשלחו שוב {success_count}/{len(groups[page])} סרטונים מהקבוצה."
-    if failed_count:
-        status += f" ⚠️ {failed_count} לא נשלחו."
-    await query.edit_message_text(status, reply_markup=duplicate_group_keyboard(page, len(groups)))
+    await admin_dup_page(update, context, page)
 
 async def admin_gallery_delete(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
