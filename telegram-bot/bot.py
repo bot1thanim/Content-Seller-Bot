@@ -401,11 +401,13 @@ def callback_permission(callback_data: str) -> str | None:
     """Map private callback data to its required permission; None means owner-only/unknown."""
     if callback_data in {"admin_panel", "back_admin"}:
         return "panel"
-    if callback_data.startswith(("admin_gallery", "vid_", "admin_categories", "cat_", "admin_repair")):
+    if callback_data == "admin_gallery":
+        return "gallery_or_duplicates"
+    if callback_data.startswith(("vid_", "admin_categories", "admin_cat_", "cat_", "admin_repair")):
         return "gallery"
     if callback_data.startswith(("admin_dup", "dup_", "admin_trash", "trash_", "del_eid_", "del_v_")):
         return "duplicates"
-    if callback_data.startswith(("admin_orders", "users_page", "admin_check", "support_reply")):
+    if callback_data.startswith(("admin_stats", "admin_orders", "users_page", "admin_check", "support_reply")):
         return "users"
     if callback_data.startswith(("admin_send", "admin_approve")):
         return "user_messages"
@@ -436,6 +438,12 @@ async def admin_callback_gate(update: Update, context: ContextTypes.DEFAULT_TYPE
     permission = callback_permission(data)
     if permission == "panel":
         if is_admin(query.from_user.id):
+            return
+    elif permission == "gallery_or_duplicates":
+        if is_admin(query.from_user.id) and (
+            has_admin_permission(query.from_user.id, "gallery")
+            or has_admin_permission(query.from_user.id, "duplicates")
+        ):
             return
     elif permission:
         if is_admin(query.from_user.id) and has_admin_permission(query.from_user.id, permission):
@@ -1727,25 +1735,33 @@ async def admin_approve_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def admin_gallery(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    if not is_admin(query.from_user.id):
+    user_id = query.from_user.id
+    can_manage_gallery = has_admin_permission(user_id, "gallery")
+    can_manage_duplicates = has_admin_permission(user_id, "duplicates")
+    if not (can_manage_gallery or can_manage_duplicates):
         return
-    
-    keyboard = [
-        [InlineKeyboardButton("🎬 עיון בספריה", callback_data="vid_page_0")],
-        [InlineKeyboardButton("🏷 קטגוריות", callback_data="admin_categories")],
-        [
-            InlineKeyboardButton("🔎 מצא כפילויות", callback_data="admin_dup_scan"),
-            InlineKeyboardButton("🔄 מצא כפילויות מחדש", callback_data="admin_dup_rescan"),
-        ],
-        [InlineKeyboardButton("🗑 סל מיחזור", callback_data="admin_trash_page_0")],
-        [InlineKeyboardButton("📤 שלח את כל הסרטונים", callback_data="vid_send_all")],
-        [InlineKeyboardButton("🛠 תיקון מזהים שבורים", callback_data="admin_repair_start")],
-        [InlineKeyboardButton("🔙 חזור לפאנל", callback_data="back_admin")]
-    ]
-    
+
+    keyboard = []
+    if can_manage_gallery:
+        keyboard.extend([
+            [InlineKeyboardButton("🎬 עיון בספריה", callback_data="vid_page_0")],
+            [InlineKeyboardButton("🏷 קטגוריות", callback_data="admin_categories")],
+            [InlineKeyboardButton("📤 שלח את כל הסרטונים", callback_data="vid_send_all")],
+            [InlineKeyboardButton("🛠 תיקון מזהים שבורים", callback_data="admin_repair_start")],
+        ])
+    if can_manage_duplicates:
+        keyboard.extend([
+            [
+                InlineKeyboardButton("🔎 מצא כפילויות", callback_data="admin_dup_scan"),
+                InlineKeyboardButton("🔄 מצא כפילויות מחדש", callback_data="admin_dup_rescan"),
+            ],
+            [InlineKeyboardButton("🗑 סל מיחזור", callback_data="admin_trash_page_0")],
+        ])
+    keyboard.append([InlineKeyboardButton("🔙 חזור לפאנל", callback_data="back_admin")])
+
     text = """🎬 *ניהול גלריה ומדיה*
 
-כאן תוכל לנהל את כל הסרטונים בבוט, לאתר כפילויות ולשחזר סרטונים שנמחקו."""
+כאן תוכל לנהל את הסרטונים, לאתר כפילויות ולשחזר סרטונים שנמחקו — בהתאם להרשאות שקיבלת."""
     
     await query.edit_message_text(text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(keyboard))
 
