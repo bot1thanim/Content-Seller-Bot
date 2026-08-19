@@ -10,6 +10,7 @@ import warnings
 import zipfile
 import time
 import uuid
+import re
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from datetime import datetime, date, timezone, timedelta
 from pathlib import Path
@@ -24,6 +25,7 @@ from telegram import (
 )
 from telegram.ext import (
     Application,
+    ApplicationHandlerStop,
     CommandHandler,
     CallbackQueryHandler,
     MessageHandler,
@@ -57,6 +59,10 @@ ORDERS_FILE    = DATA_DIR / "orders.json"
 COUPONS_FILE   = DATA_DIR / "coupons.json"
 SETTINGS_FILE  = DATA_DIR / "settings.json"
 TRASH_FILE     = DATA_DIR / "trash.json"
+ADMIN_ACTIONS_FILE = DATA_DIR / "admin_actions.json"
+AUTO_BACKUPS_DIR = DATA_DIR / "auto_backups"
+MAX_ADMIN_ACTIONS = 2000
+MAX_AUTO_BACKUPS = 30
 
 # Only these JSON data files may be restored from an administrator backup.
 BACKUP_ALLOWED_FILES = {
@@ -68,6 +74,7 @@ BACKUP_ALLOWED_FILES = {
     "coupons.json": dict,
     "settings.json": dict,
     "trash.json": list,
+    "admin_actions.json": list,
 }
 MAX_RESTORE_ARCHIVE_BYTES = 20 * 1024 * 1024
 MAX_RESTORE_UNCOMPRESSED_BYTES = 40 * 1024 * 1024
@@ -128,7 +135,8 @@ VIP_LEVELS = [
     ADMIN_VIDEO_CAT_SORT,    # 29
     ADMIN_REPAIR_UPLOAD,     # 30
     ADMIN_CATEGORY_RENAME,   # 31
-) = range(32)
+    ADMIN_MANAGER_ADD_ID,    # 32
+) = range(33)
 
 
 # ─── Data helpers ─────────────────────────────────────────────────────────────
@@ -144,6 +152,7 @@ def ensure_data_files():
         (COUPONS_FILE,   {}),
         (SETTINGS_FILE,  {"referral_multiplier": 1.0, "maintenance": False}),
         (TRASH_FILE,     []),
+        (ADMIN_ACTIONS_FILE, []),
     ]
     for filepath, default in defaults:
         if not filepath.exists():
@@ -172,13 +181,46 @@ def save_json(filepath, data):
     tmp.replace(filepath)
 
 
+def video_categories(video: dict) -> list[str]:
+    """Return normalized private category memberships, supporting legacy single-category data."""
+    if not isinstance(video, dict):
+        return ["כללי"]
+    raw = video.get("categories")
+    if isinstance(raw, list):
+        categories = [str(item).strip() for item in raw if isinstance(item, str) and item.strip()]
+    else:
+        legacy = video.get("category", "כללי")
+        categories = [str(legacy).strip()] if isinstance(legacy, str) and legacy.strip() else []
+    # Keep order stable while removing duplicates.
+    unique = list(dict.fromkeys(categories))
+    return unique or ["כללי"]
+
+
+def normalize_video_categories(video: dict) -> bool:
+    """Persist both multi-category data and the legacy primary category for compatibility."""
+    if not isinstance(video, dict):
+        return False
+    categories = video_categories(video)
+    changed = video.get("categories") != categories or video.get("category") != categories[0]
+    video["categories"] = categories
+    video["category"] = categories[0]
+    return changed
+
+
+def display_video_categories(video: dict) -> str:
+    return ", ".join(video_categories(video))
+
+
 def normalize_restored_videos(videos):
-    """Convert the legacy list-of-file_id backup format to current video records."""
+    """Convert legacy file-id data and normalize category memberships during restore."""
     if videos and all(isinstance(item, str) for item in videos):
-        return [
+        videos = [
             {"file_id": item, "duration": 0, "preview": None, "entry_id": uuid.uuid4().hex}
             for item in videos
         ]
+    if isinstance(videos, list):
+        for video in videos:
+            normalize_video_categories(video)
     return videos
 
 
@@ -245,7 +287,7 @@ def apply_restore_payloads(payloads: dict) -> None:
 
 
 def load_videos_with_entry_ids():
-    """Load video records and permanently assign a unique entry_id to every record."""
+    """Load video records and permanently normalize IDs and category memberships."""
     videos = load_json(VIDEOS_FILE)
     if not isinstance(videos, list):
         return []
@@ -261,6 +303,8 @@ def load_videos_with_entry_ids():
             video["entry_id"] = entry_id
             changed = True
         used_ids.add(entry_id)
+        if normalize_video_categories(video):
+            changed = True
 
     if changed:
         save_json(VIDEOS_FILE, videos)
@@ -310,6 +354,134 @@ def load_settings() -> dict:
 
 def save_settings(s: dict):
     save_json(SETTINGS_FILE, s)
+
+
+ADMIN_PERMISSIONS = [
+    ("gallery", "🎬 גלריה, העלאה וקטגוריות"),
+    ("duplicates", "🔎 כפילויות וסל מיחזור"),
+    ("users", "👥 משתמשים, הזמנות ותמיכה"),
+    ("user_messages", "📩 שליחה למשתמש ואישור תשלום"),
+    ("broadcast", "📢 הודעה לכל המשתמשים"),
+    ("coins", "🪙 מטבעות, קופונים ודרגות"),
+    ("maintenance", "🔧 מצב תחזוקה"),
+    ("audit_log", "📜 יומן פעולות"),
+    ("backup", "💾 גיבוי ושחזור"),
+    ("dangerous_delete", "🗑 מחיקה לצמיתות ואיפוס"),
+]
+PERMISSION_LABELS = dict(ADMIN_PERMISSIONS)
+
+
+def is_owner(user_id: int) -> bool:
+    return int(user_id) == ADMIN_ID
+
+
+def admin_managers() -> dict:
+    settings = load_settings()
+    managers = settings.get("admin_managers", {})
+    return managers if isinstance(managers, dict) else {}
+
+
+def is_admin(user_id: int) -> bool:
+    return is_owner(user_id) or str(user_id) in admin_managers()
+
+
+def admin_permissions(user_id: int) -> set[str]:
+    if is_owner(user_id):
+        return set(PERMISSION_LABELS)
+    record = admin_managers().get(str(user_id), {})
+    permissions = record.get("permissions", []) if isinstance(record, dict) else []
+    return {permission for permission in permissions if permission in PERMISSION_LABELS}
+
+
+def has_admin_permission(user_id: int, permission: str) -> bool:
+    return is_owner(user_id) or permission in admin_permissions(user_id)
+
+
+def callback_permission(callback_data: str) -> str | None:
+    """Map private callback data to its required permission; None means owner-only/unknown."""
+    if callback_data in {"admin_panel", "back_admin"}:
+        return "panel"
+    if callback_data.startswith(("admin_gallery", "vid_", "admin_categories", "cat_", "admin_repair")):
+        return "gallery"
+    if callback_data.startswith(("admin_dup", "dup_", "admin_trash", "trash_", "del_eid_", "del_v_")):
+        return "duplicates"
+    if callback_data.startswith(("admin_orders", "users_page", "admin_check", "support_reply")):
+        return "users"
+    if callback_data.startswith(("admin_send", "admin_approve")):
+        return "user_messages"
+    if callback_data.startswith("admin_broadcast"):
+        return "broadcast"
+    if callback_data.startswith(("admin_coins", "admin_coupons", "coupon_", "admin_vip", "admin_multiplier")):
+        return "coins"
+    if callback_data.startswith(("admin_maintenance", "maint_")):
+        return "maintenance"
+    if callback_data.startswith("admin_actions"):
+        return "audit_log"
+    if callback_data.startswith(("admin_backup", "admin_restore")):
+        return "backup"
+    if callback_data.startswith(("admin_delete", "admin_global_reset")):
+        return "dangerous_delete"
+    if callback_data.startswith("admin_managers") or callback_data.startswith("admin_mgr_"):
+        return None
+    return None
+
+
+async def admin_callback_gate(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    if not query:
+        return
+    data = query.data or ""
+    permission = callback_permission(data)
+    if permission == "panel":
+        if is_admin(query.from_user.id):
+            return
+    elif permission:
+        if is_admin(query.from_user.id) and has_admin_permission(query.from_user.id, permission):
+            return
+    else:
+        # Callbacks not owned by this mapper are public unless they use the admin namespace.
+        if not data.startswith(("admin_", "cat_", "dup_", "vid_", "trash_", "del_", "maint_", "support_reply")):
+            return
+        if data.startswith(("admin_managers", "admin_mgr_")) and is_owner(query.from_user.id):
+            return
+    await query.answer("⛔ אין לך הרשאה לפעולה זו.", show_alert=True)
+    raise ApplicationHandlerStop
+
+
+def create_auto_backup(reason: str, actor_id: int | None = None) -> Path | None:
+    """Create a bounded JSON snapshot before a destructive data operation."""
+    try:
+        AUTO_BACKUPS_DIR.mkdir(parents=True, exist_ok=True)
+        safe_reason = re.sub(r"[^a-zA-Z0-9_-]+", "_", reason).strip("_") or "operation"
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        path = AUTO_BACKUPS_DIR / f"auto_{stamp}_{safe_reason}.zip"
+        with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as archive:
+            for filename in BACKUP_ALLOWED_FILES:
+                filepath = DATA_DIR / filename
+                if filepath.exists():
+                    archive.write(filepath, arcname=filename)
+        backups = sorted(AUTO_BACKUPS_DIR.glob("auto_*.zip"), key=lambda item: item.stat().st_mtime, reverse=True)
+        for old_backup in backups[MAX_AUTO_BACKUPS:]:
+            old_backup.unlink(missing_ok=True)
+        logger.info("Created automatic backup %s for %s by %s", path.name, reason, actor_id)
+        return path
+    except Exception as exc:
+        logger.exception("Automatic backup failed before %s: %s", reason, exc)
+        return None
+
+
+def log_admin_action(actor_id: int, action: str, details: dict | None = None) -> None:
+    """Persist a bounded, non-secret audit record for admin activity."""
+    records = load_json(ADMIN_ACTIONS_FILE)
+    if not isinstance(records, list):
+        records = []
+    records.append({
+        "at": datetime.now(timezone.utc).isoformat(),
+        "admin_id": int(actor_id),
+        "action": str(action),
+        "details": details if isinstance(details, dict) else {},
+    })
+    save_json(ADMIN_ACTIONS_FILE, records[-MAX_ADMIN_ACTIONS:])
 
 
 DUPLICATE_REVIEWED_KEY = "reviewed_non_duplicate_groups"
@@ -523,45 +695,30 @@ def get_admin_reply_keyboard():
         one_time_keyboard=False,
     )
 
-def get_admin_inline_keyboard():
-    settings    = load_settings()
+
+def get_admin_inline_keyboard(user_id: int = ADMIN_ID):
+    """Return a private panel containing only the allowed operations for this administrator."""
+    settings = load_settings()
     maint_status = "🟠 תחזוקה" if settings.get("maintenance") else "🟢 פעיל"
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton(f"📡 סטטוס בוט: {maint_status}", callback_data="admin_maintenance")],
-        [
-            InlineKeyboardButton("📊 סטטיסטיקה",      callback_data="admin_stats"),
-            InlineKeyboardButton("🧾 הזמנות",          callback_data="admin_orders_page_0"),
-        ],
-        [
-            InlineKeyboardButton("🔍 בדוק משתמש",     callback_data="admin_check"),
-            InlineKeyboardButton("👥 רשימת משתמשים",  callback_data="users_page_0"),
-        ],
-        [
-            InlineKeyboardButton("📩 שלח למשתמש",     callback_data="admin_send"),
-            InlineKeyboardButton("✅ אישור תשלום",     callback_data="admin_approve"),
-        ],
-        [InlineKeyboardButton("🎬 גלריית סרטונים", callback_data="admin_gallery")],
-        [
-            InlineKeyboardButton("📢 הודעה לכולם",    callback_data="admin_broadcast"),
-            InlineKeyboardButton("🪙 ניהול מטבעות",   callback_data="admin_coins"),
-        ],
-        [
-            InlineKeyboardButton("💎 ניהול דרגות",    callback_data="admin_vip"),
-        ],
-        [
-            InlineKeyboardButton("🎟 ניהול קופונים",  callback_data="admin_coupons"),
-            InlineKeyboardButton("💱 ערך מטבע",       callback_data="admin_multiplier"),
-        ],
-        [
-            InlineKeyboardButton("💾 גיבוי ZIP",      callback_data="admin_backup"),
-            InlineKeyboardButton("📥 שחזור גיבוי",   callback_data="admin_restore"),
-        ],
-        [
-            InlineKeyboardButton("🔄 איפוס נתונים",  callback_data="admin_global_reset"),
-            InlineKeyboardButton("🧹 מחק סרטונים",   callback_data="admin_delete"),
-        ],
-        [InlineKeyboardButton("🔧 ניהול מצב תחזוקה",    callback_data="admin_maintenance")],
-    ])
+    rows = []
+    def add(permission: str, buttons: list[InlineKeyboardButton]):
+        if has_admin_permission(user_id, permission):
+            rows.append(buttons)
+    add("maintenance", [InlineKeyboardButton(f"📡 סטטוס בוט: {maint_status}", callback_data="admin_maintenance")])
+    add("users", [InlineKeyboardButton("📊 סטטיסטיקה", callback_data="admin_stats"), InlineKeyboardButton("🧾 הזמנות", callback_data="admin_orders_page_0")])
+    add("users", [InlineKeyboardButton("🔍 בדוק משתמש", callback_data="admin_check"), InlineKeyboardButton("👥 רשימת משתמשים", callback_data="users_page_0")])
+    add("user_messages", [InlineKeyboardButton("📩 שלח למשתמש", callback_data="admin_send"), InlineKeyboardButton("✅ אישור תשלום", callback_data="admin_approve")])
+    add("gallery", [InlineKeyboardButton("🎬 גלריית סרטונים", callback_data="admin_gallery")])
+    add("duplicates", [InlineKeyboardButton("🔎 כפילויות וסל מיחזור", callback_data="admin_gallery")])
+    add("audit_log", [InlineKeyboardButton("📜 יומן פעולות", callback_data="admin_actions_page_0")])
+    add("broadcast", [InlineKeyboardButton("📢 הודעה לכולם", callback_data="admin_broadcast")])
+    add("coins", [InlineKeyboardButton("🪙 ניהול מטבעות", callback_data="admin_coins"), InlineKeyboardButton("💎 ניהול דרגות", callback_data="admin_vip")])
+    add("coins", [InlineKeyboardButton("🎟 ניהול קופונים", callback_data="admin_coupons"), InlineKeyboardButton("💱 ערך מטבע", callback_data="admin_multiplier")])
+    add("backup", [InlineKeyboardButton("💾 גיבוי ZIP", callback_data="admin_backup"), InlineKeyboardButton("📥 שחזור גיבוי", callback_data="admin_restore")])
+    add("dangerous_delete", [InlineKeyboardButton("🔄 איפוס נתונים", callback_data="admin_global_reset"), InlineKeyboardButton("🧹 מחק סרטונים", callback_data="admin_delete")])
+    if is_owner(user_id):
+        rows.append([InlineKeyboardButton("👑 ניהול מנהלים", callback_data="admin_managers")])
+    return InlineKeyboardMarkup(rows or [[InlineKeyboardButton("ℹ️ אין הרשאות פעילות", callback_data="noop")]])
 
 # ─── Maintenance gate ─────────────────────────────────────────────────────────
 
@@ -628,8 +785,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             save_json(USERS_FILE, users)
 
 
-    if user.id == ADMIN_ID:
-        await update.message.reply_text("👋 ברוך הבא אדמין!", reply_markup=get_admin_reply_keyboard())
+    if is_admin(user.id):
+        await update.message.reply_text("👋 ברוך הבא בפאנל הניהול!", reply_markup=get_admin_reply_keyboard())
 
     vip = get_user_vip(str(user.id))
     await update.message.reply_text(
@@ -685,13 +842,14 @@ async def daily_bonus(update: Update, context: ContextTypes.DEFAULT_TYPE):
     coins[uid] = new_balance
     save_json(COINS_FILE, coins)
     
-    await query.answer(
-        f"🎁 קיבלת {bonus_amount} מטבע מתנה!\n\n"
-        f"💰 יתרה קודמת: {old_balance}\n"
-        f"🆕 יתרה חדשה: {new_balance}",
-        show_alert=True
+    await query.answer(f"🎁 קיבלת {bonus_amount} מטבע! כעת יש לך בסך הכול {new_balance} מטבעות.", show_alert=True)
+    await query.edit_message_text(
+        f"🎁 *המתנה היומית התקבלה!*\n\n"
+        f"קיבלת עכשיו: *{bonus_amount} מטבעות*\n"
+        f"💰 יש לך בסך הכול: *{new_balance} מטבעות*",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 חזרה לתפריט", callback_data="back_main")]]),
     )
-    await back_main(update, context)
 
 # ─── VIP Info ────────────────────────────────────────────────────────────────
 
@@ -799,7 +957,8 @@ async def paypal_package_selected(update: Update, context: ContextTypes.DEFAULT_
     if available < pkg["videos"]:
         await query.edit_message_text(
             f"כרגע נשארו לך רק {available} סרטונים חדשים שעדיין לא קיבלת. "
-            "בחר חבילה קטנה יותר או חזור מאוחר יותר לאחר הוספת תוכן חדש.",
+            "כדי לא לשלוח לך כפילויות, לא ניתן להשלים את החבילה הזו כרגע. "
+            "בחר חבילה קטנה יותר או חזור לאחר שיועלה תוכן חדש.",
             reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 חזרה", callback_data="paypal_menu")]]),
         )
         return
@@ -869,7 +1028,8 @@ async def coin_package_buy(update: Update, context: ContextTypes.DEFAULT_TYPE):
     available = count_unseen_videos(query.from_user.id)
     if available < pkg["videos"]:
         await query.answer(
-            f"❌ נשארו לך רק {available} סרטונים חדשים. בחר חבילה קטנה יותר או המתן לתוכן חדש.",
+            f"❌ נשארו לך רק {available} סרטונים חדשים שעדיין לא קיבלת. "
+            "כדי למנוע כפילויות, בחר חבילה קטנה יותר או המתן לתוכן חדש.",
             show_alert=True,
         )
         return
@@ -1022,7 +1182,7 @@ async def support_receive_msg(update: Update, context: ContextTypes.DEFAULT_TYPE
 async def admin_support_reply_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    if query.from_user.id != ADMIN_ID:
+    if not is_admin(query.from_user.id):
         return ConversationHandler.END
     target = query.data.replace("support_reply_", "")
     context.user_data["support_reply_target"] = target
@@ -1030,7 +1190,7 @@ async def admin_support_reply_start(update: Update, context: ContextTypes.DEFAUL
     return SUPPORT_REPLY_MSG
 
 async def admin_support_reply_send(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID:
+    if not is_admin(update.effective_user.id):
         return ConversationHandler.END
     target = context.user_data.get("support_reply_target")
     try:
@@ -1040,30 +1200,172 @@ async def admin_support_reply_send(update: Update, context: ContextTypes.DEFAULT
         await update.message.reply_text(f"❌ שגיאה: {e}")
     return ConversationHandler.END
 
+# ─── Owner: manager permissions ───────────────────────────────────────────────
+
+async def admin_managers_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if not is_owner(query.from_user.id):
+        return
+    managers = admin_managers()
+    buttons = [[InlineKeyboardButton("➕ הוסף מנהל", callback_data="admin_mgr_add")]]
+    for manager_id, record in managers.items():
+        label = record.get("name") or f"מנהל {manager_id}"
+        buttons.append([InlineKeyboardButton(f"👤 {label} ({manager_id})", callback_data=f"admin_mgr_pick_{manager_id}")])
+    buttons.append([InlineKeyboardButton("🔙 חזרה לפאנל", callback_data="back_admin")])
+    await query.edit_message_text(
+        "👑 *ניהול מנהלים*\n\nבחר מנהל כדי להגדיר את ההרשאות שלו. רק הבעלים יכול להוסיף, לערוך או להסיר מנהלים.",
+        parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(buttons),
+    )
+
+
+async def admin_manager_add_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if not is_owner(query.from_user.id):
+        return ConversationHandler.END
+    await query.edit_message_text(
+        "שלח את *מזהה המשתמש המספרי* של המנהל החדש. לאחר ההוספה תבחר בדיוק את ההרשאות שלו.",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ ביטול", callback_data="admin_managers")]]),
+    )
+    return ADMIN_MANAGER_ADD_ID
+
+
+async def admin_manager_add_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_owner(update.effective_user.id):
+        return ConversationHandler.END
+    try:
+        manager_id = int(update.message.text.strip())
+    except ValueError:
+        await update.message.reply_text("❌ יש לשלוח מזהה משתמש מספרי בלבד.")
+        return ADMIN_MANAGER_ADD_ID
+    if manager_id == ADMIN_ID:
+        await update.message.reply_text("ℹ️ זהו מזהה הבעלים הראשי, ולכן אין צורך להוסיף אותו כמנהל.")
+        return ConversationHandler.END
+    settings = load_settings()
+    managers = settings.setdefault("admin_managers", {})
+    record = managers.get(str(manager_id), {})
+    record.setdefault("permissions", [])
+    record.setdefault("name", "")
+    managers[str(manager_id)] = record
+    save_settings(settings)
+    context.user_data["selected_manager_id"] = str(manager_id)
+    log_admin_action(update.effective_user.id, "manager_added", {"manager_id": manager_id})
+    await update.message.reply_text(
+        f"✅ המנהל `{manager_id}` נוסף ללא הרשאות עדיין. בחר את ההרשאות שלו:",
+        parse_mode="Markdown",
+        reply_markup=_manager_permissions_keyboard(str(manager_id)),
+    )
+    return ConversationHandler.END
+
+
+def _manager_permissions_keyboard(manager_id: str) -> InlineKeyboardMarkup:
+    record = admin_managers().get(manager_id, {})
+    assigned = set(record.get("permissions", [])) if isinstance(record, dict) else set()
+    buttons = []
+    for permission, label in ADMIN_PERMISSIONS:
+        mark = "✅" if permission in assigned else "⬜"
+        buttons.append([InlineKeyboardButton(f"{mark} {label}", callback_data=f"admin_mgr_toggle_{permission}")])
+    buttons.extend([
+        [InlineKeyboardButton("🗑 הסר מנהל", callback_data="admin_mgr_remove")],
+        [InlineKeyboardButton("🔙 חזרה לרשימה", callback_data="admin_managers")],
+    ])
+    return InlineKeyboardMarkup(buttons)
+
+
+async def admin_manager_pick(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if not is_owner(query.from_user.id):
+        return
+    manager_id = query.data.replace("admin_mgr_pick_", "")
+    if manager_id not in admin_managers():
+        await query.answer("המנהל אינו קיים יותר.", show_alert=True)
+        await admin_managers_menu(update, context)
+        return
+    context.user_data["selected_manager_id"] = manager_id
+    record = admin_managers()[manager_id]
+    title = record.get("name") or manager_id
+    await query.edit_message_text(
+        f"👤 *מנהל: {title}*\n🆔 `{manager_id}`\n\nסמן או הסר הרשאות. השינויים נשמרים מיד.",
+        parse_mode="Markdown", reply_markup=_manager_permissions_keyboard(manager_id),
+    )
+
+
+async def admin_manager_toggle(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if not is_owner(query.from_user.id):
+        return
+    permission = query.data.replace("admin_mgr_toggle_", "")
+    manager_id = context.user_data.get("selected_manager_id")
+    if permission not in PERMISSION_LABELS or not manager_id:
+        await query.answer("נתוני ההרשאה אינם זמינים. בחר מנהל מחדש.", show_alert=True)
+        return
+    settings = load_settings()
+    managers = settings.get("admin_managers", {})
+    record = managers.get(manager_id)
+    if not isinstance(record, dict):
+        await query.answer("המנהל אינו קיים יותר.", show_alert=True)
+        return
+    permissions = set(record.get("permissions", []))
+    if permission in permissions:
+        permissions.remove(permission)
+    else:
+        permissions.add(permission)
+    record["permissions"] = sorted(permissions)
+    managers[manager_id] = record
+    settings["admin_managers"] = managers
+    save_settings(settings)
+    log_admin_action(query.from_user.id, "manager_permission_changed", {"manager_id": manager_id, "permission": permission, "enabled": permission in permissions})
+    await query.edit_message_reply_markup(reply_markup=_manager_permissions_keyboard(manager_id))
+
+
+async def admin_manager_remove(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if not is_owner(query.from_user.id):
+        return
+    manager_id = context.user_data.get("selected_manager_id")
+    if not manager_id or manager_id not in admin_managers():
+        await admin_managers_menu(update, context)
+        return
+    settings = load_settings()
+    settings.get("admin_managers", {}).pop(manager_id, None)
+    save_settings(settings)
+    log_admin_action(query.from_user.id, "manager_removed", {"manager_id": manager_id})
+    context.user_data.pop("selected_manager_id", None)
+    await query.answer("🗑 המנהל הוסר והגישה נחסמה מיד.", show_alert=True)
+    await admin_managers_menu(update, context)
+
 # ─── Admin: panel ─────────────────────────────────────────────────────────────
 
 async def admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID:
+    user_id = update.effective_user.id
+    if not is_admin(user_id):
         return
     settings = load_settings()
     maint_status = "🟠 *מצב תחזוקה פעיל*" if settings.get("maintenance") else "🟢 *הבוט פעיל כרגיל*"
+    title = "👑 *פאנל בעלים*" if is_owner(user_id) else "🛠 *פאנל מנהל*"
     await update.message.reply_text(
-        f"🛠 *פאנל אדמין*\n\nסטטוס נוכחי: {maint_status}\n\nבחר פעולה:",
+        f"{title}\n\nסטטוס נוכחי: {maint_status}\n\nבחר פעולה:",
         parse_mode="Markdown",
-        reply_markup=get_admin_inline_keyboard(),
+        reply_markup=get_admin_inline_keyboard(user_id),
     )
 
 async def back_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    if query.from_user.id != ADMIN_ID:
+    if not is_admin(query.from_user.id):
         return
     settings = load_settings()
     maint_status = "🟠 *מצב תחזוקה פעיל*" if settings.get("maintenance") else "🟢 *הבוט פעיל כרגיל*"
+    title = "👑 *פאנל בעלים*" if is_owner(query.from_user.id) else "🛠 *פאנל מנהל*"
     await query.edit_message_text(
-        f"🛠 *פאנל אדמין*\n\nסטטוס נוכחי: {maint_status}\n\nבחר פעולה:",
+        f"{title}\n\nסטטוס נוכחי: {maint_status}\n\nבחר פעולה:",
         parse_mode="Markdown",
-        reply_markup=get_admin_inline_keyboard(),
+        reply_markup=get_admin_inline_keyboard(query.from_user.id),
     )
 
 # ─── Admin: stats ─────────────────────────────────────────────────────────────
@@ -1071,7 +1373,7 @@ async def back_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    if query.from_user.id != ADMIN_ID:
+    if not is_admin(query.from_user.id):
         return
     users    = load_json(USERS_FILE)
     orders   = load_json(ORDERS_FILE)
@@ -1109,7 +1411,7 @@ async def admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def admin_orders_page(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    if query.from_user.id != ADMIN_ID:
+    if not is_admin(query.from_user.id):
         return
     page   = int(query.data.split("admin_orders_page_")[1])
     orders = load_json(ORDERS_FILE)
@@ -1144,7 +1446,7 @@ async def admin_orders_page(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def users_page(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    if query.from_user.id != ADMIN_ID:
+    if not is_admin(query.from_user.id):
         return
     idx       = int(query.data.split("users_page_")[1])
     users     = load_json(USERS_FILE)
@@ -1197,13 +1499,13 @@ async def users_page(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def admin_check_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    if query.from_user.id != ADMIN_ID:
+    if not is_admin(query.from_user.id):
         return ConversationHandler.END
     await query.edit_message_text("🔍 *בדיקת משתמש*\n\nשלח את ה-ID:", parse_mode="Markdown")
     return ADMIN_CHECK_USER
 
 async def admin_check_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID:
+    if not is_admin(update.effective_user.id):
         return ConversationHandler.END
     target_id = update.message.text.strip()
     users   = load_json(USERS_FILE)
@@ -1231,18 +1533,63 @@ async def admin_check_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     return ConversationHandler.END
 
+# ─── Admin: activity log ─────────────────────────────────────────────────────
+
+async def admin_actions_page(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if not is_admin(query.from_user.id):
+        return
+    try:
+        page = int(query.data.rsplit("_", 1)[1])
+    except ValueError:
+        page = 0
+    records = load_json(ADMIN_ACTIONS_FILE)
+    if not isinstance(records, list) or not records:
+        await query.edit_message_text(
+            "📜 יומן הפעולות עדיין ריק.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 חזרה", callback_data="back_admin")]]),
+        )
+        return
+    newest_first = list(reversed(records))
+    per_page = 8
+    pages = max(1, (len(newest_first) + per_page - 1) // per_page)
+    page = max(0, min(page, pages - 1))
+    slice_start = page * per_page
+    batch = newest_first[slice_start:slice_start + per_page]
+    lines = ["📜 *יומן פעולות מנהל*\n"]
+    for record in batch:
+        when = str(record.get("at", ""))[:19].replace("T", " ")
+        action = record.get("action", "לא ידוע")
+        actor = record.get("admin_id", "?")
+        lines.append(f"• `{when}` — *{action}*\n  מנהל: `{actor}`")
+    navigation = []
+    if page > 0:
+        navigation.append(InlineKeyboardButton("⬅️ קודם", callback_data=f"admin_actions_page_{page - 1}"))
+    navigation.append(InlineKeyboardButton(f"{page + 1}/{pages}", callback_data="noop"))
+    if page < pages - 1:
+        navigation.append(InlineKeyboardButton("הבא ➡️", callback_data=f"admin_actions_page_{page + 1}"))
+    await query.edit_message_text(
+        "\n".join(lines),
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup([
+            navigation,
+            [InlineKeyboardButton("🔙 חזרה", callback_data="back_admin")],
+        ]),
+    )
+
 # ─── Admin: send videos to user ──────────────────────────────────────────────
 
 async def admin_send_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    if query.from_user.id != ADMIN_ID:
+    if not is_admin(query.from_user.id):
         return ConversationHandler.END
     await query.edit_message_text("📩 *שליחת הודעה למשתמש*\n\nרשום את ההודעה שברצונך לשלוח:", parse_mode="Markdown")
     return ADMIN_SEND_MSG
 
 async def admin_send_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID:
+    if not is_admin(update.effective_user.id):
         return ConversationHandler.END
     msg = update.message.text.strip()
     context.user_data["admin_msg_text"] = msg
@@ -1250,7 +1597,7 @@ async def admin_send_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ADMIN_SEND_ID
 
 async def admin_send_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID:
+    if not is_admin(update.effective_user.id):
         return ConversationHandler.END
     uid   = update.message.text.strip()
     msg   = context.user_data.get("admin_msg_text", "")
@@ -1268,13 +1615,13 @@ async def admin_send_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def admin_approve_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    if query.from_user.id != ADMIN_ID:
+    if not is_admin(query.from_user.id):
         return ConversationHandler.END
     await query.edit_message_text("✅ *אישור תשלום ידני*\n\nכמה סרטונים לשלוח למשתמש?", parse_mode="Markdown")
     return ADMIN_APPROVE_COUNT
 
 async def admin_approve_count(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID:
+    if not is_admin(update.effective_user.id):
         return ConversationHandler.END
     try:
         count = int(update.message.text.strip())
@@ -1286,7 +1633,7 @@ async def admin_approve_count(update: Update, context: ContextTypes.DEFAULT_TYPE
     return ADMIN_APPROVE_ID
 
 async def admin_approve_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID:
+    if not is_admin(update.effective_user.id):
         return ConversationHandler.END
     uid   = update.message.text.strip()
     count = context.user_data.get("approve_v_count", 0)
@@ -1295,7 +1642,8 @@ async def admin_approve_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
         available = count_unseen_videos(int(uid))
         if available < count:
             await update.message.reply_text(
-                f"❌ למשתמש נותרו רק {available} סרטונים חדשים. לא נשלחה חבילה כדי למנוע חזרות.",
+                f"❌ למשתמש נותרו רק {available} סרטונים חדשים שעדיין לא קיבל. "
+                "לא נשלחה חבילה כדי למנוע חזרות.",
                 reply_markup=get_admin_inline_keyboard(),
             )
             return ConversationHandler.END
@@ -1322,7 +1670,7 @@ async def admin_approve_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def admin_gallery(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    if query.from_user.id != ADMIN_ID:
+    if not is_admin(query.from_user.id):
         return
     
     keyboard = [
@@ -1362,7 +1710,7 @@ async def admin_gallery_page(update: Update, context: ContextTypes.DEFAULT_TYPE,
     v = videos[page]
     text = f"""🎬 *גלריית סרטונים ({page+1}/{total})*
 
-📁 קטגוריה: {v.get('category', 'כללי')}
+📁 קטגוריות: {display_video_categories(v)}
 ⏱ אורך: {v.get('duration', 0)} שניות"""
     
     nav = []
@@ -1426,6 +1774,7 @@ async def show_duplicate_scan(update: Update, context: ContextTypes.DEFAULT_TYPE
         )
         return
 
+    await clear_sent_duplicate_group_media(context)
     await admin_dup_page(update, context, 0)
 
 
@@ -1482,7 +1831,7 @@ def duplicate_group_keyboard(page: int, total: int) -> InlineKeyboardMarkup:
         navigation.append(InlineKeyboardButton("הבא ➡️", callback_data=f"dup_page_{page + 1}"))
 
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("📤 שלח חשדות (סרטונים אלו)", callback_data=f"dup_send_{page}")],
+        [InlineKeyboardButton("🔁 שלח שוב את הקבוצה", callback_data=f"dup_send_{page}")],
         [
             InlineKeyboardButton("✅ סמן כלא כפול", callback_data=f"dup_mark_{page}"),
             InlineKeyboardButton("🔙 חזרה לגלריה", callback_data="dup_back_gallery"),
@@ -1512,6 +1861,28 @@ async def admin_dup_back_to_gallery(update: Update, context: ContextTypes.DEFAUL
     await admin_gallery(update, context)
 
 
+async def send_duplicate_group_media(context: ContextTypes.DEFAULT_TYPE, group: list[dict]) -> tuple[int, int]:
+    """Send one review group immediately and remember only its media for clean navigation."""
+    await clear_sent_duplicate_group_media(context)
+    success_count = 0
+    failed_count = 0
+    sent_message_ids = []
+    for video in group:
+        entry_id = video.get("entry_id")
+        if not entry_id:
+            failed_count += 1
+            continue
+        sent_message = await send_admin_video_with_delete_button(context.bot, video["file_id"], entry_id)
+        if sent_message and sent_message != "INVALID_FILE_ID":
+            success_count += 1
+            sent_message_ids.append(sent_message.message_id)
+        else:
+            failed_count += 1
+        await asyncio.sleep(0.2)
+    context.user_data["dup_sent_media_message_ids"] = sent_message_ids
+    return success_count, failed_count
+
+
 async def admin_dup_page(update: Update, context: ContextTypes.DEFAULT_TYPE, page=None):
     query = update.callback_query
     if page is None:
@@ -1521,7 +1892,6 @@ async def admin_dup_page(update: Update, context: ContextTypes.DEFAULT_TYPE, pag
 
     groups = context.user_data.get("dup_groups", [])
     total = len(groups)
-
     if page >= total:
         await query.edit_message_text(
             "✅ סיימת לעבור על כל הכפילויות!",
@@ -1531,59 +1901,33 @@ async def admin_dup_page(update: Update, context: ContextTypes.DEFAULT_TYPE, pag
 
     group = groups[page]
     duration = group[0].get("duration", 0)
-    text = f"""🔎 *חשד לכפילות ({page + 1}/{total})*
-
-⏱ אורך משותף: {duration} שניות
-👥 מספר סרטונים בקבוצה: {len(group)}
-
-לחץ על הכפתור למטה כדי לשלוח את הסרטונים לבדיקה ולמחיקה."""
     await query.edit_message_text(
-        text,
+        f"🔎 *חשד לכפילות ({page + 1}/{total})*\n\n⏱ אורך משותף: {duration} שניות\n"
+        f"👥 מספר סרטונים בקבוצה: {len(group)}\n\n⏳ שולח את סרטוני הקבוצה אוטומטית לבדיקה...",
         parse_mode="Markdown",
         reply_markup=duplicate_group_keyboard(page, total),
     )
+    success_count, failed_count = await send_duplicate_group_media(context, group)
+    status = f"✅ נשלחו אוטומטית {success_count}/{len(group)} סרטונים חשודים. אפשר למחוק סרטון, לסמן כלא כפול או לעבור לקבוצה הבאה."
+    if failed_count:
+        status += f"\n⚠️ {failed_count} סרטונים לא נשלחו וסומנו לבדיקה."
+    await query.edit_message_text(status, reply_markup=duplicate_group_keyboard(page, total))
 
 
 async def admin_dup_send_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Optional manual resend for the currently open group."""
     query = update.callback_query
     await query.answer()
     page = int(query.data.replace("dup_send_", ""))
     groups = context.user_data.get("dup_groups", [])
     if not (0 <= page < len(groups)):
-        await context.bot.send_message(chat_id=ADMIN_ID, text="⚠️ קבוצת הכפילויות כבר אינה זמינה. יש לבצע 'מצא כפילויות' מחדש.")
+        await query.answer("הקבוצה כבר אינה זמינה. יש לבצע סריקה מחדש.", show_alert=True)
         return
-
-    # Re-sending the same group must not leave an older copy of its review videos in the chat.
-    await clear_sent_duplicate_group_media(context)
-    group = groups[page]
-    success_count = 0
-    failed_count = 0
-    sent_message_ids = []
-
-    for video in group:
-        entry_id = video.get("entry_id")
-        if not entry_id:
-            logger.error("Duplicate group contains a video without entry_id")
-            failed_count += 1
-            continue
-
-        sent_message = await send_admin_video_with_delete_button(context.bot, video["file_id"], entry_id)
-        if sent_message:
-            success_count += 1
-            sent_message_ids.append(sent_message.message_id)
-        else:
-            failed_count += 1
-        # Stay below the per-chat delivery rate and let the retry handler manage 429 responses.
-        await asyncio.sleep(1.1)
-
-    context.user_data["dup_sent_media_message_ids"] = sent_message_ids
-    status = f"✅ נשלחו {success_count}/{len(group)} סרטונים חשודים. לחץ על סרטון כדי למחוק אותו, או המשך לקבוצה הבאה."
+    success_count, failed_count = await send_duplicate_group_media(context, groups[page])
+    status = f"✅ נשלחו שוב {success_count}/{len(groups[page])} סרטונים מהקבוצה."
     if failed_count:
-        status += f" ⚠️ {failed_count} סרטונים לא נשלחו; הפרטים נרשמו בלוגים."
-    await query.edit_message_text(
-        status,
-        reply_markup=duplicate_group_keyboard(page, len(groups)),
-    )
+        status += f" ⚠️ {failed_count} לא נשלחו."
+    await query.edit_message_text(status, reply_markup=duplicate_group_keyboard(page, len(groups)))
 
 async def admin_gallery_delete(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -1699,16 +2043,27 @@ async def admin_trash_perm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     idx = int(query.data.replace("trash_perm_", ""))
     trash = load_json(TRASH_FILE)
-    
     if 0 <= idx < len(trash):
-        trash.pop(idx)
+        backup = create_auto_backup("permanent_video_delete", query.from_user.id)
+        if not backup:
+            await query.answer("לא נוצר גיבוי בטיחותי ולכן המחיקה בוטלה.", show_alert=True)
+            return
+        removed = trash.pop(idx)
         save_json(TRASH_FILE, trash)
-        await query.answer("🗑 נמחק לצמיתות.", show_alert=True)
+        log_admin_action(query.from_user.id, "video_permanently_deleted", {"entry_id": removed.get("entry_id")})
+        await query.answer("🗑 נמחק לצמיתות לאחר יצירת גיבוי בטיחותי.", show_alert=True)
         await admin_trash_page(update, context, 0)
 
 async def admin_trash_empty(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    backup = create_auto_backup("empty_trash", query.from_user.id)
+    if not backup:
+        await query.answer("לא נוצר גיבוי בטיחותי ולכן ריקון הסל בוטל.", show_alert=True)
+        return
+    count = len(load_json(TRASH_FILE))
     save_json(TRASH_FILE, [])
-    await update.callback_query.answer("🧹 סל המיחזור רוקן!", show_alert=True)
+    log_admin_action(query.from_user.id, "trash_emptied", {"removed_entries": count})
+    await query.answer("🧹 סל המיחזור רוקן לאחר יצירת גיבוי בטיחותי!", show_alert=True)
     await admin_gallery(update, context)
 
 # At most one manual "send all" run may operate for a chat at the same time.
@@ -1880,7 +2235,7 @@ async def admin_repair_start(update: Update, context: ContextTypes.DEFAULT_TYPE)
     """Open the repair menu. This handler is deliberately standalone, not a conversation entry point."""
     query = update.callback_query
     await query.answer()
-    if query.from_user.id != ADMIN_ID:
+    if not is_admin(query.from_user.id):
         return
 
     videos = load_videos_with_entry_ids()
@@ -1905,7 +2260,7 @@ async def admin_repair_scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Scan all stored identifiers through getFile and begin the re-upload flow."""
     query = update.callback_query
     await query.answer("הסריקה התחילה")
-    if query.from_user.id != ADMIN_ID:
+    if not is_admin(query.from_user.id):
         return ConversationHandler.END
 
     videos = load_videos_with_entry_ids()
@@ -1955,7 +2310,7 @@ async def admin_repair_cached(update: Update, context: ContextTypes.DEFAULT_TYPE
     """Resume the re-upload queue built by a prior full scan."""
     query = update.callback_query
     await query.answer()
-    if query.from_user.id != ADMIN_ID:
+    if not is_admin(query.from_user.id):
         return ConversationHandler.END
 
     videos = load_videos_with_entry_ids()
@@ -2003,7 +2358,7 @@ async def admin_repair_show_current(update: Update, context: ContextTypes.DEFAUL
 
     context.user_data["repair_index"] = index
     duration = video.get("duration", 0)
-    category = video.get("category", "כללי")
+    category = display_video_categories(video)
     size_bytes = video.get("file_size")
     size_text = f"\n📦 גודל: {size_bytes / (1024 * 1024):.2f} MB" if isinstance(size_bytes, (int, float)) and size_bytes else ""
     text = (
@@ -2026,7 +2381,7 @@ async def admin_repair_show_current(update: Update, context: ContextTypes.DEFAUL
 
 async def admin_repair_handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Save the fresh file_id supplied by the administrator for the current item."""
-    if update.effective_user.id != ADMIN_ID:
+    if not is_admin(update.effective_user.id):
         return ConversationHandler.END
     if not update.message.video:
         await update.message.reply_text("יש לשלוח קובץ וידאו בלבד, או ללחוץ על ׳דלג כרגע׳.")
@@ -2088,7 +2443,7 @@ async def admin_repair_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE
 async def admin_video_search_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query  = update.callback_query
     await query.answer()
-    if query.from_user.id != ADMIN_ID:
+    if not is_admin(query.from_user.id):
         return ConversationHandler.END
     videos = load_json(VIDEOS_FILE)
     await query.edit_message_text(
@@ -2099,7 +2454,7 @@ async def admin_video_search_start(update: Update, context: ContextTypes.DEFAULT
     return ADMIN_VIDEO_SEARCH
 
 async def admin_video_search_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID:
+    if not is_admin(update.effective_user.id):
         return ConversationHandler.END
     videos = load_json(VIDEOS_FILE)
     try:
@@ -2137,7 +2492,7 @@ async def admin_video_search_input(update: Update, context: ContextTypes.DEFAULT
 async def admin_search_sec_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    if query.from_user.id != ADMIN_ID:
+    if not is_admin(query.from_user.id):
         return ConversationHandler.END
     await query.edit_message_text(
         "⏱ *חיפוש סרטונים לפי שניות*\n\nשלח את מספר השניות לחיפוש (למשל `26`):",
@@ -2162,7 +2517,7 @@ def parse_smart_time(text: str) -> int:
         return -1
 
 async def admin_search_sec_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID:
+    if not is_admin(update.effective_user.id):
         return ConversationHandler.END
     
     text = update.message.text.strip()
@@ -2240,7 +2595,7 @@ def _category_videos(category: str) -> list[dict]:
     return sorted(
         [
             video for video in load_videos_with_entry_ids()
-            if video.get("category", "כללי") == category
+            if category in video_categories(video)
         ],
         key=lambda video: (video.get("duration", 0), video.get("added_at", "")),
     )
@@ -2249,7 +2604,7 @@ def _category_videos(category: str) -> list[dict]:
 async def admin_cat_browse_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    if query.from_user.id != ADMIN_ID:
+    if not is_admin(query.from_user.id):
         return
 
     categories = _admin_categories()
@@ -2270,7 +2625,7 @@ async def admin_cat_browse_menu(update: Update, context: ContextTypes.DEFAULT_TY
 async def admin_cat_browse_category(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    if query.from_user.id != ADMIN_ID:
+    if not is_admin(query.from_user.id):
         return
 
     try:
@@ -2304,7 +2659,7 @@ async def admin_cat_browse_category(update: Update, context: ContextTypes.DEFAUL
 
 async def admin_cat_browse_page(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    if query.from_user.id != ADMIN_ID:
+    if not is_admin(query.from_user.id):
         return
     try:
         page = int(query.data.rsplit("_", 1)[1])
@@ -2366,7 +2721,7 @@ async def admin_cat_browse_send_all(update: Update, context: ContextTypes.DEFAUL
     """Immediately send every video of the selected private category to the admin."""
     query = update.callback_query
     await query.answer()
-    if query.from_user.id != ADMIN_ID:
+    if not is_admin(query.from_user.id):
         return
 
     category = context.user_data.get("category_browse_name")
@@ -2424,16 +2779,170 @@ async def admin_cat_browse_send_all(update: Update, context: ContextTypes.DEFAUL
     )
 
 
+async def admin_cat_clone_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    categories = _admin_categories()
+    buttons = [[InlineKeyboardButton(f"📋 {category}", callback_data=f"cat_clone_pick_{index}")]
+               for index, category in enumerate(categories)]
+    buttons.append([InlineKeyboardButton("🔙 חזרה", callback_data="admin_cat_edit")])
+    await query.edit_message_text(
+        "בחר קטגוריה לשכפול. תיווצר קטגוריה חדשה עם אותם שיוכי סרטונים, ואז אפשר לשנות לה שם.",
+        reply_markup=InlineKeyboardMarkup(buttons),
+    )
+
+
+async def admin_cat_clone_pick(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    try:
+        index = int(query.data.rsplit("_", 1)[1])
+    except ValueError:
+        return
+    categories = _admin_categories()
+    if not 0 <= index < len(categories):
+        await query.answer("הקטגוריה אינה זמינה.", show_alert=True)
+        return
+    source = categories[index]
+    base = f"עותק של {source}"
+    cloned = base
+    suffix = 2
+    while cloned in categories:
+        cloned = f"{base} {suffix}"
+        suffix += 1
+    backup = create_auto_backup("clone_category", query.from_user.id)
+    if not backup:
+        await query.answer("לא נוצר גיבוי בטיחותי ולכן השכפול בוטל.", show_alert=True)
+        return
+    settings = load_settings()
+    settings["categories"] = categories + [cloned]
+    save_settings(settings)
+    videos = load_videos_with_entry_ids()
+    copied = 0
+    for video in videos:
+        memberships = video_categories(video)
+        if source in memberships:
+            video["categories"] = memberships + [cloned]
+            normalize_video_categories(video)
+            copied += 1
+    save_json(VIDEOS_FILE, videos)
+    log_admin_action(query.from_user.id, "category_cloned", {"source": source, "clone": cloned, "videos": copied})
+    await query.edit_message_text(
+        f"✅ הקטגוריה ׳{source}׳ שוכפלה ל׳{cloned}׳. {copied} סרטונים שויכו גם לקטגוריה החדשה.\n"
+        "אפשר לשנות את שם הקטגוריה החדשה במסך עריכת הקטגוריות.",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 חזרה לעריכת קטגוריות", callback_data="admin_cat_edit")]]),
+    )
+
+
+async def admin_cat_merge_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    categories = [category for category in _admin_categories() if category != "כללי"]
+    buttons = [[InlineKeyboardButton(f"📁 {category}", callback_data=f"cat_merge_source_{index}")]
+               for index, category in enumerate(categories)]
+    buttons.append([InlineKeyboardButton("🔙 חזרה", callback_data="admin_cat_edit")])
+    if not categories:
+        await query.edit_message_text("אין עדיין שתי קטגוריות שניתן למזג.", reply_markup=InlineKeyboardMarkup(buttons))
+        return
+    context.user_data["merge_category_choices"] = categories
+    await query.edit_message_text("בחר את קטגוריית המקור שתמוזג לתוך קטגוריה אחרת:", reply_markup=InlineKeyboardMarkup(buttons))
+
+
+async def admin_cat_merge_source(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    choices = context.user_data.get("merge_category_choices", [])
+    try:
+        source_index = int(query.data.rsplit("_", 1)[1])
+    except ValueError:
+        return
+    if not 0 <= source_index < len(choices):
+        await query.answer("הקטגוריה אינה זמינה.", show_alert=True)
+        return
+    source = choices[source_index]
+    context.user_data["merge_category_source"] = source
+    targets = [category for category in _admin_categories() if category != source]
+    buttons = [[InlineKeyboardButton(f"➡️ {category}", callback_data=f"cat_merge_target_{index}")]
+               for index, category in enumerate(targets)]
+    buttons.append([InlineKeyboardButton("🔙 חזרה", callback_data="admin_cat_merge")])
+    context.user_data["merge_category_targets"] = targets
+    await query.edit_message_text(f"קטגוריית המקור: ׳{source}׳.\nבחר את קטגוריית היעד:", reply_markup=InlineKeyboardMarkup(buttons))
+
+
+async def admin_cat_merge_target(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    source = context.user_data.get("merge_category_source")
+    targets = context.user_data.get("merge_category_targets", [])
+    try:
+        target_index = int(query.data.rsplit("_", 1)[1])
+    except ValueError:
+        return
+    if not source or not 0 <= target_index < len(targets):
+        await query.answer("בחירת המיזוג אינה זמינה. התחל מחדש.", show_alert=True)
+        return
+    target = targets[target_index]
+    context.user_data["merge_category_target"] = target
+    await query.edit_message_text(
+        f"הסרטונים של ׳{source}׳ ישויכו גם ל׳{target}׳.\n\nמה לעשות עם קטגוריית המקור לאחר המיזוג?",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("✅ מזג והשאר את המקור", callback_data="cat_merge_keep")],
+            [InlineKeyboardButton("🗑 מזג ומחק את המקור", callback_data="cat_merge_remove")],
+            [InlineKeyboardButton("❌ ביטול", callback_data="admin_cat_edit")],
+        ]),
+    )
+
+
+async def admin_cat_merge_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    source = context.user_data.get("merge_category_source")
+    target = context.user_data.get("merge_category_target")
+    remove_source = query.data == "cat_merge_remove"
+    categories = _admin_categories()
+    if not source or not target or source == target or source not in categories or target not in categories:
+        await query.answer("נתוני המיזוג אינם זמינים. התחל מחדש.", show_alert=True)
+        return
+    backup = create_auto_backup("merge_categories", query.from_user.id)
+    if not backup:
+        await query.answer("לא נוצר גיבוי בטיחותי ולכן המיזוג בוטל.", show_alert=True)
+        return
+    videos = load_videos_with_entry_ids()
+    changed = 0
+    for video in videos:
+        memberships = video_categories(video)
+        if source in memberships:
+            updated = [item for item in memberships if not (remove_source and item == source)]
+            if target not in updated:
+                updated.append(target)
+            video["categories"] = updated or ["כללי"]
+            normalize_video_categories(video)
+            changed += 1
+    save_json(VIDEOS_FILE, videos)
+    if remove_source:
+        settings = load_settings()
+        settings["categories"] = [category for category in categories if category != source]
+        save_settings(settings)
+    log_admin_action(query.from_user.id, "categories_merged", {"source": source, "target": target, "removed_source": remove_source, "videos": changed})
+    await query.edit_message_text(
+        f"✅ המיזוג הושלם: {changed} סרטונים שויכו ל׳{target}׳."
+        + (f" קטגוריית המקור ׳{source}׳ הוסרה." if remove_source else f" קטגוריית המקור ׳{source}׳ נשארה."),
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 חזרה לעריכת קטגוריות", callback_data="admin_cat_edit")]]),
+    )
+
+
 async def admin_cat_edit_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     await query.edit_message_text(
-        "✏️ *עריכת קטגוריות*\n\nאפשר להוסיף קטגוריה, לשנות שם של קטגוריה קיימת או להסיר קטגוריה. "
-        "בעת הסרה, הסרטונים שלה עוברים אוטומטית ל׳כללי׳.",
+        "✏️ *עריכת קטגוריות*\n\nאפשר להוסיף, לשנות שם, להסיר, לשכפל או למזג קטגוריות. "
+        "סרטון יכול להשתייך לכמה קטגוריות במקביל.",
         parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup([
             [InlineKeyboardButton("➕ הוסף קטגוריה", callback_data="admin_cat_add")],
             [InlineKeyboardButton("✏️ שנה שם קטגוריה", callback_data="admin_cat_rename")],
+            [InlineKeyboardButton("📋 שכפל קטגוריה", callback_data="admin_cat_clone")],
+            [InlineKeyboardButton("🔀 מזג קטגוריות", callback_data="admin_cat_merge")],
             [InlineKeyboardButton("🗑 הסר קטגוריה", callback_data="admin_cat_delete")],
             [InlineKeyboardButton("🔙 חזרה", callback_data="admin_categories")],
         ]),
@@ -2523,8 +3032,11 @@ async def admin_cat_rename_input(update: Update, context: ContextTypes.DEFAULT_T
     save_settings(settings)
     videos = load_json(VIDEOS_FILE)
     for video in videos:
-        if isinstance(video, dict) and video.get("category") == old_name:
-            video["category"] = new_name
+        if isinstance(video, dict):
+            memberships = video_categories(video)
+            if old_name in memberships:
+                video["categories"] = [new_name if item == old_name else item for item in memberships]
+                normalize_video_categories(video)
     save_json(VIDEOS_FILE, videos)
     context.user_data.pop("category_rename_old", None)
     await update.message.reply_text(
@@ -2577,17 +3089,26 @@ async def admin_cat_delete_confirm(update: Update, context: ContextTypes.DEFAULT
         await query.answer("הקטגוריה אינה זמינה להסרה.", show_alert=True)
         return
     removed = categories[index]
+    backup = create_auto_backup("delete_category", query.from_user.id)
+    if not backup:
+        await query.answer("לא נוצר גיבוי בטיחותי ולכן הסרת הקטגוריה בוטלה.", show_alert=True)
+        return
     settings = load_settings()
     settings["categories"] = [category for category in categories if category != removed]
     save_settings(settings)
     videos = load_json(VIDEOS_FILE)
     moved = 0
     for video in videos:
-        if isinstance(video, dict) and video.get("category") == removed:
-            video["category"] = "כללי"
-            moved += 1
+        if isinstance(video, dict):
+            memberships = video_categories(video)
+            if removed in memberships:
+                remaining = [item for item in memberships if item != removed]
+                video["categories"] = remaining or ["כללי"]
+                normalize_video_categories(video)
+                moved += 1
     save_json(VIDEOS_FILE, videos)
-    await query.answer(f"הקטגוריה הוסרה; {moved} סרטונים עברו לכללי.", show_alert=True)
+    log_admin_action(query.from_user.id, "category_deleted", {"category": removed, "videos_updated": moved})
+    await query.answer(f"הקטגוריה הוסרה; {moved} סרטונים עודכנו.", show_alert=True)
     await admin_categories_menu(update, context)
 
 
@@ -2601,18 +3122,18 @@ async def admin_cat_sort_page(update: Update, context: ContextTypes.DEFAULT_TYPE
     page = max(0, min(page, len(videos) - 1))
     video = videos[page]
     await clear_sent_duplicate_group_media(context)
-    current_category = video.get("category", "כללי")
+    current_categories = video_categories(video)
     text = (
         f"🏷 *מיון לקטגוריות ({page + 1}/{len(videos)})*\n\n"
-        f"📁 קטגוריה נוכחית: *{current_category}*\n"
-        "בחר קטגוריה לסרטון זה. הקטגוריה הנוכחית מסומנת ב־✅."
+        f"📁 קטגוריות נוכחיות: *{', '.join(current_categories)}*\n"
+        "אפשר לסמן כמה קטגוריות. לחיצה על קטגוריה מוסיפה או מסירה את הסימון."
     )
 
     categories = _admin_categories()
     buttons = []
     row = []
     for index, category in enumerate(categories):
-        label = f"✅ {category}" if category == current_category else category
+        label = f"✅ {category}" if category in current_categories else category
         row.append(InlineKeyboardButton(label, callback_data=f"cat_assign_{page}_{index}"))
         if len(row) == 2:
             buttons.append(row)
@@ -2654,30 +3175,32 @@ async def admin_cat_assign(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not 0 <= page < len(videos):
         await query.answer("הסרטון כבר אינו זמין. חזור ונסה שוב.", show_alert=True)
         return
-    videos[page]["category"] = categories[category_index]
-    save_json(VIDEOS_FILE, videos)
-
-    if page < len(videos) - 1:
-        await admin_cat_sort_page(update, context, page + 1)
+    selected_category = categories[category_index]
+    memberships = video_categories(videos[page])
+    if selected_category == "כללי" and selected_category in memberships and len(memberships) == 1:
+        await query.answer("כל סרטון חייב להשתייך לפחות לקטגוריה אחת.", show_alert=True)
+        return
+    if selected_category in memberships:
+        memberships = [item for item in memberships if item != selected_category]
     else:
-        await clear_sent_duplicate_group_media(context)
-        await query.edit_message_text(
-            "✅ סיימת לעבור על כל הסרטונים. אפשר להיכנס שוב למיון בכל עת.",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 חזרה לקטגוריות", callback_data="admin_categories")]]),
-        )
+        memberships.append(selected_category)
+    videos[page]["categories"] = memberships or ["כללי"]
+    normalize_video_categories(videos[page])
+    save_json(VIDEOS_FILE, videos)
+    await admin_cat_sort_page(update, context, page)
 
 # ─── Admin: broadcast (enhanced + media) ──────────────────────────────────────
 
 async def admin_broadcast_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    if query.from_user.id != ADMIN_ID:
+    if not is_admin(query.from_user.id):
         return ConversationHandler.END
     await query.edit_message_text("📢 *הודעה לכולם*\n\nשלח את תוכן ההודעה (טקסט בלבד):", parse_mode="Markdown")
     return ADMIN_BROADCAST
 
 async def admin_broadcast_get_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID:
+    if not is_admin(update.effective_user.id):
         return ConversationHandler.END
     context.user_data["broadcast_msg"] = update.message.text
     await update.message.reply_text(
@@ -2687,7 +3210,7 @@ async def admin_broadcast_get_msg(update: Update, context: ContextTypes.DEFAULT_
     return ADMIN_BROADCAST_MEDIA
 
 async def admin_broadcast_get_media(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID:
+    if not is_admin(update.effective_user.id):
         return ConversationHandler.END
     
     if update.message.photo:
@@ -2704,7 +3227,7 @@ async def admin_broadcast_get_media(update: Update, context: ContextTypes.DEFAUL
     return ADMIN_BROADCAST_BTN
 
 async def admin_broadcast_get_btn(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID:
+    if not is_admin(update.effective_user.id):
         return ConversationHandler.END
     raw    = update.message.text.strip()
     markup = None
@@ -2728,7 +3251,7 @@ async def admin_broadcast_get_btn(update: Update, context: ContextTypes.DEFAULT_
     return ADMIN_BROADCAST_DELAY
 
 async def admin_broadcast_get_delay(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID:
+    if not is_admin(update.effective_user.id):
         return ConversationHandler.END
     try:
         delay_min = int(update.message.text.strip())
@@ -2787,13 +3310,13 @@ async def admin_broadcast_get_delay(update: Update, context: ContextTypes.DEFAUL
 async def admin_vip_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    if query.from_user.id != ADMIN_ID:
+    if not is_admin(query.from_user.id):
         return ConversationHandler.END
     await query.edit_message_text("💎 *ניהול דרגות VIP*\n\nשלח את ה-ID של המשתמש:", parse_mode="Markdown")
     return ADMIN_VIP_ID
 
 async def admin_vip_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID:
+    if not is_admin(update.effective_user.id):
         return ConversationHandler.END
     try:
         uid = str(int(update.message.text.strip()))
@@ -2829,7 +3352,7 @@ async def admin_vip_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def admin_vip_level(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    if query.from_user.id != ADMIN_ID:
+    if not is_admin(query.from_user.id):
         return ConversationHandler.END
         
     try:
@@ -2871,13 +3394,13 @@ async def admin_vip_level(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def admin_coins_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    if query.from_user.id != ADMIN_ID:
+    if not is_admin(query.from_user.id):
         return ConversationHandler.END
     await query.edit_message_text("🪙 *ניהול מטבעות*\n\nשלח את ה-ID של המשתמש:", parse_mode="Markdown")
     return ADMIN_COINS_ID
 
 async def admin_coins_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID:
+    if not is_admin(update.effective_user.id):
         return ConversationHandler.END
     try:
         uid = str(int(update.message.text.strip()))
@@ -2893,7 +3416,7 @@ async def admin_coins_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ADMIN_COINS_AMOUNT
 
 async def admin_coins_amount(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID:
+    if not is_admin(update.effective_user.id):
         return ConversationHandler.END
     try:
         amount = int(update.message.text.strip())
@@ -2918,7 +3441,7 @@ async def admin_coins_amount(update: Update, context: ContextTypes.DEFAULT_TYPE)
 async def admin_coupons_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query   = update.callback_query
     await query.answer()
-    if query.from_user.id != ADMIN_ID:
+    if not is_admin(query.from_user.id):
         return
     coupons = load_json(COUPONS_FILE)
     lines   = ["🎟 *ניהול קופונים*\n"]
@@ -2939,7 +3462,7 @@ async def admin_coupons_menu(update: Update, context: ContextTypes.DEFAULT_TYPE)
 async def admin_coupon_delete(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    if query.from_user.id != ADMIN_ID:
+    if not is_admin(query.from_user.id):
         return
     code    = query.data.replace("coupon_del_", "")
     coupons = load_json(COUPONS_FILE)
@@ -2951,13 +3474,13 @@ async def admin_coupon_delete(update: Update, context: ContextTypes.DEFAULT_TYPE
 async def admin_coupon_new_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    if query.from_user.id != ADMIN_ID:
+    if not is_admin(query.from_user.id):
         return ConversationHandler.END
     await query.edit_message_text("🎟 *קופון חדש*\n\nשלח את *קוד הקופון* (אותיות/מספרים):", parse_mode="Markdown")
     return ADMIN_COUPON_CODE
 
 async def admin_coupon_get_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID:
+    if not is_admin(update.effective_user.id):
         return ConversationHandler.END
     code = update.message.text.strip().upper()
     if not code.replace("_", "").replace("-", "").isalnum():
@@ -2972,7 +3495,7 @@ async def admin_coupon_get_code(update: Update, context: ContextTypes.DEFAULT_TY
     return ADMIN_COUPON_COINS
 
 async def admin_coupon_get_coins(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID:
+    if not is_admin(update.effective_user.id):
         return ConversationHandler.END
     try:
         val = int(update.message.text.strip())
@@ -2986,7 +3509,7 @@ async def admin_coupon_get_coins(update: Update, context: ContextTypes.DEFAULT_T
     return ADMIN_COUPON_EXPIRY
 
 async def admin_coupon_get_expiry(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID:
+    if not is_admin(update.effective_user.id):
         return ConversationHandler.END
     raw = update.message.text.strip()
     if raw.lower() == "skip":
@@ -3002,7 +3525,7 @@ async def admin_coupon_get_expiry(update: Update, context: ContextTypes.DEFAULT_
     return ADMIN_COUPON_LIMIT
 
 async def admin_coupon_get_limit(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID:
+    if not is_admin(update.effective_user.id):
         return ConversationHandler.END
     raw      = update.message.text.strip()
     max_uses = None
@@ -3032,7 +3555,7 @@ async def admin_coupon_get_limit(update: Update, context: ContextTypes.DEFAULT_T
 async def admin_multiplier_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query    = update.callback_query
     await query.answer()
-    if query.from_user.id != ADMIN_ID:
+    if not is_admin(query.from_user.id):
         return ConversationHandler.END
     settings = load_settings()
     current  = settings.get("referral_multiplier", 1.0)
@@ -3044,7 +3567,7 @@ async def admin_multiplier_start(update: Update, context: ContextTypes.DEFAULT_T
     return ADMIN_MULTIPLIER
 
 async def admin_multiplier_apply(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID:
+    if not is_admin(update.effective_user.id):
         return ConversationHandler.END
     try:
         new_mult = float(update.message.text.strip())
@@ -3085,7 +3608,7 @@ async def admin_multiplier_apply(update: Update, context: ContextTypes.DEFAULT_T
 async def admin_backup(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    if query.from_user.id != ADMIN_ID:
+    if not is_admin(query.from_user.id):
         return
     await query.edit_message_text("💾 *יוצר גיבוי ZIP...*", parse_mode="Markdown")
     buf = build_zip_of_data()
@@ -3096,6 +3619,7 @@ async def admin_backup(update: Update, context: ContextTypes.DEFAULT_TYPE):
         filename=f"backup_{stamp}.zip",
         caption=f"💾 גיבוי מלא — {stamp}",
     )
+    log_admin_action(query.from_user.id, "manual_backup_created", {})
     await context.bot.send_message(chat_id=ADMIN_ID, text="✅ הגיבוי הושלם!", reply_markup=get_admin_inline_keyboard())
 
 # ─── Admin: restore from ZIP ─────────────────────────────────────────────────
@@ -3103,7 +3627,7 @@ async def admin_backup(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def admin_restore_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    if query.from_user.id != ADMIN_ID:
+    if not is_admin(query.from_user.id):
         return ConversationHandler.END
     context.user_data.pop("pending_restore", None)
     await query.edit_message_text(
@@ -3118,7 +3642,7 @@ async def admin_restore_start(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 
 async def admin_restore_receive(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID:
+    if not is_admin(update.effective_user.id):
         return ConversationHandler.END
     doc = update.message.document
     if not doc or not (doc.file_name or "").lower().endswith(".zip"):
@@ -3159,7 +3683,7 @@ async def admin_restore_receive(update: Update, context: ContextTypes.DEFAULT_TY
 async def admin_restore_apply(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    if query.from_user.id != ADMIN_ID:
+    if not is_admin(query.from_user.id):
         return ConversationHandler.END
     payloads = context.user_data.get("pending_restore")
     if not isinstance(payloads, dict) or not payloads:
@@ -3170,6 +3694,9 @@ async def admin_restore_apply(update: Update, context: ContextTypes.DEFAULT_TYPE
         return ConversationHandler.END
 
     try:
+        auto_snapshot = create_auto_backup("restore_data", query.from_user.id)
+        if not auto_snapshot:
+            raise RuntimeError("automatic backup creation failed")
         snapshot = build_zip_of_data()
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         await context.bot.send_document(
@@ -3179,6 +3706,7 @@ async def admin_restore_apply(update: Update, context: ContextTypes.DEFAULT_TYPE
             caption="💾 גיבוי חירום אוטומטי לפני שחזור",
         )
         apply_restore_payloads(payloads)
+        log_admin_action(query.from_user.id, "backup_restored", {"files": sorted(payloads.keys())})
         context.user_data.pop("pending_restore", None)
         await query.edit_message_text(
             "✅ *השחזור הושלם בהצלחה!*\n\n"
@@ -3200,7 +3728,7 @@ async def admin_restore_apply(update: Update, context: ContextTypes.DEFAULT_TYPE
 async def admin_global_reset_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    if query.from_user.id != ADMIN_ID:
+    if not is_admin(query.from_user.id):
         return ConversationHandler.END
 
     users  = len(load_json(USERS_FILE))
@@ -3228,7 +3756,7 @@ async def admin_global_reset_start(update: Update, context: ContextTypes.DEFAULT
 async def admin_global_reset_step2(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    if query.from_user.id != ADMIN_ID:
+    if not is_admin(query.from_user.id):
         return ConversationHandler.END
     await query.edit_message_text(
         "🔴 *אישור סופי*\n\nהקלד *מאשר* כדי למחוק את כל הנתונים:",
@@ -3238,11 +3766,16 @@ async def admin_global_reset_step2(update: Update, context: ContextTypes.DEFAULT
     return ADMIN_GLOBAL_RESET_CONFIRM
 
 async def admin_global_reset_execute(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID:
+    if not is_admin(update.effective_user.id):
         return ConversationHandler.END
     if update.message.text.strip() != "מאשר":
         await update.message.reply_text("❌ ביטול — הטקסט לא תאם. שלח 'מאשר' בדיוק.")
         return ADMIN_GLOBAL_RESET_CONFIRM
+
+    backup = create_auto_backup("global_reset", update.effective_user.id)
+    if not backup:
+        await update.message.reply_text("❌ לא נוצר גיבוי בטיחותי ולכן האיפוס בוטל.", reply_markup=get_admin_inline_keyboard())
+        return ConversationHandler.END
 
     for filepath, default in [
         (USERS_FILE,     {}),
@@ -3254,6 +3787,7 @@ async def admin_global_reset_execute(update: Update, context: ContextTypes.DEFAU
     ]:
         save_json(filepath, default)
 
+    log_admin_action(update.effective_user.id, "global_data_reset", {})
     await update.message.reply_text(
         "✅ *כל הנתונים נמחקו בהצלחה!*\nהגדרות המערכת (settings.json) נשמרו.",
         parse_mode="Markdown",
@@ -3266,7 +3800,7 @@ async def admin_global_reset_execute(update: Update, context: ContextTypes.DEFAU
 async def admin_delete_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query  = update.callback_query
     await query.answer()
-    if query.from_user.id != ADMIN_ID:
+    if not is_admin(query.from_user.id):
         return
     videos = load_json(VIDEOS_FILE)
     await query.edit_message_text(
@@ -3281,11 +3815,17 @@ async def admin_delete_start(update: Update, context: ContextTypes.DEFAULT_TYPE)
 async def admin_delete_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    if query.from_user.id != ADMIN_ID:
+    if not is_admin(query.from_user.id):
         return
+    backup = create_auto_backup("delete_all_videos", query.from_user.id)
+    if not backup:
+        await query.answer("לא נוצר גיבוי בטיחותי ולכן המחיקה בוטלה.", show_alert=True)
+        return
+    count = len(load_json(VIDEOS_FILE))
     save_json(VIDEOS_FILE, [])
+    log_admin_action(query.from_user.id, "all_videos_deleted", {"count": count})
     await query.edit_message_text(
-        "✅ כל הסרטונים נמחקו!",
+        "✅ כל הסרטונים נמחקו לאחר יצירת גיבוי בטיחותי!",
         reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 חזור", callback_data="back_admin")]]),
     )
 
@@ -3294,7 +3834,7 @@ async def admin_delete_confirm(update: Update, context: ContextTypes.DEFAULT_TYP
 async def admin_maintenance_toggle(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    if query.from_user.id != ADMIN_ID:
+    if not is_admin(query.from_user.id):
         return
     
     data = query.data
@@ -3357,7 +3897,7 @@ async def admin_maintenance_toggle(update: Update, context: ContextTypes.DEFAULT
 
 async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Store every admin-uploaded video immediately in the private default category."""
-    if update.effective_user.id != ADMIN_ID:
+    if not is_admin(update.effective_user.id):
         return ConversationHandler.END
     video = update.message.video
     if not video:
@@ -3400,7 +3940,7 @@ async def admin_video_cat_sel(update: Update, context: ContextTypes.DEFAULT_TYPE
     return ADMIN_VIDEO_PREVIEW
 
 async def admin_video_preview_receive(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID:
+    if not is_admin(update.effective_user.id):
         return ConversationHandler.END
     
     preview = None
@@ -3693,6 +4233,12 @@ def main():
         fallbacks=[CallbackQueryHandler(admin_categories_menu, pattern="^admin_categories$")],
         per_message=False, per_chat=True,
     )
+    manager_add_conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(admin_manager_add_start, pattern="^admin_mgr_add$")],
+        states={ADMIN_MANAGER_ADD_ID: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_manager_add_input)]},
+        fallbacks=[CommandHandler("cancel", cancel), CallbackQueryHandler(admin_managers_menu, pattern="^admin_managers$")],
+        per_message=False, per_chat=True,
+    )
     cat_rename_conv = ConversationHandler(
         entry_points=[CallbackQueryHandler(admin_cat_rename_pick, pattern=r"^cat_rename_pick_\d+$")],
         states={ADMIN_CATEGORY_RENAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_cat_rename_input)]},
@@ -3716,11 +4262,13 @@ def main():
         check_conv, send_conv, approve_conv, broadcast_conv, coins_conv, vip_conv,
         coupon_new_conv, multiplier_conv, restore_conv, global_reset_conv,
         video_search_conv, video_search_sec_conv, repair_conv, support_conv, coupon_redeem_conv, support_reply_conv,
-        cat_add_conv, cat_rename_conv, video_upload_conv
+        cat_add_conv, cat_rename_conv, manager_add_conv, video_upload_conv
     ]:
         app.add_handler(conv)
 
     app.add_error_handler(telegram_error_handler)
+    # The access gate runs before all private callbacks and blocks unauthorized actions centrally.
+    app.add_handler(CallbackQueryHandler(admin_callback_gate), group=-1)
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.Regex("^🛠 פאנל אדמין$"), admin_panel))
@@ -3739,7 +4287,12 @@ def main():
         ("^daily_bonus$",               daily_bonus),
         ("^vip_info$",                  vip_info),
         ("^back_main$",                 back_main),
+        ("^admin_managers$",            admin_managers_menu),
+        (r"^admin_mgr_pick_\d+$",        admin_manager_pick),
+        (r"^admin_mgr_toggle_.+$",       admin_manager_toggle),
+        ("^admin_mgr_remove$",           admin_manager_remove),
         ("^admin_stats$",               admin_stats),
+        (r"^admin_actions_page_\d+$",    admin_actions_page),
         (r"^admin_orders_page_\d+$",    admin_orders_page),
         (r"^users_page_\d+$",           users_page),
         ("^admin_gallery$",             admin_gallery),
@@ -3768,6 +4321,13 @@ def main():
         ("^cat_browse_current$",        admin_cat_browse_current),
         ("^cat_browse_send_all$",       admin_cat_browse_send_all),
         ("^admin_cat_edit$",            admin_cat_edit_menu),
+        ("^admin_cat_clone$",           admin_cat_clone_start),
+        (r"^cat_clone_pick_\d+$",       admin_cat_clone_pick),
+        ("^admin_cat_merge$",           admin_cat_merge_start),
+        (r"^cat_merge_source_\d+$",     admin_cat_merge_source),
+        (r"^cat_merge_target_\d+$",     admin_cat_merge_target),
+        ("^cat_merge_keep$",            admin_cat_merge_confirm),
+        ("^cat_merge_remove$",          admin_cat_merge_confirm),
         ("^admin_cat_rename$",          admin_cat_rename_start),
         ("^admin_cat_delete$",          admin_cat_delete_start),
         (r"^cat_delete_pick_\d+$",    admin_cat_delete_pick),
