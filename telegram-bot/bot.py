@@ -729,8 +729,8 @@ def get_admin_inline_keyboard(user_id: int = ADMIN_ID):
     add("users", [InlineKeyboardButton("📊 סטטיסטיקה", callback_data="admin_stats"), InlineKeyboardButton("🧾 הזמנות", callback_data="admin_orders_page_0")])
     add("users", [InlineKeyboardButton("🔍 בדוק משתמש", callback_data="admin_check"), InlineKeyboardButton("👥 רשימת משתמשים", callback_data="users_page_0")])
     add("user_messages", [InlineKeyboardButton("📩 שלח למשתמש", callback_data="admin_send"), InlineKeyboardButton("✅ אישור תשלום", callback_data="admin_approve")])
-    add("gallery", [InlineKeyboardButton("🎬 גלריית סרטונים", callback_data="admin_gallery")])
-    add("duplicates", [InlineKeyboardButton("🔎 כפילויות וסל מיחזור", callback_data="admin_gallery")])
+    if has_admin_permission(user_id, "gallery") or has_admin_permission(user_id, "duplicates"):
+        rows.append([InlineKeyboardButton("🎬 גלריית סרטונים", callback_data="admin_gallery")])
     add("broadcast", [InlineKeyboardButton("📢 הודעה לכולם", callback_data="admin_broadcast")])
     add("coins", [InlineKeyboardButton("🪙 ניהול מטבעות", callback_data="admin_coins"), InlineKeyboardButton("💎 ניהול דרגות", callback_data="admin_vip")])
     add("coins", [InlineKeyboardButton("🎟 ניהול קופונים", callback_data="admin_coupons"), InlineKeyboardButton("💱 ערך מטבע", callback_data="admin_multiplier")])

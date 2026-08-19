@@ -131,6 +131,7 @@ async def run():
         # The owner retains the familiar detailed panel with direct day-to-day actions.
         owner_callbacks = button_callbacks(bot.get_admin_inline_keyboard(owner))
         assert {"admin_stats", "admin_gallery", "admin_maintenance", "admin_menu_system"}.issubset(owner_callbacks)
+        assert owner_callbacks.count("admin_gallery") == 1
         assert "admin_backup" not in owner_callbacks and "admin_actions_page_0" not in owner_callbacks
         assert "admin_menu_users" not in owner_callbacks
         # A manager with only user messaging permission sees only that section's allowed controls.
@@ -163,6 +164,12 @@ async def run():
                 assert await gate_allows(allowed_callback, 12345), (permission, allowed_callback)
             assert not await gate_allows("admin_managers", 12345), permission
             assert not await gate_allows(blocked_callback, 12345), permission
+
+        # A manager with both gallery permissions still receives one gallery entry point only.
+        settings = bot.load_settings()
+        settings["admin_managers"]["12345"]["permissions"] = ["gallery", "duplicates"]
+        bot.save_settings(settings)
+        assert button_callbacks(bot.get_admin_inline_keyboard(12345)).count("admin_gallery") == 1
 
         # Gallery-only and duplicates-only managers enter the same category but receive different controls.
         settings = bot.load_settings()
