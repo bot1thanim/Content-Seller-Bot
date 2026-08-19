@@ -417,8 +417,10 @@ def callback_permission(callback_data: str) -> str | None:
         return "coins"
     if callback_data.startswith(("admin_maintenance", "maint_")):
         return "maintenance"
-    if callback_data.startswith("admin_menu_users") or callback_data.startswith("admin_menu_rewards") or callback_data.startswith("admin_menu_communications") or callback_data.startswith("admin_menu_system"):
+    if callback_data.startswith("admin_menu_users") or callback_data.startswith("admin_menu_rewards") or callback_data.startswith("admin_menu_communications"):
         return "panel"
+    if callback_data.startswith("admin_menu_system"):
+        return "system"
     if callback_data.startswith("admin_actions"):
         return "audit_log"
     if callback_data.startswith(("admin_backup", "admin_restore")):
@@ -443,6 +445,12 @@ async def admin_callback_gate(update: Update, context: ContextTypes.DEFAULT_TYPE
         if is_admin(query.from_user.id) and (
             has_admin_permission(query.from_user.id, "gallery")
             or has_admin_permission(query.from_user.id, "duplicates")
+        ):
+            return
+    elif permission == "system":
+        if is_admin(query.from_user.id) and (
+            is_owner(query.from_user.id)
+            or bool({"audit_log", "backup", "dangerous_delete"} & admin_permissions(query.from_user.id))
         ):
             return
     elif permission:
@@ -723,14 +731,14 @@ def get_admin_inline_keyboard(user_id: int = ADMIN_ID):
     add("user_messages", [InlineKeyboardButton("📩 שלח למשתמש", callback_data="admin_send"), InlineKeyboardButton("✅ אישור תשלום", callback_data="admin_approve")])
     add("gallery", [InlineKeyboardButton("🎬 גלריית סרטונים", callback_data="admin_gallery")])
     add("duplicates", [InlineKeyboardButton("🔎 כפילויות וסל מיחזור", callback_data="admin_gallery")])
-    add("audit_log", [InlineKeyboardButton("📜 יומן פעולות", callback_data="admin_actions_page_0")])
     add("broadcast", [InlineKeyboardButton("📢 הודעה לכולם", callback_data="admin_broadcast")])
     add("coins", [InlineKeyboardButton("🪙 ניהול מטבעות", callback_data="admin_coins"), InlineKeyboardButton("💎 ניהול דרגות", callback_data="admin_vip")])
     add("coins", [InlineKeyboardButton("🎟 ניהול קופונים", callback_data="admin_coupons"), InlineKeyboardButton("💱 ערך מטבע", callback_data="admin_multiplier")])
-    add("backup", [InlineKeyboardButton("💾 גיבוי ZIP", callback_data="admin_backup"), InlineKeyboardButton("📥 שחזור גיבוי", callback_data="admin_restore")])
-    add("dangerous_delete", [InlineKeyboardButton("🔄 איפוס נתונים", callback_data="admin_global_reset"), InlineKeyboardButton("🧹 מחק סרטונים", callback_data="admin_delete")])
-    if is_owner(user_id):
-        rows.append([InlineKeyboardButton("👑 ניהול מנהלים", callback_data="admin_managers")])
+
+    # Advanced tools added after the original panel are kept together here.
+    advanced_permissions = {"audit_log", "backup", "dangerous_delete"}
+    if is_owner(user_id) or bool(advanced_permissions & admin_permissions(user_id)):
+        rows.append([InlineKeyboardButton("⚙️ מערכת, גיבויים וכלים מתקדמים", callback_data="admin_menu_system")])
 
     return InlineKeyboardMarkup(rows or [[InlineKeyboardButton("ℹ️ אין הרשאות פעילות", callback_data="noop")]])
 
@@ -781,19 +789,17 @@ async def admin_menu_system(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     user_id = query.from_user.id
-    settings = load_settings()
-    maint_status = "🟠 תחזוקה" if settings.get("maintenance") else "🟢 פעיל"
     rows = []
-    if has_admin_permission(user_id, "maintenance"):
-        rows.append([InlineKeyboardButton(f"📡 סטטוס: {maint_status}", callback_data="admin_maintenance")])
     if has_admin_permission(user_id, "audit_log"):
         rows.append([InlineKeyboardButton("📜 יומן פעולות", callback_data="admin_actions_page_0")])
     if has_admin_permission(user_id, "backup"):
         rows.append([InlineKeyboardButton("💾 גיבוי ZIP", callback_data="admin_backup"), InlineKeyboardButton("📥 שחזור גיבוי", callback_data="admin_restore")])
     if has_admin_permission(user_id, "dangerous_delete"):
         rows.append([InlineKeyboardButton("🔄 איפוס נתונים", callback_data="admin_global_reset"), InlineKeyboardButton("🧹 מחק סרטונים", callback_data="admin_delete")])
+    if is_owner(user_id):
+        rows.append([InlineKeyboardButton("👑 ניהול מנהלים", callback_data="admin_managers")])
     rows.append(_back_to_admin_row())
-    await query.edit_message_text("⚙️ *מערכת, בטיחות וגיבויים*\n\nבחר פעולה:", parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(rows))
+    await query.edit_message_text("⚙️ *מערכת, גיבויים וכלים מתקדמים*\n\nבחר פעולה:", parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(rows))
 
 # ─── Maintenance gate ─────────────────────────────────────────────────────────
 

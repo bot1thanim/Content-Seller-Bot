@@ -130,8 +130,9 @@ async def run():
         assert callback_data == ["admin_gallery"], callback_data
         # The owner retains the familiar detailed panel with direct day-to-day actions.
         owner_callbacks = button_callbacks(bot.get_admin_inline_keyboard(owner))
-        assert {"admin_stats", "admin_gallery", "admin_backup", "admin_actions_page_0", "admin_managers"}.issubset(owner_callbacks)
-        assert "admin_menu_users" not in owner_callbacks and "admin_menu_system" not in owner_callbacks
+        assert {"admin_stats", "admin_gallery", "admin_maintenance", "admin_menu_system"}.issubset(owner_callbacks)
+        assert "admin_backup" not in owner_callbacks and "admin_actions_page_0" not in owner_callbacks
+        assert "admin_menu_users" not in owner_callbacks
         # A manager with only user messaging permission sees only that section's allowed controls.
         settings = bot.load_settings()
         settings["admin_managers"]["12345"]["permissions"] = ["user_messages"]
@@ -149,9 +150,9 @@ async def run():
             "broadcast": (["admin_broadcast"], "admin_backup"),
             "coins": (["admin_coins", "admin_vip", "admin_coupons", "admin_multiplier"], "admin_backup"),
             "maintenance": (["admin_maintenance"], "admin_backup"),
-            "audit_log": (["admin_actions_page_0"], "admin_backup"),
-            "backup": (["admin_backup", "admin_restore"], "admin_delete"),
-            "dangerous_delete": (["admin_global_reset", "admin_delete"], "admin_backup"),
+            "audit_log": (["admin_menu_system"], "admin_backup"),
+            "backup": (["admin_menu_system"], "admin_delete"),
+            "dangerous_delete": (["admin_menu_system"], "admin_backup"),
         }
         for permission, (expected_controls, blocked_callback) in permission_controls.items():
             settings = bot.load_settings()
@@ -205,6 +206,11 @@ async def run():
         assert "admin_backup" in backup_only_buttons and "admin_delete" not in backup_only_buttons
         assert await gate_allows("admin_backup", 12345)
         assert not await gate_allows("admin_delete", 12345)
+
+        owner_system = FakeUpdate("admin_menu_system", owner)
+        await bot.admin_menu_system(owner_system, SimpleNamespace())
+        owner_system_buttons = button_callbacks(owner_system.callback_query.edits[-1][1]["reply_markup"])
+        assert {"admin_actions_page_0", "admin_backup", "admin_global_reset", "admin_managers"}.issubset(owner_system_buttons)
         assert await gate_allows("admin_managers", owner)
 
         # Daily-bonus data continues to maintain an accurate total balance.
