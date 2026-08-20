@@ -446,6 +446,8 @@ def callback_permission(callback_data: str) -> str | None:
     """Map private callback data to its required permission; None means owner-only/unknown."""
     if callback_data in {"admin_panel", "back_admin"}:
         return "panel"
+    if callback_data == "admin_owner_assistant_settings":
+        return "owner"
     if callback_data in {"admin_assistant", "admin_assistant_back"}:
         return "assistant"
     if callback_data == "admin_gallery":
@@ -490,6 +492,9 @@ async def admin_callback_gate(update: Update, context: ContextTypes.DEFAULT_TYPE
     permission = callback_permission(data)
     if permission == "panel":
         if is_admin(query.from_user.id):
+            return
+    elif permission == "owner":
+        if is_owner(query.from_user.id):
             return
     elif permission == "gallery_or_duplicates":
         if is_admin(query.from_user.id) and (

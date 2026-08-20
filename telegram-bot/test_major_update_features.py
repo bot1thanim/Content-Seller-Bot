@@ -206,6 +206,8 @@ async def run():
         await bot.admin_owner_assistant_settings(owner_assistant_update, SimpleNamespace(user_data={}))
         assert "כל יכולות העוזר פעילות" in owner_assistant_update.callback_query.edits[-1][0]
         assert "admin_assistant" in button_callbacks(owner_assistant_update.callback_query.edits[-1][1]["reply_markup"])
+        assert await gate_allows("admin_owner_assistant_settings", owner)
+        assert not await gate_allows("admin_owner_assistant_settings", 12345)
 
         # Owner can define a manager and toggle only explicit permissions.
         settings = bot.load_settings()
