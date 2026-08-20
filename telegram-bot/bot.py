@@ -831,13 +831,13 @@ def get_main_keyboard(user_id):
         ],
         [
             InlineKeyboardButton("💳 תשלום", callback_data="payment_method"),
-            InlineKeyboardButton("ℹ️ איך זה עובד?", callback_data="purchase_help"),
+            InlineKeyboardButton("👥 הפניות שלי", callback_data="referrals"),
         ],
         [
             InlineKeyboardButton("💰 ארנק מטבעות", callback_data="wallet"),
             InlineKeyboardButton("🎟 מימוש קופון", callback_data="coupon_redeem"),
         ],
-        [InlineKeyboardButton("👥 הפניות שלי", callback_data="referrals")],
+        [InlineKeyboardButton("ℹ️ איך זה עובד?", callback_data="purchase_help")],
         [InlineKeyboardButton("💬 תמיכה", callback_data="support")],
     ])
 

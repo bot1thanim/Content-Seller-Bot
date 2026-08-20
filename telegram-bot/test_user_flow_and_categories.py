@@ -83,6 +83,13 @@ async def run_tests():
             {'entry_id': '5', 'file_id': 'israeli-b', 'duration': 12, 'category': 'ישראלי'},
         ])
         try:
+            # The referral and purchase-help buttons are intentionally swapped in the main user keyboard.
+            main_keyboard = bot.get_main_keyboard(100)
+            main_callbacks = [
+                button.callback_data for row in main_keyboard.inline_keyboard for button in row
+            ]
+            assert main_callbacks.index('referrals') < main_callbacks.index('purchase_help')
+
             # Public delivery remains random, never repeats prior deliveries, and excludes broken records.
             context = SimpleNamespace(bot=FakeBot(), user_data={})
             assert bot.count_unseen_videos(100) == 3, 'Availability must ignore seen and broken videos'
