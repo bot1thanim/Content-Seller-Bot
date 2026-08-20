@@ -200,7 +200,12 @@ async def run():
         await bot.admin_manager_assistant_list(empty_assistant_list, SimpleNamespace(user_data={}))
         empty_assistant_buttons = button_callbacks(empty_assistant_list.callback_query.edits[-1][1]["reply_markup"])
         assert "admin_mgr_add" in empty_assistant_buttons
+        assert "admin_owner_assistant_settings" in empty_assistant_buttons
         assert "עדיין לא הוספת מנהל" in empty_assistant_list.callback_query.edits[-1][0]
+        owner_assistant_update = FakeUpdate("admin_owner_assistant_settings", owner)
+        await bot.admin_owner_assistant_settings(owner_assistant_update, SimpleNamespace(user_data={}))
+        assert "כל יכולות העוזר פעילות" in owner_assistant_update.callback_query.edits[-1][0]
+        assert "admin_assistant" in button_callbacks(owner_assistant_update.callback_query.edits[-1][1]["reply_markup"])
 
         # Owner can define a manager and toggle only explicit permissions.
         settings = bot.load_settings()

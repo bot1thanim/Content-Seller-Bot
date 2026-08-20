@@ -1431,13 +1431,16 @@ async def admin_manager_assistant_list(update: Update, context: ContextTypes.DEF
     if not is_owner(query.from_user.id):
         return
     managers = admin_managers()
-    buttons = [
+    buttons = [[InlineKeyboardButton(
+        "👑 הגדרות העוזר שלי — בעלים", callback_data="admin_owner_assistant_settings"
+    )]]
+    buttons.extend([
         [InlineKeyboardButton(
             f"🤖 {record.get('name') or manager_id} ({manager_id})",
             callback_data=f"admin_mgr_assistant_pick_{manager_id}",
         )]
         for manager_id, record in managers.items()
-    ]
+    ])
     if not managers:
         buttons.append([InlineKeyboardButton("➕ הוסף מנהל חדש", callback_data="admin_mgr_add")])
         text = (
@@ -1452,6 +1455,23 @@ async def admin_manager_assistant_list(update: Update, context: ContextTypes.DEF
         text,
         parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup(buttons),
+    )
+
+
+async def admin_owner_assistant_settings(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if not is_owner(query.from_user.id):
+        return
+    await query.edit_message_text(
+        "👑 *הגדרות העוזר שלי*\n\n"
+        "כבעלים, כל יכולות העוזר פעילות עבורך באופן אוטומטי. אין צורך להוסיף מנהל כדי לבדוק את העוזר או להשתמש בכל פעולות הניהול.\n\n"
+        "אפשר לפתוח עכשיו את העוזר ולנסות כל בקשה.",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("🤖 פתח את העוזר שלי", callback_data="admin_assistant")],
+            [InlineKeyboardButton("🔙 חזרה לניהול מנהלים", callback_data="admin_managers")],
+        ]),
     )
 
 
@@ -4979,6 +4999,7 @@ def main():
         ("^admin_menu_communications$", admin_menu_communications),
         ("^admin_menu_system$",         admin_menu_system),
         ("^admin_managers$",            admin_managers_menu),
+        ("^admin_owner_assistant_settings$", admin_owner_assistant_settings),
         (r"^admin_mgr_assistant_pick_\d+$", admin_manager_assistant_pick),
         ("^admin_mgr_assistant_list$",    admin_manager_assistant_list),
         (r"^admin_mgr_pick_\d+$",        admin_manager_pick),
