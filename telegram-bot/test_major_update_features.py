@@ -96,6 +96,7 @@ async def run():
         bot.SETTINGS_FILE = data / "settings.json"
         bot.TRASH_FILE = data / "trash.json"
         bot.ADMIN_ACTIONS_FILE = data / "admin_actions.json"
+        bot.DUPLICATE_REVIEWS_FILE = data / "duplicate_reviews.json"
         bot.AUTO_BACKUPS_DIR = data / "auto_backups"
         owner = bot.ADMIN_ID
         bot.ensure_data_files()
@@ -162,6 +163,20 @@ async def run():
         assert restore_payloads["videos.json"][0]["category"] == "רנדומלי"
         assert "רנדומלי" in restore_payloads["settings.json"]["categories"]
         assert "כללי" not in restore_payloads["settings.json"]["categories"]
+
+        # Duplicate-review marks are preserved both in old settings and in the dedicated backup file.
+        reviewed_signature = "reviewed-group-signature"
+        bot.save_reviewed_non_duplicate_signatures([reviewed_signature])
+        review_archive = io.BytesIO()
+        with zipfile.ZipFile(review_archive, "w", zipfile.ZIP_DEFLATED) as archive:
+            archive.writestr("settings.json", json.dumps({bot.DUPLICATE_REVIEWED_KEY: [reviewed_signature]}))
+            # Newer backups may contain an empty dedicated file while legacy marks still live in settings.
+            archive.writestr("duplicate_reviews.json", json.dumps([]))
+        review_payloads = bot.parse_restore_archive(review_archive.getvalue())
+        bot.apply_restore_payloads(review_payloads)
+        assert review_payloads["duplicate_reviews.json"] == [reviewed_signature]
+        assert reviewed_signature in bot.reviewed_non_duplicate_signatures()
+        assert "סימוני לא־כפול: 1" in bot.restore_summary(review_payloads)
         
         # Smart time and number parsing accept inclusive single values and ranges.
         assert bot.format_duration(70) == "1:10"

@@ -60,6 +60,7 @@ COUPONS_FILE   = DATA_DIR / "coupons.json"
 SETTINGS_FILE  = DATA_DIR / "settings.json"
 TRASH_FILE     = DATA_DIR / "trash.json"
 ADMIN_ACTIONS_FILE = DATA_DIR / "admin_actions.json"
+DUPLICATE_REVIEWS_FILE = DATA_DIR / "duplicate_reviews.json"
 AUTO_BACKUPS_DIR = DATA_DIR / "auto_backups"
 MAX_ADMIN_ACTIONS = 2000
 MAX_AUTO_BACKUPS = 30
@@ -75,6 +76,7 @@ BACKUP_ALLOWED_FILES = {
     "settings.json": dict,
     "trash.json": list,
     "admin_actions.json": list,
+    "duplicate_reviews.json": list,
 }
 MAX_RESTORE_ARCHIVE_BYTES = 20 * 1024 * 1024
 MAX_RESTORE_UNCOMPRESSED_BYTES = 40 * 1024 * 1024
@@ -154,6 +156,7 @@ def ensure_data_files():
         (SETTINGS_FILE,  {"referral_multiplier": 1.0, "maintenance": False}),
         (TRASH_FILE,     []),
         (ADMIN_ACTIONS_FILE, []),
+        (DUPLICATE_REVIEWS_FILE, []),
     ]
     for filepath, default in defaults:
         if not filepath.exists():
@@ -192,8 +195,8 @@ def normalize_category_name(category: str) -> str:
     return DEFAULT_CATEGORY if cleaned == LEGACY_DEFAULT_CATEGORY else cleaned
 
 
-def normalize_category_list(categories) -> list[str]:
-    """Normalize, deduplicate and alphabetically order private category names."""
+def normalize_category_list(categories, alphabetical: bool = True) -> list[str]:
+    """Normalize categories, optionally preserving the manually selected order."""
     cleaned = [
         normalize_category_name(category)
         for category in (categories if isinstance(categories, list) else [])
@@ -201,7 +204,8 @@ def normalize_category_list(categories) -> list[str]:
     ]
     if DEFAULT_CATEGORY not in cleaned:
         cleaned.append(DEFAULT_CATEGORY)
-    return sorted(set(cleaned), key=lambda category: category.casefold())
+    unique = list(dict.fromkeys(cleaned))
+    return sorted(unique, key=lambda category: category.casefold()) if alphabetical else unique
 
 
 def video_categories(video: dict) -> list[str]:
@@ -260,7 +264,13 @@ def normalize_restored_videos(videos):
 def normalize_restored_settings(settings):
     """Keep old backups compatible after the default category was renamed."""
     if isinstance(settings, dict):
-        settings["categories"] = normalize_category_list(settings.get("categories", []))
+        order_mode = settings.get("category_order_mode", "alphabetical")
+        if order_mode not in {"alphabetical", "manual"}:
+            order_mode = "alphabetical"
+        settings["category_order_mode"] = order_mode
+        settings["categories"] = normalize_category_list(
+            settings.get("categories", []), alphabetical=(order_mode == "alphabetical")
+        )
     return settings
 
 
@@ -300,6 +310,20 @@ def parse_restore_archive(raw_bytes: bytes) -> dict:
         payloads["trash.json"] = normalize_restored_videos(payloads["trash.json"])
     if "settings.json" in payloads:
         payloads["settings.json"] = normalize_restored_settings(payloads["settings.json"])
+
+    # Review marks existed inside settings in older backups and in a dedicated file in newer ones.
+    # Merge both sources so a newly-created empty review file can never erase legacy decisions.
+    legacy_reviews = payloads.get("settings.json", {}).get(DUPLICATE_REVIEWED_KEY, [])
+    file_reviews = payloads.get("duplicate_reviews.json", [])
+    combined_reviews = sorted({
+        signature for signature in list(legacy_reviews if isinstance(legacy_reviews, list) else [])
+        + list(file_reviews if isinstance(file_reviews, list) else [])
+        if isinstance(signature, str)
+    })
+    if "settings.json" in payloads:
+        payloads["settings.json"][DUPLICATE_REVIEWED_KEY] = combined_reviews
+    if "duplicate_reviews.json" in payloads or "settings.json" in payloads:
+        payloads["duplicate_reviews.json"] = combined_reviews
     return payloads
 
 
@@ -314,6 +338,7 @@ def restore_summary(payloads: dict) -> str:
         "settings.json": "הגדרות",
         "trash.json": "סל מיחזור",
         "admin_actions.json": "יומן פעולות מנהל",
+        "duplicate_reviews.json": "סימוני לא־כפול",
     }
     parts = []
     for filename, data in payloads.items():
@@ -327,6 +352,12 @@ def apply_restore_payloads(payloads: dict) -> None:
     DATA_DIR.mkdir(exist_ok=True)
     for filename, data in payloads.items():
         save_json(DATA_DIR / filename, data)
+    # Old backups kept review marks inside settings; new ones have a dedicated file too.
+    if "duplicate_reviews.json" in payloads:
+        save_reviewed_non_duplicate_signatures(payloads["duplicate_reviews.json"])
+    elif "settings.json" in payloads:
+        legacy_reviews = payloads["settings.json"].get(DUPLICATE_REVIEWED_KEY, [])
+        save_reviewed_non_duplicate_signatures(legacy_reviews if isinstance(legacy_reviews, list) else [])
     if "videos.json" in payloads:
         load_videos_with_entry_ids()
 
@@ -394,7 +425,11 @@ def load_settings() -> dict:
     s.setdefault("referral_multiplier", 1.0)
     s.setdefault("maintenance", False)
     s.setdefault("waiting_users", [])
-    s["categories"] = normalize_category_list(s.get("categories", []))
+    order_mode = s.get("category_order_mode", "alphabetical")
+    if order_mode not in {"alphabetical", "manual"}:
+        order_mode = "alphabetical"
+    s["category_order_mode"] = order_mode
+    s["categories"] = normalize_category_list(s.get("categories", []), alphabetical=(order_mode == "alphabetical"))
     return s
 
 def save_settings(s: dict):
@@ -602,9 +637,25 @@ def duplicate_group_signature(group: list[dict]) -> str:
 
 
 def reviewed_non_duplicate_signatures() -> set[str]:
+    """Load review decisions from the dedicated backup file and legacy settings key."""
     settings = load_settings()
-    reviewed = settings.get(DUPLICATE_REVIEWED_KEY, [])
-    return {signature for signature in reviewed if isinstance(signature, str)}
+    legacy = settings.get(DUPLICATE_REVIEWED_KEY, [])
+    stored = load_json(DUPLICATE_REVIEWS_FILE)
+    values = []
+    if isinstance(legacy, list):
+        values.extend(legacy)
+    if isinstance(stored, list):
+        values.extend(stored)
+    return {signature for signature in values if isinstance(signature, str)}
+
+
+def save_reviewed_non_duplicate_signatures(signatures) -> None:
+    """Persist review decisions both in a dedicated backup file and legacy settings."""
+    cleaned = sorted({signature for signature in signatures if isinstance(signature, str)})
+    save_json(DUPLICATE_REVIEWS_FILE, cleaned)
+    settings = load_settings()
+    settings[DUPLICATE_REVIEWED_KEY] = cleaned
+    save_settings(settings)
 
 
 def mark_group_as_not_duplicate(group: list[dict]) -> bool:
@@ -617,18 +668,14 @@ def mark_group_as_not_duplicate(group: list[dict]) -> bool:
     if signature in reviewed:
         return False
     reviewed.append(signature)
-    settings[DUPLICATE_REVIEWED_KEY] = reviewed
-    save_settings(settings)
+    save_reviewed_non_duplicate_signatures(reviewed)
     return True
 
 
 def clear_not_duplicate_marks() -> int:
     """Clear manual duplicate-review decisions so a full scan includes every group again."""
-    settings = load_settings()
-    reviewed = settings.get(DUPLICATE_REVIEWED_KEY, [])
-    count = len(reviewed) if isinstance(reviewed, list) else 0
-    settings[DUPLICATE_REVIEWED_KEY] = []
-    save_settings(settings)
+    count = len(reviewed_non_duplicate_signatures())
+    save_reviewed_non_duplicate_signatures([])
     return count
 
 def is_maintenance() -> bool:
@@ -3431,8 +3478,12 @@ async def admin_search_sec_input(update: Update, context: ContextTypes.DEFAULT_T
 
 
 def _admin_categories() -> list[str]:
-    """Return all private categories in Hebrew alphabetical order, including רנדומלי."""
-    return normalize_category_list(load_settings().get("categories", []))
+    """Return private categories in the saved alphabetical or manual order."""
+    settings = load_settings()
+    return normalize_category_list(
+        settings.get("categories", []),
+        alphabetical=(settings.get("category_order_mode", "alphabetical") == "alphabetical"),
+    )
 
 
 def _valid_category_name(name: str) -> str | None:
@@ -3447,10 +3498,14 @@ async def admin_categories_menu(update: Update, context: ContextTypes.DEFAULT_TY
     await query.answer()
     await clear_sent_duplicate_group_media(context)
     categories = _admin_categories()
-    text = "🏷 *קטגוריות — כלי ניהול פרטי*\n\nהקטגוריות הקיימות:\n" + "\n".join(f"• {category}" for category in categories)
+    order_mode = load_settings().get("category_order_mode", "alphabetical")
+    order_label = "א׳–ת׳" if order_mode == "alphabetical" else "סדר ידני"
+    text = "🏷 *קטגוריות — כלי ניהול פרטי*\n\n"
+    text += f"סדר נוכחי: *{order_label}*\n\nהקטגוריות הקיימות:\n" + "\n".join(f"• {category}" for category in categories)
     text += "\n\nהקטגוריות אינן מוצגות למשתמשים כרגע. בעתיד, בחירה ב׳רנדומלי׳ תבחר סרטון מתוך קטגוריה זו באופן אקראי."
     buttons = [
         [InlineKeyboardButton("📂 עיון ושליחה לפי קטגוריה", callback_data="admin_cat_browse")],
+        [InlineKeyboardButton("↕️ סדר קטגוריות", callback_data="admin_cat_order")],
         [InlineKeyboardButton("✏️ עריכת קטגוריות", callback_data="admin_cat_edit")],
         [InlineKeyboardButton("🏷 מיון לקטגוריות", callback_data="admin_cat_sort_start")],
         [InlineKeyboardButton("🔙 חזרה לגלריה", callback_data="admin_gallery")],
@@ -3468,6 +3523,66 @@ def _category_videos(category: str) -> list[dict]:
         ],
         key=lambda video: (video.get("duration", 0), video.get("added_at", "")),
     )
+
+
+async def admin_cat_order_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show manual up/down controls while retaining an explicit alphabetical reset."""
+    query = update.callback_query
+    await query.answer()
+    categories = _admin_categories()
+    order_mode = load_settings().get("category_order_mode", "alphabetical")
+    mode_text = "א׳–ת׳" if order_mode == "alphabetical" else "ידני"
+    buttons = []
+    for index, category in enumerate(categories):
+        buttons.append([InlineKeyboardButton(f"{index + 1}. {category}", callback_data="noop")])
+        moves = []
+        if index > 0:
+            moves.append(InlineKeyboardButton("⬆️ למעלה", callback_data=f"cat_order_up_{index}"))
+        if index < len(categories) - 1:
+            moves.append(InlineKeyboardButton("⬇️ למטה", callback_data=f"cat_order_down_{index}"))
+        if moves:
+            buttons.append(moves)
+    buttons.extend([
+        [InlineKeyboardButton("🔤 מיין מחדש לפי א׳–ת׳", callback_data="cat_order_alpha")],
+        [InlineKeyboardButton("🔙 חזרה לקטגוריות", callback_data="admin_categories")],
+    ])
+    await query.edit_message_text(
+        f"↕️ *סדר קטגוריות*\n\nהסדר הנוכחי: *{mode_text}*. "
+        "אפשר להזיז כל קטגוריה למעלה או למטה, או להחזיר את כולן למיון א׳–ת׳.",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(buttons),
+    )
+
+
+async def admin_cat_order_move(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    match = re.fullmatch(r"cat_order_(up|down)_(\d+)", query.data or "")
+    if not match:
+        return
+    direction, raw_index = match.groups()
+    index = int(raw_index)
+    categories = _admin_categories()
+    target = index - 1 if direction == "up" else index + 1
+    if not 0 <= index < len(categories) or not 0 <= target < len(categories):
+        await query.answer("הקטגוריה אינה זמינה להזזה.", show_alert=True)
+        return
+    categories[index], categories[target] = categories[target], categories[index]
+    settings = load_settings()
+    settings["category_order_mode"] = "manual"
+    settings["categories"] = categories
+    save_settings(settings)
+    await admin_cat_order_menu(update, context)
+
+
+async def admin_cat_order_alphabetical(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    settings = load_settings()
+    settings["category_order_mode"] = "alphabetical"
+    settings["categories"] = normalize_category_list(settings.get("categories", []), alphabetical=True)
+    save_settings(settings)
+    await admin_cat_order_menu(update, context)
 
 
 async def admin_cat_browse_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -3987,6 +4102,16 @@ def _category_sort_videos() -> list[dict]:
         load_videos_with_entry_ids(),
         key=lambda video: (int(video.get("duration", 0) or 0), str(video.get("entry_id", ""))),
     )
+
+
+async def admin_cat_sort_navigation(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Parse the requested page from the callback so Next/Previous never fall back to page zero."""
+    query = update.callback_query
+    try:
+        page = int((query.data or "").rsplit("_", 1)[1])
+    except (IndexError, ValueError):
+        page = 0
+    await admin_cat_sort_page(update, context, page)
 
 
 async def admin_cat_sort_page(update: Update, context: ContextTypes.DEFAULT_TYPE, page=0):
@@ -5223,6 +5348,9 @@ def main():
         (r"^vid_del_\d+$",              admin_gallery_delete),
         ("^vid_send_all$",              admin_gallery_send_all),
         ("^admin_categories$",          admin_categories_menu),
+        ("^admin_cat_order$",           admin_cat_order_menu),
+        (r"^cat_order_(up|down)_\d+$", admin_cat_order_move),
+        ("^cat_order_alpha$",           admin_cat_order_alphabetical),
         ("^admin_cat_browse$",          admin_cat_browse_menu),
         (r"^cat_browse_pick_\d+$",      admin_cat_browse_category),
         (r"^cat_browse_page_\d+$",      admin_cat_browse_page),
@@ -5240,7 +5368,7 @@ def main():
         ("^admin_cat_delete$",          admin_cat_delete_start),
         (r"^cat_delete_pick_\d+$",    admin_cat_delete_pick),
         (r"^cat_delete_confirm_\d+$", admin_cat_delete_confirm),
-        (r"^cat_sort_page_\d+$",       admin_cat_sort_page),
+        (r"^cat_sort_page_\d+$",       admin_cat_sort_navigation),
         ("^admin_cat_sort_start$",      lambda u, c: admin_cat_sort_page(u, c, 0)),
         (r"^cat_assign_",               admin_cat_assign),
         ("^admin_coupons$",             admin_coupons_menu),

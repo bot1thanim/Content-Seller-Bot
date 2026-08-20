@@ -190,10 +190,23 @@ async def run_tests():
             assert '10 שניות' in sort_query.edits[-1][0], 'Category sorting must start from the shortest video'
             assert len(sort_context.bot.sent_video_ids) == 1, 'Sorting must send exactly one current video'
             next_sort_query = FakeQuery('cat_sort_page_1')
-            await bot.admin_cat_sort_page(SimpleNamespace(callback_query=next_sort_query), sort_context, 1)
+            await bot.admin_cat_sort_navigation(SimpleNamespace(callback_query=next_sort_query), sort_context)
             assert sort_context.bot.deleted_ids, 'Moving to the next category-sort video must delete the prior preview'
             assert len(sort_context.bot.sent_video_ids) == 2, 'Moving next must send exactly one replacement preview'
             assert '12 שניות' in next_sort_query.edits[-1][0], 'Category sorting must remain in ascending duration order'
+
+            # Categories can be moved into a manual order and restored to Hebrew alphabetical order.
+            order_context = SimpleNamespace(user_data={})
+            order_move_query = FakeQuery('cat_order_down_0')
+            await bot.admin_cat_order_move(SimpleNamespace(callback_query=order_move_query), order_context)
+            manual_settings = bot.load_settings()
+            assert manual_settings['category_order_mode'] == 'manual', 'Moving a category must switch to manual order'
+            assert manual_settings['categories'][0] != 'חו״ל', 'The selected category was not moved down'
+            order_alpha_query = FakeQuery('cat_order_alpha')
+            await bot.admin_cat_order_alphabetical(SimpleNamespace(callback_query=order_alpha_query), order_context)
+            alphabetical_settings = bot.load_settings()
+            assert alphabetical_settings['category_order_mode'] == 'alphabetical'
+            assert alphabetical_settings['categories'] == sorted(alphabetical_settings['categories'], key=lambda name: name.casefold())
 
             # Renaming a category updates both settings and assigned videos.
             rename_message = FakeMessage(text='מקומי')
