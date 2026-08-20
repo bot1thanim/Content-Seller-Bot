@@ -136,7 +136,8 @@ VIP_LEVELS = [
     ADMIN_REPAIR_UPLOAD,     # 30
     ADMIN_CATEGORY_RENAME,   # 31
     ADMIN_MANAGER_ADD_ID,    # 32
-) = range(33)
+    ADMIN_ASSISTANT_COMMAND, # 33
+) = range(34)
 
 
 # ─── Data helpers ─────────────────────────────────────────────────────────────
@@ -410,7 +411,7 @@ def has_admin_permission(user_id: int, permission: str) -> bool:
 
 def callback_permission(callback_data: str) -> str | None:
     """Map private callback data to its required permission; None means owner-only/unknown."""
-    if callback_data in {"admin_panel", "back_admin"}:
+    if callback_data in {"admin_panel", "back_admin", "admin_assistant"}:
         return "panel"
     if callback_data == "admin_gallery":
         return "gallery_or_duplicates"
@@ -737,6 +738,10 @@ def get_admin_inline_keyboard(user_id: int = ADMIN_ID):
     def add(permission: str, buttons: list[InlineKeyboardButton]):
         if has_admin_permission(user_id, permission):
             rows.append(buttons)
+
+    # Every administrator can use the free text-command assistant; execution remains permission-scoped.
+    if is_admin(user_id):
+        rows.append([InlineKeyboardButton("🤖 עוזר פקודות", callback_data="admin_assistant")])
 
     # Existing day-to-day controls stay visible on the main panel.
     add("maintenance", [InlineKeyboardButton(f"📡 סטטוס בוט: {maint_status}", callback_data="admin_maintenance")])
@@ -1462,6 +1467,201 @@ async def back_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode="Markdown",
         reply_markup=get_admin_inline_keyboard(query.from_user.id),
     )
+
+# ─── Admin: free command assistant ────────────────────────────────────────────
+
+
+def _assistant_examples(user_id: int) -> list[str]:
+    """Return only examples that match the requesting administrator's permissions."""
+    examples = []
+    if has_admin_permission(user_id, "gallery"):
+        examples.extend([
+            "• שלח סרטונים מ-10 עד 20 שניות",
+            "• שלח סרטונים מ-1:30 עד 2:10",
+            "• שלח סרטונים מספר 10 עד 28",
+            "• פתח גלריה",
+            "• פתח קטגוריות",
+        ])
+    if has_admin_permission(user_id, "duplicates"):
+        examples.extend(["• מצא כפילויות", "• פתח סל מיחזור"])
+    if has_admin_permission(user_id, "users"):
+        examples.append("• הצג סטטיסטיקה")
+    if has_admin_permission(user_id, "backup"):
+        examples.append("• צור גיבוי")
+    return examples or ["• אין כרגע פעולות שמותר לבצע עם העוזר."]
+
+
+async def admin_assistant_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    user_id = query.from_user.id
+    if not is_admin(user_id):
+        return ConversationHandler.END
+    text = (
+        "🤖 *עוזר פקודות חכם*\n\n"
+        "כתוב לי פעולה בעברית ואבצע אותה לפי ההרשאות שלך. "
+        "אפשר לכתוב `עזרה` בכל זמן או `ביטול` כדי לצאת.\n\n"
+        "*דוגמאות לפעולות שלך:*\n" + "\n".join(_assistant_examples(user_id))
+    )
+    await query.edit_message_text(
+        text,
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ ביטול / חזרה לפאנל", callback_data="back_admin")]]),
+    )
+    return ADMIN_ASSISTANT_COMMAND
+
+
+def _assistant_normalize(text: str) -> str:
+    return re.sub(r"\s+", " ", text.strip().lower().replace("–", "-").replace("—", "-"))
+
+
+def _assistant_time_range(text: str) -> tuple[int, int] | None:
+    """Extract a time range from Hebrew command text without accepting unrelated numbers."""
+    if not any(marker in text for marker in ("שני", "זמן", "אורך", "דקה", ":")):
+        return None
+    match = re.search(r"(\d+(?::\d+)?)\s*(?:שניות?|דקות?)?\s*(?:-|עד|ועד)\s*(\d+(?::\d+)?)\s*(?:שניות?|דקות?)?", text)
+    if not match:
+        return None
+    first = parse_smart_time(match.group(1))
+    last = parse_smart_time(match.group(2))
+    return (first, last) if first >= 0 and last >= first else None
+
+
+def _assistant_number_range(text: str) -> tuple[int, int] | None:
+    """Extract a number range only when the command explicitly refers to video numbers."""
+    if "מספר" not in text:
+        return None
+    match = re.search(r"(?:מספר(?:ים)?|מספרי סרטונים)[^\d]*(\d+)\s*(?:-|עד|ועד)\s*(\d+)", text)
+    if not match:
+        return None
+    first, last = int(match.group(1)), int(match.group(2))
+    return (first, last) if first >= 1 and last >= first else None
+
+
+async def _assistant_clear_previous_media(context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> None:
+    message_ids = context.user_data.pop("assistant_sent_media_message_ids", [])
+    for message_id in message_ids:
+        try:
+            await context.bot.delete_message(chat_id=chat_id, message_id=message_id)
+        except Exception:
+            pass
+
+
+async def _assistant_send_videos(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    selected: list[dict],
+    description: str,
+) -> None:
+    """Send selected library videos to the requesting manager, in the supplied safe order."""
+    user_id = update.effective_user.id
+    await _assistant_clear_previous_media(context, user_id)
+    await update.message.reply_text(f"🤖 נמצאו {len(selected)} סרטונים: {description}. שולח לפי הסדר...")
+    sent_ids = []
+    success = 0
+    can_delete = has_admin_permission(user_id, "duplicates")
+    for video in selected:
+        try:
+            markup = None
+            if can_delete:
+                markup = InlineKeyboardMarkup([[InlineKeyboardButton(
+                    "🗑 העבר לסל מיחזור", callback_data=f"del_eid_{video['entry_id']}"
+                )]])
+            sent = await context.bot.send_video(chat_id=user_id, video=video["file_id"], reply_markup=markup)
+            if sent:
+                sent_ids.append(sent.message_id)
+                success += 1
+            await asyncio.sleep(0.15)
+        except Exception:
+            logger.exception("Assistant could not send a selected video")
+    context.user_data["assistant_sent_media_message_ids"] = sent_ids
+    await update.message.reply_text(f"✅ העוזר סיים: {success}/{len(selected)} סרטונים נשלחו.")
+
+
+def _assistant_action_button(label: str, callback_data: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton(label, callback_data=callback_data)],
+        [InlineKeyboardButton("🤖 המשך עם העוזר", callback_data="admin_assistant")],
+    ])
+
+
+async def admin_assistant_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Deterministically parse safe Hebrew manager commands without an external AI service."""
+    user_id = update.effective_user.id
+    if not is_admin(user_id):
+        return ConversationHandler.END
+    text = _assistant_normalize(update.message.text)
+    if text in {"ביטול", "חזור", "חזרה", "יציאה", "צא"}:
+        await _assistant_clear_previous_media(context, user_id)
+        await update.message.reply_text("🤖 יצאת מעוזר הפקודות.", reply_markup=get_admin_inline_keyboard(user_id))
+        return ConversationHandler.END
+    if text in {"עזרה", "דוגמאות", "מה אתה יודע לעשות", "מה אפשר לעשות"}:
+        await update.message.reply_text(
+            "🤖 *דוגמאות לפעולות שלך:*\n" + "\n".join(_assistant_examples(user_id)),
+            parse_mode="Markdown",
+        )
+        return ADMIN_ASSISTANT_COMMAND
+
+    if has_admin_permission(user_id, "gallery"):
+        time_range = _assistant_time_range(text)
+        if time_range and any(word in text for word in ("שלח", "חפש", "סרטון")):
+            first, last = time_range
+            videos = load_json(VIDEOS_FILE)
+            selected = [
+                video for video in videos
+                if isinstance(video, dict) and first <= int(video.get("duration", 0) or 0) <= last
+            ]
+            selected.sort(key=lambda video: (int(video.get("duration", 0) or 0), str(video.get("entry_id", ""))))
+            if not selected:
+                await update.message.reply_text(f"🤖 לא נמצאו סרטונים בטווח {format_duration(first)}–{format_duration(last)}.")
+            else:
+                await _assistant_send_videos(
+                    update, context, selected,
+                    f"בטווח {format_duration(first)}–{format_duration(last)} מהקצר לארוך",
+                )
+            return ADMIN_ASSISTANT_COMMAND
+
+        number_range = _assistant_number_range(text)
+        if number_range and any(word in text for word in ("שלח", "חפש", "סרטון")):
+            first, last = number_range
+            videos = load_json(VIDEOS_FILE)
+            if last > len(videos):
+                await update.message.reply_text(f"🤖 המספרים חייבים להיות בין 1 ל-{len(videos)}.")
+            else:
+                selected = videos[first - 1:last]
+                await _assistant_send_videos(update, context, selected, f"במספרים {first}-{last}")
+            return ADMIN_ASSISTANT_COMMAND
+
+        if "גלר" in text or "עיון בספר" in text:
+            await update.message.reply_text("🤖 פותח את הגלריה.", reply_markup=_assistant_action_button("🎬 פתח גלריית סרטונים", "admin_gallery"))
+            return ConversationHandler.END
+        if "קטגור" in text:
+            await update.message.reply_text("🤖 פותח את הקטגוריות.", reply_markup=_assistant_action_button("🏷 פתח קטגוריות", "admin_categories"))
+            return ConversationHandler.END
+
+    if has_admin_permission(user_id, "duplicates"):
+        if "כפיל" in text and any(word in text for word in ("מצא", "בדוק", "סרוק")):
+            callback = "admin_dup_rescan" if "מחדש" in text else "admin_dup_scan"
+            label = "🔄 סרוק כפילויות מחדש" if callback.endswith("rescan") else "🔎 מצא כפילויות"
+            await update.message.reply_text("🤖 הפקודה מוכנה.", reply_markup=_assistant_action_button(label, callback))
+            return ConversationHandler.END
+        if "סל" in text and ("מחזור" in text or "אשפה" in text):
+            await update.message.reply_text("🤖 פותח את סל המיחזור.", reply_markup=_assistant_action_button("🗑 פתח סל מיחזור", "admin_trash_page_0"))
+            return ConversationHandler.END
+
+    if has_admin_permission(user_id, "users") and ("סטט" in text or "נתונים" in text):
+        await update.message.reply_text("🤖 פותח את הסטטיסטיקה.", reply_markup=_assistant_action_button("📊 הצג סטטיסטיקה", "admin_stats"))
+        return ConversationHandler.END
+
+    if has_admin_permission(user_id, "backup") and ("גיבוי" in text and any(word in text for word in ("צור", "עשה", "הכן"))):
+        await update.message.reply_text("🤖 יצירת הגיבוי דורשת לחיצה מודעת.", reply_markup=_assistant_action_button("💾 צור גיבוי ZIP", "admin_backup"))
+        return ConversationHandler.END
+
+    await update.message.reply_text(
+        "🤖 לא זיהיתי פעולה מותרת. כתוב `עזרה` כדי לראות דוגמאות שמתאימות להרשאות שלך."
+    )
+    return ADMIN_ASSISTANT_COMMAND
+
 
 # ─── Admin: stats ─────────────────────────────────────────────────────────────
 
@@ -4442,6 +4642,16 @@ def main():
         fallbacks=[CommandHandler("cancel", cancel), CallbackQueryHandler(admin_managers_menu, pattern="^admin_managers$")],
         per_message=False, per_chat=True,
     )
+    assistant_conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(admin_assistant_start, pattern="^admin_assistant$")],
+        states={ADMIN_ASSISTANT_COMMAND: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_assistant_command)]},
+        fallbacks=[
+            CommandHandler("cancel", cancel),
+            CallbackQueryHandler(back_admin, pattern="^back_admin$"),
+        ],
+        per_message=False,
+        per_chat=True,
+    )
     cat_rename_conv = ConversationHandler(
         entry_points=[CallbackQueryHandler(admin_cat_rename_pick, pattern=r"^cat_rename_pick_\d+$")],
         states={ADMIN_CATEGORY_RENAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_cat_rename_input)]},
@@ -4465,7 +4675,7 @@ def main():
         check_conv, send_conv, approve_conv, broadcast_conv, coins_conv, vip_conv,
         coupon_new_conv, multiplier_conv, restore_conv, global_reset_conv,
         video_search_conv, video_search_sec_conv, repair_conv, support_conv, coupon_redeem_conv, support_reply_conv,
-        cat_add_conv, cat_rename_conv, manager_add_conv, video_upload_conv
+        cat_add_conv, cat_rename_conv, manager_add_conv, assistant_conv, video_upload_conv
     ]:
         app.add_handler(conv)
 

@@ -204,7 +204,7 @@ async def run():
         assert not bot.has_admin_permission(12345, "backup")
         keyboard = bot.get_admin_inline_keyboard(12345)
         callback_data = [button.callback_data for row in keyboard.inline_keyboard for button in row]
-        assert callback_data == ["admin_gallery"], callback_data
+        assert callback_data == ["admin_assistant", "admin_gallery"], callback_data
         # The owner retains the familiar detailed panel with direct day-to-day actions.
         owner_callbacks = button_callbacks(bot.get_admin_inline_keyboard(owner))
         assert {"admin_stats", "admin_gallery", "admin_maintenance", "admin_menu_system"}.issubset(owner_callbacks)
@@ -236,8 +236,8 @@ async def run():
             settings = bot.load_settings()
             settings["admin_managers"]["12345"]["permissions"] = [permission]
             bot.save_settings(settings)
-            assert button_callbacks(bot.get_admin_inline_keyboard(12345)) == expected_controls
-            for allowed_callback in expected_controls:
+            assert button_callbacks(bot.get_admin_inline_keyboard(12345)) == ["admin_assistant", *expected_controls]
+            for allowed_callback in ["admin_assistant", *expected_controls]:
                 assert await gate_allows(allowed_callback, 12345), (permission, allowed_callback)
             assert not await gate_allows("admin_managers", 12345), permission
             assert not await gate_allows(blocked_callback, 12345), permission
@@ -247,6 +247,31 @@ async def run():
         settings["admin_managers"]["12345"]["permissions"] = ["gallery", "duplicates"]
         bot.save_settings(settings)
         assert button_callbacks(bot.get_admin_inline_keyboard(12345)).count("admin_gallery") == 1
+
+        # The free command assistant parses only permitted commands and sends results in a safe order.
+        settings = bot.load_settings()
+        settings["admin_managers"]["12345"]["permissions"] = ["gallery"]
+        bot.save_settings(settings)
+        assistant_bot = FakeBot()
+        assistant_message = FakeMessage("שלח סרטונים מ-10 עד 20 שניות")
+        assistant_update = SimpleNamespace(effective_user=SimpleNamespace(id=12345), message=assistant_message)
+        assistant_context = SimpleNamespace(bot=assistant_bot, user_data={})
+        assert await bot.admin_assistant_command(assistant_update, assistant_context) == bot.ADMIN_ASSISTANT_COMMAND
+        assert [video for _, video, _ in assistant_bot.sent_videos] == ["f1", "f2", "f3", "f4"]
+        assert all(markup is None for _, _, markup in assistant_bot.sent_videos)
+
+        blocked_assistant_message = FakeMessage("מצא כפילויות")
+        blocked_assistant_update = SimpleNamespace(effective_user=SimpleNamespace(id=12345), message=blocked_assistant_message)
+        assert await bot.admin_assistant_command(blocked_assistant_update, assistant_context) == bot.ADMIN_ASSISTANT_COMMAND
+        assert "לא זיהיתי" in blocked_assistant_message.replies[-1][0]
+
+        settings = bot.load_settings()
+        settings["admin_managers"]["12345"]["permissions"] = ["duplicates"]
+        bot.save_settings(settings)
+        duplicate_assistant_message = FakeMessage("מצא כפילויות")
+        duplicate_assistant_update = SimpleNamespace(effective_user=SimpleNamespace(id=12345), message=duplicate_assistant_message)
+        assert await bot.admin_assistant_command(duplicate_assistant_update, SimpleNamespace(bot=FakeBot(), user_data={})) == bot.ConversationHandler.END
+        assert "admin_dup_scan" in button_callbacks(duplicate_assistant_message.replies[-1][1]["reply_markup"])
 
         # Gallery-only and duplicates-only managers enter the same category but receive different controls.
         settings = bot.load_settings()
