@@ -872,7 +872,7 @@ def get_admin_inline_keyboard(user_id: int = ADMIN_ID):
         rows.append([InlineKeyboardButton("🎬 גלריית סרטונים", callback_data="admin_gallery")])
     add("broadcast", [InlineKeyboardButton("📢 הודעה לכולם", callback_data="admin_broadcast")])
     add("coins", [InlineKeyboardButton("🪙 ניהול מטבעות", callback_data="admin_coins"), InlineKeyboardButton("💎 ניהול דרגות", callback_data="admin_vip")])
-    add("coins", [InlineKeyboardButton("🎟 ניהול קופונים", callback_data="admin_coupons"), InlineKeyboardButton("💱 ערך מטבע", callback_data="admin_multiplier")])
+    add("coins", [InlineKeyboardButton("🎟 ניהול קופונים", callback_data="admin_coupons"), InlineKeyboardButton("💱 מכפיל מטבעות", callback_data="admin_multiplier")])
 
     # Advanced tools added after the original panel are kept together here.
     advanced_permissions = {"audit_log", "backup", "dangerous_delete"}
@@ -909,7 +909,7 @@ async def admin_menu_rewards(update: Update, context: ContextTypes.DEFAULT_TYPE)
         "🪙 *מטבעות, קופונים ודרגות*\n\nבחר פעולה:", parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup([
             [InlineKeyboardButton("🪙 ניהול מטבעות", callback_data="admin_coins"), InlineKeyboardButton("💎 ניהול דרגות", callback_data="admin_vip")],
-            [InlineKeyboardButton("🎟 ניהול קופונים", callback_data="admin_coupons"), InlineKeyboardButton("💱 ערך מטבע", callback_data="admin_multiplier")],
+            [InlineKeyboardButton("🎟 ניהול קופונים", callback_data="admin_coupons"), InlineKeyboardButton("💱 מכפיל מטבעות", callback_data="admin_multiplier")],
             _back_to_admin_row(),
         ]),
     )
@@ -4567,9 +4567,17 @@ async def admin_multiplier_start(update: Update, context: ContextTypes.DEFAULT_T
     settings = load_settings()
     current  = settings.get("referral_multiplier", 1.0)
     await query.edit_message_text(
-        f"💱 *ערך מטבעות*\n\nהמכפיל הנוכחי: *{current}x*\n(על כל הפניה מקבלים 1 * המכפיל)\n\nשלח מכפיל חדש (למשל 1.5):",
+        f"💱 *מכפיל הפניות ויתרות מטבעות*\n\n"
+        f"המכפיל הנוכחי: *{current}x*\n\n"
+        "*מה המכפיל עושה?*\n"
+        "• כל הפניה חדשה מזכה ב־1 × המכפיל מטבעות.\n"
+        "• שינוי המכפיל מעדכן גם את כל היתרות הקיימות באותו יחס.\n"
+        "  לדוגמה: 10 מטבעות ב־1x יהפכו ל־20 מטבעות ב־2x.\n\n"
+        "*מה אינו משתנה?*\n"
+        "• מחיר PayPal, מחיר סרטונים במטבעות והמתנה היומית נשארים ללא שינוי.\n\n"
+        "⚠️ שלח מכפיל חדש (למשל `1.5`). שינוי זה ישפיע על כל יתרות המשתמשים.",
         parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ ביטול / חזור", callback_data="back_admin")]]),
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 חזרה לפאנל", callback_data="back_admin")]]),
     )
     return ADMIN_MULTIPLIER
 
@@ -5138,7 +5146,10 @@ def main():
     multiplier_conv = ConversationHandler(
         entry_points=[CallbackQueryHandler(admin_multiplier_start, pattern="^admin_multiplier$")],
         states={ADMIN_MULTIPLIER: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_multiplier_apply)]},
-        fallbacks=[CommandHandler("cancel", cancel)],
+        fallbacks=[
+            CommandHandler("cancel", cancel),
+            CallbackQueryHandler(back_admin, pattern="^back_admin$"),
+        ],
         per_message=False, per_chat=True,
     )
     restore_conv = ConversationHandler(

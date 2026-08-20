@@ -107,6 +107,16 @@ async def run():
             {"file_id": "f3", "duration": 20, "entry_id": "c", "category": "קצר"},
             {"file_id": "f4", "duration": 20, "entry_id": "d", "category": "קצר"},
         ])
+        # The currency-multiplier button opens for the owner and explains its exact effect.
+        multiplier_query = FakeQuery("admin_multiplier", owner)
+        multiplier_state = await bot.admin_multiplier_start(
+            SimpleNamespace(callback_query=multiplier_query), SimpleNamespace()
+        )
+        multiplier_text = multiplier_query.edits[-1][0]
+        assert multiplier_state == bot.ADMIN_MULTIPLIER
+        assert "מכפיל הפניות" in multiplier_text
+        assert "מחיר PayPal" in multiplier_text and "המתנה היומית" in multiplier_text
+
         # Legacy category values are migrated safely and can hold multiple memberships.
         videos = bot.load_videos_with_entry_ids()
         assert bot.video_categories(videos[0]) == ["ישראלי"]
