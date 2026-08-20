@@ -1,6 +1,8 @@
 import asyncio
 import importlib.util
+import io
 import json
+import zipfile
 import tempfile
 from pathlib import Path
 from types import SimpleNamespace
@@ -134,6 +136,15 @@ async def run():
         await bot.admin_trash_page(trash_preview, preview_context, 0)
         await bot.admin_gallery(FakeUpdate("admin_gallery", owner), preview_context)
         assert len(fake_bot.deleted) == deleted_before_trash_back + 1
+        # A manual backup containing the admin audit file must reach preview safely.
+        restore_archive = io.BytesIO()
+        with zipfile.ZipFile(restore_archive, "w", zipfile.ZIP_DEFLATED) as archive:
+            archive.writestr("videos.json", "[]")
+            archive.writestr("admin_actions.json", "[]")
+        restore_payloads = bot.parse_restore_archive(restore_archive.getvalue())
+        restore_preview = bot.restore_summary(restore_payloads)
+        assert "יומן פעולות מנהל: 0" in restore_preview
+
         # Safety snapshot and audit persistence are created before dangerous work.
         snapshot = bot.create_auto_backup("test_dangerous_action", owner)
         assert snapshot and snapshot.exists()
@@ -202,7 +213,15 @@ async def run():
         gallery_buttons = button_callbacks(gallery_update.callback_query.edits[-1][1]["reply_markup"])
         assert "vid_page_0" in gallery_buttons and "admin_dup_scan" not in gallery_buttons
         assert await gate_allows("vid_page_0", 12345)
+        assert await gate_allows("admin_video_search", 12345)
+        assert await gate_allows("admin_search_sec_start", 12345)
         assert not await gate_allows("admin_dup_scan", 12345)
+        assert bot.callback_permission("admin_video_search") == "gallery"
+        assert bot.callback_permission("admin_search_sec_start") == "gallery"
+        number_search_update = FakeUpdate("admin_video_search", 12345)
+        assert await bot.admin_video_search_start(number_search_update, SimpleNamespace()) == bot.ADMIN_VIDEO_SEARCH
+        time_search_update = FakeUpdate("admin_search_sec_start", 12345)
+        assert await bot.admin_search_sec_start(time_search_update, SimpleNamespace()) == bot.ADMIN_VIDEO_SEARCH_SECONDS
 
         settings = bot.load_settings()
         settings["admin_managers"]["12345"]["permissions"] = ["duplicates"]

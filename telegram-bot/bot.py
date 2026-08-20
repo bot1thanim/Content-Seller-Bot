@@ -269,6 +269,7 @@ def restore_summary(payloads: dict) -> str:
         "coupons.json": "קופונים",
         "settings.json": "הגדרות",
         "trash.json": "סל מיחזור",
+        "admin_actions.json": "יומן פעולות מנהל",
     }
     parts = []
     for filename, data in payloads.items():
@@ -403,7 +404,10 @@ def callback_permission(callback_data: str) -> str | None:
         return "panel"
     if callback_data == "admin_gallery":
         return "gallery_or_duplicates"
-    if callback_data.startswith(("vid_", "admin_categories", "admin_cat_", "cat_", "admin_repair")):
+    if callback_data.startswith((
+        "vid_", "admin_categories", "admin_cat_", "cat_", "admin_repair",
+        "admin_video_search", "admin_search_sec",
+    )):
         return "gallery"
     if callback_data.startswith(("admin_dup", "dup_", "admin_trash", "trash_", "del_eid_", "del_v_")):
         return "duplicates"
@@ -2574,7 +2578,7 @@ async def admin_repair_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE
 async def admin_video_search_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query  = update.callback_query
     await query.answer()
-    if not is_admin(query.from_user.id):
+    if not has_admin_permission(query.from_user.id, "gallery"):
         return ConversationHandler.END
     videos = load_json(VIDEOS_FILE)
     await query.edit_message_text(
@@ -2585,7 +2589,7 @@ async def admin_video_search_start(update: Update, context: ContextTypes.DEFAULT
     return ADMIN_VIDEO_SEARCH
 
 async def admin_video_search_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
+    if not has_admin_permission(update.effective_user.id, "gallery"):
         return ConversationHandler.END
     videos = load_json(VIDEOS_FILE)
     try:
@@ -2623,7 +2627,7 @@ async def admin_video_search_input(update: Update, context: ContextTypes.DEFAULT
 async def admin_search_sec_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    if not is_admin(query.from_user.id):
+    if not has_admin_permission(query.from_user.id, "gallery"):
         return ConversationHandler.END
     await query.edit_message_text(
         "⏱ *חיפוש סרטונים לפי שניות*\n\nשלח את מספר השניות לחיפוש (למשל `26`):",
@@ -2648,7 +2652,7 @@ def parse_smart_time(text: str) -> int:
         return -1
 
 async def admin_search_sec_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
+    if not has_admin_permission(update.effective_user.id, "gallery"):
         return ConversationHandler.END
     
     text = update.message.text.strip()
