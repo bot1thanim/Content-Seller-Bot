@@ -35,6 +35,15 @@ class FakeBot:
         self.deleted.append((chat_id, message_id))
 
 
+class FakeMessage:
+    def __init__(self, text):
+        self.text = text
+        self.replies = []
+    async def reply_text(self, text, **kwargs):
+        self.replies.append((text, kwargs))
+        return Msg()
+
+
 class FakeQuery:
     def __init__(self, data, user_id):
         self.data = data
@@ -144,6 +153,41 @@ async def run():
         restore_payloads = bot.parse_restore_archive(restore_archive.getvalue())
         restore_preview = bot.restore_summary(restore_payloads)
         assert "יומן פעולות מנהל: 0" in restore_preview
+
+        # Smart time and number parsing accept inclusive single values and ranges.
+        assert bot.format_duration(70) == "1:10"
+        assert bot.format_duration(26) == "26 שניות"
+        assert bot.parse_smart_time_range("10-13") == (10, 13)
+        assert bot.parse_smart_time_range("1:30-22:30") == (90, 1350)
+        assert bot.parse_smart_time_range("1:61") is None
+        assert bot.parse_number_range("10-28", 100) == (10, 28)
+        assert bot.parse_number_range("28-10", 100) is None
+
+        # Time-range results include both endpoints and are delivered from shortest to longest.
+        original_videos = bot.load_json(bot.VIDEOS_FILE)
+        range_videos = [
+            {"file_id": "r13", "duration": 13, "entry_id": "r13", "category": "כללי"},
+            {"file_id": "r10b", "duration": 10, "entry_id": "r10b", "category": "כללי"},
+            {"file_id": "r12", "duration": 12, "entry_id": "r12", "category": "כללי"},
+            {"file_id": "r10a", "duration": 10, "entry_id": "r10a", "category": "כללי"},
+            {"file_id": "r11", "duration": 11, "entry_id": "r11", "category": "כללי"},
+        ]
+        write(bot.VIDEOS_FILE, range_videos)
+        time_range_bot = FakeBot()
+        time_range_message = FakeMessage("10-13")
+        time_range_update = SimpleNamespace(effective_user=SimpleNamespace(id=owner), message=time_range_message)
+        await bot.admin_search_sec_input(time_range_update, SimpleNamespace(bot=time_range_bot, user_data={}))
+        assert [video for _, video, _ in time_range_bot.sent_videos] == ["r10a", "r10b", "r11", "r12", "r13"]
+        assert "5 סרטונים" in time_range_message.replies[0][0]
+
+        # Number-range results preserve the exact library order between the chosen endpoints.
+        number_range_bot = FakeBot()
+        number_range_message = FakeMessage("2-4")
+        number_range_update = SimpleNamespace(effective_user=SimpleNamespace(id=owner), message=number_range_message)
+        await bot.admin_video_search_input(number_range_update, SimpleNamespace(bot=number_range_bot, user_data={}))
+        assert [video for _, video, _ in number_range_bot.sent_videos] == ["r10b", "r12", "r10a"]
+        assert "3 סרטונים" in number_range_message.replies[0][0]
+        write(bot.VIDEOS_FILE, original_videos)
 
         # Safety snapshot and audit persistence are created before dangerous work.
         snapshot = bot.create_auto_backup("test_dangerous_action", owner)

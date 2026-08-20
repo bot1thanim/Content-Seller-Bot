@@ -211,6 +211,16 @@ def display_video_categories(video: dict) -> str:
     return ", ".join(video_categories(video))
 
 
+def format_duration(seconds: int | float | None) -> str:
+    """Display a stored duration in a concise, human-readable seconds or minutes:seconds form."""
+    try:
+        total_seconds = max(0, int(seconds or 0))
+    except (TypeError, ValueError):
+        total_seconds = 0
+    minutes, remainder = divmod(total_seconds, 60)
+    return f"{minutes}:{remainder:02d}" if minutes else f"{remainder} שניות"
+
+
 def normalize_restored_videos(videos):
     """Convert legacy file-id data and normalize category memberships during restore."""
     if videos and all(isinstance(item, str) for item in videos):
@@ -1810,7 +1820,7 @@ async def admin_gallery_page(update: Update, context: ContextTypes.DEFAULT_TYPE,
     text = f"""🎬 *גלריית סרטונים ({page+1}/{total})*
 
 📁 קטגוריות: {display_video_categories(v)}
-⏱ אורך: {v.get('duration', 0)} שניות"""
+⏱ אורך: {format_duration(v.get('duration', 0))}"""
     
     nav = []
     if page > 0:
@@ -2033,7 +2043,7 @@ async def admin_dup_page(update: Update, context: ContextTypes.DEFAULT_TYPE, pag
     duration = group[0].get("duration", 0)
     if not had_lower_control:
         await query.edit_message_text(
-            f"🔎 *חשד לכפילות ({page + 1}/{total})*\n\n⏱ אורך משותף: {duration} שניות\n"
+            f"🔎 *חשד לכפילות ({page + 1}/{total})*\n\n⏱ אורך משותף: {format_duration(duration)}\n"
             f"👥 מספר סרטונים בקבוצה: {len(group)}\n\n⏳ שולח את סרטוני הקבוצה אוטומטית לבדיקה...",
             parse_mode="Markdown",
         )
@@ -2139,7 +2149,7 @@ async def admin_trash_page(update: Update, context: ContextTypes.DEFAULT_TYPE, p
     
     text = f"""🗑 *סל מיחזור ({page+1}/{total})*
 
-⏱ אורך: {v.get('duration', 0)} שניות
+⏱ אורך: {format_duration(v.get('duration', 0))}
 📅 נמחק ב: {v.get('deleted_at', 'לא ידוע')}"""
     
     nav = []
@@ -2498,7 +2508,7 @@ async def admin_repair_show_current(update: Update, context: ContextTypes.DEFAUL
     size_text = f"\n📦 גודל: {size_bytes / (1024 * 1024):.2f} MB" if isinstance(size_bytes, (int, float)) and size_bytes else ""
     text = (
         f"⚠️ *סרטון עם מזהה שבור ({index + 1}/{len(repair_list)})*\n\n"
-        f"⏱ אורך במאגר: {duration} שניות\n"
+        f"⏱ אורך במאגר: {format_duration(duration)}\n"
         f"📁 קטגוריה: {category}{size_text}\n\n"
         "שלח עכשיו את *אותו קובץ וידאו מקורי* לבוט.\n"
         "הבוט יעדכן רק את מזהה הקובץ, וישמור את שאר פרטי הסרטון."
@@ -2582,38 +2592,62 @@ async def admin_video_search_start(update: Update, context: ContextTypes.DEFAULT
         return ConversationHandler.END
     videos = load_json(VIDEOS_FILE)
     await query.edit_message_text(
-        f"🔢 *חיפוש סרטון לפי מספר*\n\nיש {len(videos)} סרטונים.\nשלח מספר (1–{len(videos)}):",
+        f"🔢 *חיפוש סרטונים לפי מספר*\n\nיש {len(videos)} סרטונים.\n"
+        f"שלח מספר יחיד (למשל `26`) או טווח מספרים (למשל `10-28`).\n"
+        f"הטווח החוקי הוא 1–{len(videos)}.",
         parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ ביטול / חזור לעיון", callback_data="admin_gallery")]]),
     )
     return ADMIN_VIDEO_SEARCH
 
+
+def parse_number_range(text: str, maximum: int) -> tuple[int, int] | None:
+    """Parse one video number or an inclusive number range such as 10-28."""
+    normalized = text.strip().replace("–", "-").replace("—", "-")
+    parts = normalized.split("-")
+    if len(parts) not in {1, 2} or any(not part.strip().isdigit() for part in parts):
+        return None
+    first = int(parts[0])
+    last = int(parts[-1])
+    if first < 1 or last < first or last > maximum:
+        return None
+    return first, last
+
+
 async def admin_video_search_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not has_admin_permission(update.effective_user.id, "gallery"):
         return ConversationHandler.END
     videos = load_json(VIDEOS_FILE)
-    try:
-        num = int(update.message.text.strip())
-        if num < 1 or num > len(videos):
-            raise ValueError
-    except ValueError:
-        await update.message.reply_text(f"❌ מספר לא תקין. בחר בין 1 ל-{len(videos)}.")
+    number_range = parse_number_range(update.message.text, len(videos))
+    if not number_range:
+        await update.message.reply_text(
+            f"❌ מספר או טווח לא תקינים. כתוב מספר בין 1 ל-{len(videos)} או טווח כמו `10-28`.",
+            parse_mode="Markdown",
+        )
         return ADMIN_VIDEO_SEARCH
-    idx     = num - 1
-    v = videos[idx]
+
+    first, last = number_range
+    selected = list(enumerate(videos[first - 1:last], start=first - 1))
     await clear_sent_duplicate_group_media(context)
-    await update.message.reply_text(f"🎬 סרטון {num}/{len(videos)}:")
-    sent = await context.bot.send_video(
-        chat_id=ADMIN_ID,
-        video=v["file_id"],
-        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(f"🗑 מחק סרטון {num}", callback_data=f"vid_del_{idx}")]]),
-    )
-    if sent:
-        context.user_data["dup_sent_media_message_ids"] = [sent.message_id]
+    label = str(first) if first == last else f"{first}-{last}"
+    await update.message.reply_text(f"🔢 נמצאו {len(selected)} סרטונים במספרים {label}. שולח לפי הסדר...")
+
+    success = 0
+    sent_message_ids = []
+    for index, video in selected:
+        try:
+            sent = await send_admin_video_with_delete_button(context.bot, video["file_id"], video["entry_id"])
+            if sent and sent != "INVALID_FILE_ID":
+                success += 1
+                sent_message_ids.append(sent.message_id)
+            await asyncio.sleep(0.15)
+        except Exception:
+            logger.exception("Failed to send numbered search result %s", index + 1)
+    context.user_data["dup_sent_media_message_ids"] = sent_message_ids
     await update.message.reply_text(
-        "🔍 החיפוש הסתיים.",
+        f"✅ סיימתי לשלוח את תוצאות החיפוש ({success}/{len(selected)} נשלחו).",
         reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("🎬 חזרה לעיון בספריה", callback_data=f"vid_page_{idx}")],
+            [InlineKeyboardButton("🎬 חזרה לעיון בספריה", callback_data=f"vid_page_{first - 1}")],
             [
                 InlineKeyboardButton("🔢 חיפוש לפי מספר", callback_data="admin_video_search"),
                 InlineKeyboardButton("⏱ חיפוש לפי זמן", callback_data="admin_search_sec_start"),
@@ -2630,61 +2664,95 @@ async def admin_search_sec_start(update: Update, context: ContextTypes.DEFAULT_T
     if not has_admin_permission(query.from_user.id, "gallery"):
         return ConversationHandler.END
     await query.edit_message_text(
-        "⏱ *חיפוש סרטונים לפי שניות*\n\nשלח את מספר השניות לחיפוש (למשל `26`):",
+        "⏱ *חיפוש סרטונים לפי זמן*\n\n"
+        "אפשר לחפש זמן יחיד: `26` או `1:20`.\n"
+        "אפשר גם לחפש טווח כולל: `10-13` או `1:30-22:30`.\n\n"
+        "הזמן מוצג בפורמט דקות:שניות, והסרטונים יישלחו מהקצר לארוך.",
         parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ ביטול", callback_data="admin_gallery")]])
     )
     return ADMIN_VIDEO_SEARCH_SECONDS
 
+
 def parse_smart_time(text: str) -> int:
-    """Parse '26' as 26s, '1:20' as 80s, '20:30' as 1230s."""
+    """Parse '26' as 26s, '1:20' as 80s, and reject invalid minute:second values."""
     text = text.strip()
     if ":" in text:
         parts = text.split(":")
-        if len(parts) == 2:
-            try:
-                m, s = int(parts[0]), int(parts[1])
-                return m * 60 + s
-            except ValueError: return -1
-    try:
-        return int(text)
-    except ValueError:
+        if len(parts) == 2 and all(part.strip().isdigit() for part in parts):
+            minutes, seconds = (int(part) for part in parts)
+            if 0 <= seconds < 60:
+                return minutes * 60 + seconds
         return -1
+    return int(text) if text.isdigit() else -1
+
+
+def parse_smart_time_range(text: str) -> tuple[int, int] | None:
+    """Parse one time or an inclusive time range such as 10-13 or 1:30-22:30."""
+    normalized = text.strip().replace("–", "-").replace("—", "-")
+    parts = normalized.split("-")
+    if len(parts) not in {1, 2}:
+        return None
+    first = parse_smart_time(parts[0])
+    last = parse_smart_time(parts[-1])
+    if first < 0 or last < first:
+        return None
+    return first, last
+
 
 async def admin_search_sec_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not has_admin_permission(update.effective_user.id, "gallery"):
         return ConversationHandler.END
-    
+
     text = update.message.text.strip()
     if text.lower() == "cancel":
         await update.message.reply_text("החיפוש בוטל.", reply_markup=get_admin_inline_keyboard())
         return ConversationHandler.END
-        
-    seconds = parse_smart_time(text)
-    if seconds < 0:
-        await update.message.reply_text("❌ פורמט לא תקין. השתמש במספר (שניות) או דקות:שניות (למשל 1:20).")
+
+    time_range = parse_smart_time_range(text)
+    if not time_range:
+        await update.message.reply_text(
+            "❌ פורמט לא תקין. כתוב זמן יחיד כמו `26` או `1:20`, או טווח כמו `10-13` או `1:30-22:30`.",
+            parse_mode="Markdown",
+        )
         return ADMIN_VIDEO_SEARCH_SECONDS
-    
+
+    first, last = time_range
     videos = load_json(VIDEOS_FILE)
-    results = [v for v in videos if v.get("duration") == seconds]
-    
+    results = [
+        video for video in videos
+        if isinstance(video, dict) and first <= int(video.get("duration", 0) or 0) <= last
+    ]
+    results.sort(key=lambda video: (int(video.get("duration", 0) or 0), str(video.get("entry_id", ""))))
+
     if not results:
-        await update.message.reply_text(f"❌ לא נמצאו סרטונים באורך {text}.", reply_markup=get_admin_inline_keyboard())
+        await update.message.reply_text(
+            f"❌ לא נמצאו סרטונים בטווח {format_duration(first)}–{format_duration(last)}.",
+            reply_markup=get_admin_inline_keyboard(),
+        )
         return ConversationHandler.END
-    
-    await update.message.reply_text(f"🔎 נמצאו {len(results)} סרטונים באורך {text}. שולח כעת...")
-    
+
+    label = format_duration(first) if first == last else f"{format_duration(first)}–{format_duration(last)}"
+    await clear_sent_duplicate_group_media(context)
+    await update.message.reply_text(f"🔎 נמצאו {len(results)} סרטונים בטווח {label}. שולח מהקצר לארוך...")
+
     success = 0
-    for v in results:
+    sent_message_ids = []
+    for video in results:
         try:
-            sent = await send_admin_video_with_delete_button(context.bot, v["file_id"], v["entry_id"])
-            if sent:
+            sent = await send_admin_video_with_delete_button(context.bot, video["file_id"], video["entry_id"])
+            if sent and sent != "INVALID_FILE_ID":
                 success += 1
-            await asyncio.sleep(0.3)
+                sent_message_ids.append(sent.message_id)
+            await asyncio.sleep(0.15)
         except Exception:
-            pass
-    
-    await update.message.reply_text(f"✅ סיימתי לשלוח את תוצאות החיפוש ({success}/{len(results)} נשלחו).", reply_markup=get_admin_inline_keyboard())
+            logger.exception("Failed to send time-range search result")
+    context.user_data["dup_sent_media_message_ids"] = sent_message_ids
+
+    await update.message.reply_text(
+        f"✅ סיימתי לשלוח את תוצאות החיפוש ({success}/{len(results)} נשלחו).",
+        reply_markup=get_admin_inline_keyboard(),
+    )
     return ConversationHandler.END
 
 # ─── Admin: Private Category Management ───────────────────────────────────────
@@ -2829,7 +2897,7 @@ async def admin_cat_browse_page(update: Update, context: ContextTypes.DEFAULT_TY
     ]
     await query.edit_message_text(
         f"📂 *{category}* — סרטון *{page + 1}/{len(videos)}*\n\n"
-        f"⏱ אורך: {video.get('duration', 0)} שניות",
+        f"⏱ אורך: {format_duration(video.get('duration', 0))}",
         parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup(buttons),
     )
@@ -4056,7 +4124,7 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text(
         f"✅ הסרטון נוסף למאגר ({len(videos)} בסך הכול).\n"
-        f"⏱ אורך: {video.duration or 0} שניות\n"
+        f"⏱ אורך: {format_duration(video.duration or 0)}\n"
         "📁 קטגוריה: כללי\n\n"
         "אפשר לשייך קטגוריה אחר כך דרך גלריית סרטונים ← קטגוריות ← מיון לקטגוריות."
     )
