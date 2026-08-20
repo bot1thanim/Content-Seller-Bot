@@ -197,7 +197,7 @@ async def run():
         assert actions[-1]["action"] == "test_action"
         # Owner can define a manager and toggle only explicit permissions.
         settings = bot.load_settings()
-        settings["admin_managers"] = {"12345": {"name": "tester", "permissions": ["gallery"]}}
+        settings["admin_managers"] = {"12345": {"name": "tester", "permissions": ["assistant", "gallery"]}}
         bot.save_settings(settings)
         assert bot.is_admin(12345)
         assert bot.has_admin_permission(12345, "gallery")
@@ -231,13 +231,14 @@ async def run():
             "audit_log": (["admin_menu_system"], "admin_backup"),
             "backup": (["admin_menu_system"], "admin_delete"),
             "dangerous_delete": (["admin_menu_system"], "admin_backup"),
+            "assistant": (["admin_assistant"], "admin_backup"),
         }
         for permission, (expected_controls, blocked_callback) in permission_controls.items():
             settings = bot.load_settings()
             settings["admin_managers"]["12345"]["permissions"] = [permission]
             bot.save_settings(settings)
-            assert button_callbacks(bot.get_admin_inline_keyboard(12345)) == ["admin_assistant", *expected_controls]
-            for allowed_callback in ["admin_assistant", *expected_controls]:
+            assert button_callbacks(bot.get_admin_inline_keyboard(12345)) == expected_controls
+            for allowed_callback in expected_controls:
                 assert await gate_allows(allowed_callback, 12345), (permission, allowed_callback)
             assert not await gate_allows("admin_managers", 12345), permission
             assert not await gate_allows(blocked_callback, 12345), permission
@@ -250,7 +251,7 @@ async def run():
 
         # The free command assistant parses only permitted commands and sends results in a safe order.
         settings = bot.load_settings()
-        settings["admin_managers"]["12345"]["permissions"] = ["gallery"]
+        settings["admin_managers"]["12345"]["permissions"] = ["assistant", "gallery"]
         bot.save_settings(settings)
         assistant_bot = FakeBot()
         assistant_message = FakeMessage("שלח סרטונים מ-10 עד 20 שניות")
@@ -266,9 +267,9 @@ async def run():
         assert "לא זיהיתי" in blocked_assistant_message.replies[-1][0]
 
         settings = bot.load_settings()
-        settings["admin_managers"]["12345"]["permissions"] = ["duplicates"]
+        settings["admin_managers"]["12345"]["permissions"] = ["assistant", "duplicates"]
         bot.save_settings(settings)
-        duplicate_assistant_message = FakeMessage("מצא כפילויות")
+        duplicate_assistant_message = FakeMessage("תמצא סרטונים שחשודים בכפילויות")
         duplicate_assistant_update = SimpleNamespace(effective_user=SimpleNamespace(id=12345), message=duplicate_assistant_message)
         assert await bot.admin_assistant_command(duplicate_assistant_update, SimpleNamespace(bot=FakeBot(), user_data={})) == bot.ConversationHandler.END
         assert "admin_dup_scan" in button_callbacks(duplicate_assistant_message.replies[-1][1]["reply_markup"])

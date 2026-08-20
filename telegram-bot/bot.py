@@ -369,6 +369,7 @@ def save_settings(s: dict):
 
 
 ADMIN_PERMISSIONS = [
+    ("assistant", "🤖 שימוש בעוזר פקודות"),
     ("gallery", "🎬 גלריה, העלאה וקטגוריות"),
     ("duplicates", "🔎 כפילויות וסל מיחזור"),
     ("users", "👥 משתמשים, הזמנות ותמיכה"),
@@ -411,8 +412,10 @@ def has_admin_permission(user_id: int, permission: str) -> bool:
 
 def callback_permission(callback_data: str) -> str | None:
     """Map private callback data to its required permission; None means owner-only/unknown."""
-    if callback_data in {"admin_panel", "back_admin", "admin_assistant"}:
+    if callback_data in {"admin_panel", "back_admin"}:
         return "panel"
+    if callback_data == "admin_assistant":
+        return "assistant"
     if callback_data == "admin_gallery":
         return "gallery_or_duplicates"
     if callback_data.startswith((
@@ -739,8 +742,8 @@ def get_admin_inline_keyboard(user_id: int = ADMIN_ID):
         if has_admin_permission(user_id, permission):
             rows.append(buttons)
 
-    # Every administrator can use the free text-command assistant; execution remains permission-scoped.
-    if is_admin(user_id):
+    # The owner can grant or remove this dedicated assistant permission for every manager.
+    if has_admin_permission(user_id, "assistant"):
         rows.append([InlineKeyboardButton("🤖 עוזר פקודות", callback_data="admin_assistant")])
 
     # Existing day-to-day controls stay visible on the main panel.
@@ -1477,17 +1480,25 @@ def _assistant_examples(user_id: int) -> list[str]:
     if has_admin_permission(user_id, "gallery"):
         examples.extend([
             "• שלח סרטונים מ-10 עד 20 שניות",
-            "• שלח סרטונים מ-1:30 עד 2:10",
-            "• שלח סרטונים מספר 10 עד 28",
-            "• פתח גלריה",
-            "• פתח קטגוריות",
+            "• תשלח לי סרטונים בין 1:30 ל-2:10",
+            "• חפש מספרים 10 עד 28",
+            "• פתח גלריה או קטגוריות",
+            "• שלח את כל הסרטונים",
         ])
     if has_admin_permission(user_id, "duplicates"):
         examples.extend(["• מצא כפילויות", "• פתח סל מיחזור"])
     if has_admin_permission(user_id, "users"):
-        examples.append("• הצג סטטיסטיקה")
+        examples.extend(["• הצג סטטיסטיקה", "• פתח הזמנות", "• פתח רשימת משתמשים"])
+    if has_admin_permission(user_id, "user_messages"):
+        examples.append("• שלח למשתמש או אשר תשלום")
+    if has_admin_permission(user_id, "broadcast"):
+        examples.append("• הודעה לכולם")
+    if has_admin_permission(user_id, "coins"):
+        examples.append("• פתח מטבעות, קופונים או דרגות")
     if has_admin_permission(user_id, "backup"):
-        examples.append("• צור גיבוי")
+        examples.extend(["• צור גיבוי", "• שחזר גיבוי"])
+    if has_admin_permission(user_id, "audit_log"):
+        examples.append("• פתח יומן פעולות")
     return examples or ["• אין כרגע פעולות שמותר לבצע עם העוזר."]
 
 
@@ -1495,7 +1506,7 @@ async def admin_assistant_start(update: Update, context: ContextTypes.DEFAULT_TY
     query = update.callback_query
     await query.answer()
     user_id = query.from_user.id
-    if not is_admin(user_id):
+    if not has_admin_permission(user_id, "assistant"):
         return ConversationHandler.END
     text = (
         "🤖 *עוזר פקודות חכם*\n\n"
@@ -1519,7 +1530,10 @@ def _assistant_time_range(text: str) -> tuple[int, int] | None:
     """Extract a time range from Hebrew command text without accepting unrelated numbers."""
     if not any(marker in text for marker in ("שני", "זמן", "אורך", "דקה", ":")):
         return None
-    match = re.search(r"(\d+(?::\d+)?)\s*(?:שניות?|דקות?)?\s*(?:-|עד|ועד)\s*(\d+(?::\d+)?)\s*(?:שניות?|דקות?)?", text)
+    match = re.search(
+        r"(?:בין\s*)?(\d+(?::\d+)?)\s*(?:שניות?|דקות?)?\s*(?:-|עד|ועד|ל-?|ל)\s*(\d+(?::\d+)?)\s*(?:שניות?|דקות?)?",
+        text,
+    )
     if not match:
         return None
     first = parse_smart_time(match.group(1))
@@ -1588,7 +1602,7 @@ def _assistant_action_button(label: str, callback_data: str) -> InlineKeyboardMa
 async def admin_assistant_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Deterministically parse safe Hebrew manager commands without an external AI service."""
     user_id = update.effective_user.id
-    if not is_admin(user_id):
+    if not has_admin_permission(user_id, "assistant"):
         return ConversationHandler.END
     text = _assistant_normalize(update.message.text)
     if text in {"ביטול", "חזור", "חזרה", "יציאה", "צא"}:
@@ -1603,6 +1617,13 @@ async def admin_assistant_command(update: Update, context: ContextTypes.DEFAULT_
         return ADMIN_ASSISTANT_COMMAND
 
     if has_admin_permission(user_id, "gallery"):
+        if ("כל הסרטונים" in text or "כל סרטון" in text) and any(word in text for word in ("שלח", "תשלח")):
+            await update.message.reply_text(
+                "🤖 שליחה של כל המאגר מתחילה רק בלחיצה מודעת.",
+                reply_markup=_assistant_action_button("📤 שלח את כל הסרטונים", "vid_send_all"),
+            )
+            return ConversationHandler.END
+
         time_range = _assistant_time_range(text)
         if time_range and any(word in text for word in ("שלח", "חפש", "סרטון")):
             first, last = time_range
@@ -1640,7 +1661,9 @@ async def admin_assistant_command(update: Update, context: ContextTypes.DEFAULT_
             return ConversationHandler.END
 
     if has_admin_permission(user_id, "duplicates"):
-        if "כפיל" in text and any(word in text for word in ("מצא", "בדוק", "סרוק")):
+        if ("כפיל" in text or "כפול" in text or "חשוד" in text) and any(
+            word in text for word in ("מצא", "תמצא", "בדוק", "תבדוק", "סרוק", "תסרוק", "הראה", "תראה")
+        ):
             callback = "admin_dup_rescan" if "מחדש" in text else "admin_dup_scan"
             label = "🔄 סרוק כפילויות מחדש" if callback.endswith("rescan") else "🔎 מצא כפילויות"
             await update.message.reply_text("🤖 הפקודה מוכנה.", reply_markup=_assistant_action_button(label, callback))
@@ -1649,12 +1672,49 @@ async def admin_assistant_command(update: Update, context: ContextTypes.DEFAULT_
             await update.message.reply_text("🤖 פותח את סל המיחזור.", reply_markup=_assistant_action_button("🗑 פתח סל מיחזור", "admin_trash_page_0"))
             return ConversationHandler.END
 
-    if has_admin_permission(user_id, "users") and ("סטט" in text or "נתונים" in text):
-        await update.message.reply_text("🤖 פותח את הסטטיסטיקה.", reply_markup=_assistant_action_button("📊 הצג סטטיסטיקה", "admin_stats"))
+    if has_admin_permission(user_id, "users"):
+        if "סטט" in text or "נתונים" in text:
+            await update.message.reply_text("🤖 פותח את הסטטיסטיקה.", reply_markup=_assistant_action_button("📊 הצג סטטיסטיקה", "admin_stats"))
+            return ConversationHandler.END
+        if "הזמנ" in text:
+            await update.message.reply_text("🤖 פותח את ההזמנות.", reply_markup=_assistant_action_button("🧾 פתח הזמנות", "admin_orders_page_0"))
+            return ConversationHandler.END
+        if "משתמש" in text and any(word in text for word in ("רשימ", "הצג", "פתח")):
+            await update.message.reply_text("🤖 פותח את רשימת המשתמשים.", reply_markup=_assistant_action_button("👥 פתח רשימת משתמשים", "users_page_0"))
+            return ConversationHandler.END
+
+    if has_admin_permission(user_id, "user_messages"):
+        if "אשר" in text and "תשלום" in text:
+            await update.message.reply_text("🤖 פותח אישור תשלום.", reply_markup=_assistant_action_button("✅ אישור תשלום", "admin_approve"))
+            return ConversationHandler.END
+        if "שלח" in text and "משתמש" in text:
+            await update.message.reply_text("🤖 פותח שליחה למשתמש.", reply_markup=_assistant_action_button("📩 שלח למשתמש", "admin_send"))
+            return ConversationHandler.END
+
+    if has_admin_permission(user_id, "broadcast") and ("הודעה לכולם" in text or "שלח לכולם" in text or "פרסם" in text):
+        await update.message.reply_text("🤖 פותח הודעה לכל המשתמשים.", reply_markup=_assistant_action_button("📢 הודעה לכולם", "admin_broadcast"))
+        return ConversationHandler.END
+
+    if has_admin_permission(user_id, "coins"):
+        if "קופון" in text:
+            await update.message.reply_text("🤖 פותח ניהול קופונים.", reply_markup=_assistant_action_button("🎟 ניהול קופונים", "admin_coupons"))
+            return ConversationHandler.END
+        if "דרג" in text or "vip" in text:
+            await update.message.reply_text("🤖 פותח ניהול דרגות.", reply_markup=_assistant_action_button("💎 ניהול דרגות", "admin_vip"))
+            return ConversationHandler.END
+        if "מטבע" in text:
+            await update.message.reply_text("🤖 פותח ניהול מטבעות.", reply_markup=_assistant_action_button("🪙 ניהול מטבעות", "admin_coins"))
+            return ConversationHandler.END
+
+    if has_admin_permission(user_id, "audit_log") and ("יומן" in text or "פעולות" in text):
+        await update.message.reply_text("🤖 פותח את יומן הפעולות.", reply_markup=_assistant_action_button("📜 יומן פעולות", "admin_actions_page_0"))
         return ConversationHandler.END
 
     if has_admin_permission(user_id, "backup") and ("גיבוי" in text and any(word in text for word in ("צור", "עשה", "הכן"))):
         await update.message.reply_text("🤖 יצירת הגיבוי דורשת לחיצה מודעת.", reply_markup=_assistant_action_button("💾 צור גיבוי ZIP", "admin_backup"))
+        return ConversationHandler.END
+    if has_admin_permission(user_id, "backup") and ("שחזור" in text or "שחזר" in text):
+        await update.message.reply_text("🤖 שחזור דורש בחירת קובץ ואישור ידני.", reply_markup=_assistant_action_button("📥 שחזור גיבוי", "admin_restore"))
         return ConversationHandler.END
 
     await update.message.reply_text(
