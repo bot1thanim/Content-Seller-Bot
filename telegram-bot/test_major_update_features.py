@@ -195,6 +195,13 @@ async def run():
         bot.log_admin_action(owner, "test_action", {"ok": True})
         actions = bot.load_json(bot.ADMIN_ACTIONS_FILE)
         assert actions[-1]["action"] == "test_action"
+        # An empty assistant-manager list offers a direct manager-creation action.
+        empty_assistant_list = FakeUpdate("admin_mgr_assistant_list", owner)
+        await bot.admin_manager_assistant_list(empty_assistant_list, SimpleNamespace(user_data={}))
+        empty_assistant_buttons = button_callbacks(empty_assistant_list.callback_query.edits[-1][1]["reply_markup"])
+        assert "admin_mgr_add" in empty_assistant_buttons
+        assert "עדיין לא הוספת מנהל" in empty_assistant_list.callback_query.edits[-1][0]
+
         # Owner can define a manager and toggle only explicit permissions.
         settings = bot.load_settings()
         settings["admin_managers"] = {"12345": {"name": "tester", "permissions": ["assistant", "gallery"], "assistant_capabilities": ["gallery"]}}

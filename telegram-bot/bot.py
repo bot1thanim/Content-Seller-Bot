@@ -1438,9 +1438,18 @@ async def admin_manager_assistant_list(update: Update, context: ContextTypes.DEF
         )]
         for manager_id, record in managers.items()
     ]
+    if not managers:
+        buttons.append([InlineKeyboardButton("➕ הוסף מנהל חדש", callback_data="admin_mgr_add")])
+        text = (
+            "🤖 *הגדרות עוזר למנהלים*\n\n"
+            "עדיין לא הוספת מנהל, ולכן אין מנהל לבחירה. לחץ על הכפתור למטה, שלח את מזהה המשתמש שלו, "
+            "ואז תוכל לבחור לו הרשאות ויכולות עוזר."
+        )
+    else:
+        text = "🤖 *הגדרות עוזר למנהלים*\n\nבחר מנהל כדי להפעיל או לבטל את יכולות העוזר שלו."
     buttons.append([InlineKeyboardButton("🔙 חזרה לניהול מנהלים", callback_data="admin_managers")])
     await query.edit_message_text(
-        "🤖 *הגדרות עוזר למנהלים*\n\nבחר מנהל כדי להפעיל או לבטל את יכולות העוזר שלו.",
+        text,
         parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup(buttons),
     )
