@@ -113,6 +113,11 @@ async def run():
         bot.normalize_video_categories(videos[0])
         bot.save_json(bot.VIDEOS_FILE, videos)
         assert set(bot.video_categories(bot.load_json(bot.VIDEOS_FILE)[0])) == {"ישראלי", "קצר"}
+        legacy_random_video = {"file_id": "legacy-random", "duration": 9, "category": "כללי"}
+        bot.normalize_video_categories(legacy_random_video)
+        assert bot.video_categories(legacy_random_video) == ["רנדומלי"]
+        assert "כללי" not in bot._admin_categories()
+        assert bot._admin_categories() == sorted(bot._admin_categories(), key=lambda category: category.casefold())
         # Automatic duplicate delivery sends the first group immediately and cleans it on navigation.
         fake_bot = FakeBot()
         context = SimpleNamespace(bot=fake_bot, user_data={})
@@ -148,12 +153,16 @@ async def run():
         # A manual backup containing the admin audit file must reach preview safely.
         restore_archive = io.BytesIO()
         with zipfile.ZipFile(restore_archive, "w", zipfile.ZIP_DEFLATED) as archive:
-            archive.writestr("videos.json", "[]")
+            archive.writestr("videos.json", '[{"file_id": "legacy-restore", "duration": 15, "category": "כללי"}]')
+            archive.writestr("settings.json", '{"categories": ["כללי", "ישראלי"]}')
             archive.writestr("admin_actions.json", "[]")
         restore_payloads = bot.parse_restore_archive(restore_archive.getvalue())
         restore_preview = bot.restore_summary(restore_payloads)
         assert "יומן פעולות מנהל: 0" in restore_preview
-
+        assert restore_payloads["videos.json"][0]["category"] == "רנדומלי"
+        assert "רנדומלי" in restore_payloads["settings.json"]["categories"]
+        assert "כללי" not in restore_payloads["settings.json"]["categories"]
+        
         # Smart time and number parsing accept inclusive single values and ranges.
         assert bot.format_duration(70) == "1:10"
         assert bot.format_duration(26) == "26 שניות"

@@ -182,19 +182,41 @@ def save_json(filepath, data):
     tmp.replace(filepath)
 
 
+DEFAULT_CATEGORY = "רנדומלי"
+LEGACY_DEFAULT_CATEGORY = "כללי"
+
+
+def normalize_category_name(category: str) -> str:
+    """Map the legacy default category to the current random-category name."""
+    cleaned = str(category).strip()
+    return DEFAULT_CATEGORY if cleaned == LEGACY_DEFAULT_CATEGORY else cleaned
+
+
+def normalize_category_list(categories) -> list[str]:
+    """Normalize, deduplicate and alphabetically order private category names."""
+    cleaned = [
+        normalize_category_name(category)
+        for category in (categories if isinstance(categories, list) else [])
+        if isinstance(category, str) and str(category).strip()
+    ]
+    if DEFAULT_CATEGORY not in cleaned:
+        cleaned.append(DEFAULT_CATEGORY)
+    return sorted(set(cleaned), key=lambda category: category.casefold())
+
+
 def video_categories(video: dict) -> list[str]:
     """Return normalized private category memberships, supporting legacy single-category data."""
     if not isinstance(video, dict):
-        return ["כללי"]
+        return [DEFAULT_CATEGORY]
     raw = video.get("categories")
     if isinstance(raw, list):
-        categories = [str(item).strip() for item in raw if isinstance(item, str) and item.strip()]
+        categories = [normalize_category_name(item) for item in raw if isinstance(item, str) and item.strip()]
     else:
-        legacy = video.get("category", "כללי")
-        categories = [str(legacy).strip()] if isinstance(legacy, str) and legacy.strip() else []
+        legacy = video.get("category", LEGACY_DEFAULT_CATEGORY)
+        categories = [normalize_category_name(legacy)] if isinstance(legacy, str) and legacy.strip() else []
     # Keep order stable while removing duplicates.
     unique = list(dict.fromkeys(categories))
-    return unique or ["כללי"]
+    return unique or [DEFAULT_CATEGORY]
 
 
 def normalize_video_categories(video: dict) -> bool:
@@ -235,6 +257,13 @@ def normalize_restored_videos(videos):
     return videos
 
 
+def normalize_restored_settings(settings):
+    """Keep old backups compatible after the default category was renamed."""
+    if isinstance(settings, dict):
+        settings["categories"] = normalize_category_list(settings.get("categories", []))
+    return settings
+
+
 def parse_restore_archive(raw_bytes: bytes) -> dict:
     """Validate a ZIP fully in memory and return only allowed data-file payloads."""
     if len(raw_bytes) > MAX_RESTORE_ARCHIVE_BYTES:
@@ -267,6 +296,10 @@ def parse_restore_archive(raw_bytes: bytes) -> dict:
         raise ValueError("לא נמצאו קובצי נתונים מוכרים בגיבוי.")
     if "videos.json" in payloads:
         payloads["videos.json"] = normalize_restored_videos(payloads["videos.json"])
+    if "trash.json" in payloads:
+        payloads["trash.json"] = normalize_restored_videos(payloads["trash.json"])
+    if "settings.json" in payloads:
+        payloads["settings.json"] = normalize_restored_settings(payloads["settings.json"])
     return payloads
 
 
@@ -361,7 +394,7 @@ def load_settings() -> dict:
     s.setdefault("referral_multiplier", 1.0)
     s.setdefault("maintenance", False)
     s.setdefault("waiting_users", [])
-    s.setdefault("categories", ["כללי"])
+    s["categories"] = normalize_category_list(s.get("categories", []))
     return s
 
 def save_settings(s: dict):
@@ -3398,15 +3431,8 @@ async def admin_search_sec_input(update: Update, context: ContextTypes.DEFAULT_T
 
 
 def _admin_categories() -> list[str]:
-    settings = load_settings()
-    categories = settings.get("categories", ["כללי"])
-    if not isinstance(categories, list):
-        categories = ["כללי"]
-    categories = [str(category).strip() for category in categories if str(category).strip()]
-    if "כללי" not in categories:
-        categories.insert(0, "כללי")
-    # Preserve order while discarding repeated names.
-    return list(dict.fromkeys(categories))
+    """Return all private categories in Hebrew alphabetical order, including רנדומלי."""
+    return normalize_category_list(load_settings().get("categories", []))
 
 
 def _valid_category_name(name: str) -> str | None:
@@ -3419,9 +3445,10 @@ def _valid_category_name(name: str) -> str | None:
 async def admin_categories_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
+    await clear_sent_duplicate_group_media(context)
     categories = _admin_categories()
     text = "🏷 *קטגוריות — כלי ניהול פרטי*\n\nהקטגוריות הקיימות:\n" + "\n".join(f"• {category}" for category in categories)
-    text += "\n\nהקטגוריות אינן מוצגות למשתמשים ואינן משפיעות על הבחירה האקראית שלהם."
+    text += "\n\nהקטגוריות אינן מוצגות למשתמשים כרגע. בעתיד, בחירה ב׳רנדומלי׳ תבחר סרטון מתוך קטגוריה זו באופן אקראי."
     buttons = [
         [InlineKeyboardButton("📂 עיון ושליחה לפי קטגוריה", callback_data="admin_cat_browse")],
         [InlineKeyboardButton("✏️ עריכת קטגוריות", callback_data="admin_cat_edit")],
@@ -3679,7 +3706,7 @@ async def admin_cat_clone_pick(update: Update, context: ContextTypes.DEFAULT_TYP
 async def admin_cat_merge_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    categories = [category for category in _admin_categories() if category != "כללי"]
+    categories = [category for category in _admin_categories() if category != DEFAULT_CATEGORY]
     buttons = [[InlineKeyboardButton(f"📁 {category}", callback_data=f"cat_merge_source_{index}")]
                for index, category in enumerate(categories)]
     buttons.append([InlineKeyboardButton("🔙 חזרה", callback_data="admin_cat_edit")])
@@ -3757,7 +3784,7 @@ async def admin_cat_merge_confirm(update: Update, context: ContextTypes.DEFAULT_
             updated = [item for item in memberships if not (remove_source and item == source)]
             if target not in updated:
                 updated.append(target)
-            video["categories"] = updated or ["כללי"]
+            video["categories"] = updated or [DEFAULT_CATEGORY]
             normalize_video_categories(video)
             changed += 1
     save_json(VIDEOS_FILE, videos)
@@ -3828,11 +3855,11 @@ async def admin_cat_rename_start(update: Update, context: ContextTypes.DEFAULT_T
     buttons = [
         [InlineKeyboardButton(category, callback_data=f"cat_rename_pick_{index}")]
         for index, category in enumerate(categories)
-        if category != "כללי"
+        if category != DEFAULT_CATEGORY
     ]
     buttons.append([InlineKeyboardButton("🔙 חזרה", callback_data="admin_cat_edit")])
     if len(buttons) == 1:
-        await query.edit_message_text("אין עדיין קטגוריות שניתן לשנות. ׳כללי׳ היא קטגוריית ברירת המחדל הקבועה.", reply_markup=InlineKeyboardMarkup(buttons))
+        await query.edit_message_text("אין עדיין קטגוריות שניתן לשנות. ׳רנדומלי׳ היא קטגוריית ברירת המחדל הקבועה.", reply_markup=InlineKeyboardMarkup(buttons))
         return ConversationHandler.END
     await query.edit_message_text("בחר קטגוריה לשינוי שם:", reply_markup=InlineKeyboardMarkup(buttons))
 
@@ -3842,7 +3869,7 @@ async def admin_cat_rename_pick(update: Update, context: ContextTypes.DEFAULT_TY
     await query.answer()
     index = int(query.data.rsplit("_", 1)[1])
     categories = _admin_categories()
-    if not 0 <= index < len(categories) or categories[index] == "כללי":
+    if not 0 <= index < len(categories) or categories[index] == DEFAULT_CATEGORY:
         await query.answer("הקטגוריה אינה זמינה לשינוי.", show_alert=True)
         return ConversationHandler.END
     context.user_data["category_rename_old"] = categories[index]
@@ -3865,7 +3892,7 @@ async def admin_cat_rename_input(update: Update, context: ContextTypes.DEFAULT_T
     if new_name in categories:
         await update.message.reply_text("⚠️ קטגוריה בשם זה כבר קיימת.")
         return ADMIN_CATEGORY_RENAME
-    if old_name not in categories or old_name == "כללי":
+    if old_name not in categories or old_name == DEFAULT_CATEGORY:
         await update.message.reply_text("❌ לא ניתן לשנות את הקטגוריה הזו.")
         return ConversationHandler.END
 
@@ -3895,13 +3922,13 @@ async def admin_cat_delete_start(update: Update, context: ContextTypes.DEFAULT_T
     buttons = [
         [InlineKeyboardButton(f"🗑 {category}", callback_data=f"cat_delete_pick_{index}")]
         for index, category in enumerate(categories)
-        if category != "כללי"
+        if category != DEFAULT_CATEGORY
     ]
     buttons.append([InlineKeyboardButton("🔙 חזרה", callback_data="admin_cat_edit")])
     if len(buttons) == 1:
-        await query.edit_message_text("אין עדיין קטגוריות שניתן להסיר. ׳כללי׳ היא קטגוריית ברירת המחדל הקבועה.", reply_markup=InlineKeyboardMarkup(buttons))
+        await query.edit_message_text("אין עדיין קטגוריות שניתן להסיר. ׳רנדומלי׳ היא קטגוריית ברירת המחדל הקבועה.", reply_markup=InlineKeyboardMarkup(buttons))
         return
-    await query.edit_message_text("בחר קטגוריה להסרה. הסרטונים שלה יעברו ל׳כללי׳:", reply_markup=InlineKeyboardMarkup(buttons))
+    await query.edit_message_text("בחר קטגוריה להסרה. הסרטונים שלה יעברו ל׳רנדומלי׳:", reply_markup=InlineKeyboardMarkup(buttons))
 
 
 async def admin_cat_delete_pick(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -3909,12 +3936,12 @@ async def admin_cat_delete_pick(update: Update, context: ContextTypes.DEFAULT_TY
     await query.answer()
     index = int(query.data.rsplit("_", 1)[1])
     categories = _admin_categories()
-    if not 0 <= index < len(categories) or categories[index] == "כללי":
+    if not 0 <= index < len(categories) or categories[index] == DEFAULT_CATEGORY:
         await query.answer("הקטגוריה אינה זמינה להסרה.", show_alert=True)
         return
     category = categories[index]
     await query.edit_message_text(
-        f"האם להסיר את הקטגוריה ׳{category}׳? כל הסרטונים שלה יעברו ל׳כללי׳.",
+        f"האם להסיר את הקטגוריה ׳{category}׳? כל הסרטונים שלה יעברו ל׳רנדומלי׳.",
         reply_markup=InlineKeyboardMarkup([
             [InlineKeyboardButton("✅ כן, הסר", callback_data=f"cat_delete_confirm_{index}")],
             [InlineKeyboardButton("❌ ביטול", callback_data="admin_cat_edit")],
@@ -3927,7 +3954,7 @@ async def admin_cat_delete_confirm(update: Update, context: ContextTypes.DEFAULT
     await query.answer()
     index = int(query.data.rsplit("_", 1)[1])
     categories = _admin_categories()
-    if not 0 <= index < len(categories) or categories[index] == "כללי":
+    if not 0 <= index < len(categories) or categories[index] == DEFAULT_CATEGORY:
         await query.answer("הקטגוריה אינה זמינה להסרה.", show_alert=True)
         return
     removed = categories[index]
@@ -3945,7 +3972,7 @@ async def admin_cat_delete_confirm(update: Update, context: ContextTypes.DEFAULT
             memberships = video_categories(video)
             if removed in memberships:
                 remaining = [item for item in memberships if item != removed]
-                video["categories"] = remaining or ["כללי"]
+                video["categories"] = remaining or [DEFAULT_CATEGORY]
                 normalize_video_categories(video)
                 moved += 1
     save_json(VIDEOS_FILE, videos)
@@ -3954,8 +3981,16 @@ async def admin_cat_delete_confirm(update: Update, context: ContextTypes.DEFAULT
     await admin_categories_menu(update, context)
 
 
+def _category_sort_videos() -> list[dict]:
+    """Return sortable videos from the shortest to the longest, with a stable tie-breaker."""
+    return sorted(
+        load_videos_with_entry_ids(),
+        key=lambda video: (int(video.get("duration", 0) or 0), str(video.get("entry_id", ""))),
+    )
+
+
 async def admin_cat_sort_page(update: Update, context: ContextTypes.DEFAULT_TYPE, page=0):
-    videos = load_videos_with_entry_ids()
+    videos = _category_sort_videos()
     query = update.callback_query
     if not videos:
         await query.edit_message_text("אין סרטונים למיון.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 חזרה", callback_data="admin_categories")]]))
@@ -3967,8 +4002,9 @@ async def admin_cat_sort_page(update: Update, context: ContextTypes.DEFAULT_TYPE
     current_categories = video_categories(video)
     text = (
         f"🏷 *מיון לקטגוריות ({page + 1}/{len(videos)})*\n\n"
-        f"📁 קטגוריות נוכחיות: *{', '.join(current_categories)}*\n"
-        "אפשר לסמן כמה קטגוריות. לחיצה על קטגוריה מוסיפה או מסירה את הסימון."
+        f"⏱ אורך: *{format_duration(video.get('duration', 0))}*\n"
+        f"📁 קטגוריות נוכחיות: *{', '.join(current_categories)}*\n\n"
+        "הסרטונים מסודרים מהקצר לארוך. אפשר לסמן כמה קטגוריות; לחיצה מוסיפה או מסירה סימון."
     )
 
     categories = _admin_categories()
@@ -3993,11 +4029,9 @@ async def admin_cat_sort_page(update: Update, context: ContextTypes.DEFAULT_TYPE
     buttons.append([InlineKeyboardButton("🔙 סיום", callback_data="admin_categories")])
 
     await query.edit_message_text(text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(buttons))
-    try:
-        sent = await context.bot.send_video(chat_id=ADMIN_ID, video=video["file_id"])
+    sent = await send_admin_video_with_delete_button(context.bot, video["file_id"], video["entry_id"])
+    if sent and sent != "INVALID_FILE_ID":
         context.user_data["dup_sent_media_message_ids"] = [sent.message_id]
-    except Exception as exc:
-        logger.warning("Could not show video %s during category sorting: %s", video.get("entry_id"), exc)
 
 
 async def admin_cat_assign(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -4013,22 +4047,28 @@ async def admin_cat_assign(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.answer("הקטגוריה כבר אינה זמינה. חזור ונסה שוב.", show_alert=True)
         return
 
-    videos = load_videos_with_entry_ids()
+    videos = _category_sort_videos()
     if not 0 <= page < len(videos):
         await query.answer("הסרטון כבר אינו זמין. חזור ונסה שוב.", show_alert=True)
         return
     selected_category = categories[category_index]
-    memberships = video_categories(videos[page])
-    if selected_category == "כללי" and selected_category in memberships and len(memberships) == 1:
+    selected_video = videos[page]
+    memberships = video_categories(selected_video)
+    if selected_category == DEFAULT_CATEGORY and selected_category in memberships and len(memberships) == 1:
         await query.answer("כל סרטון חייב להשתייך לפחות לקטגוריה אחת.", show_alert=True)
         return
     if selected_category in memberships:
         memberships = [item for item in memberships if item != selected_category]
     else:
         memberships.append(selected_category)
-    videos[page]["categories"] = memberships or ["כללי"]
-    normalize_video_categories(videos[page])
-    save_json(VIDEOS_FILE, videos)
+    selected_video["categories"] = memberships or [DEFAULT_CATEGORY]
+    normalize_video_categories(selected_video)
+    all_videos = load_videos_with_entry_ids()
+    for index, video in enumerate(all_videos):
+        if video.get("entry_id") == selected_video.get("entry_id"):
+            all_videos[index] = selected_video
+            break
+    save_json(VIDEOS_FILE, all_videos)
     await admin_cat_sort_page(update, context, page)
 
 # ─── Admin: broadcast (enhanced + media) ──────────────────────────────────────
@@ -4754,7 +4794,8 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "file_name": getattr(video, "file_name", None),
         "duration": video.duration or 0,
         "file_size": video.file_size,
-        "category": "כללי",
+        "category": DEFAULT_CATEGORY,
+        "categories": [DEFAULT_CATEGORY],
         "preview": None,
         "file_status": "valid",
         "added_at": datetime.now(timezone.utc).isoformat(),
@@ -4764,7 +4805,7 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         f"✅ הסרטון נוסף למאגר ({len(videos)} בסך הכול).\n"
         f"⏱ אורך: {format_duration(video.duration or 0)}\n"
-        "📁 קטגוריה: כללי\n\n"
+        "📁 קטגוריה: רנדומלי\n\n"
         "אפשר לשייך קטגוריה אחר כך דרך גלריית סרטונים ← קטגוריות ← מיון לקטגוריות."
     )
     return ConversationHandler.END
