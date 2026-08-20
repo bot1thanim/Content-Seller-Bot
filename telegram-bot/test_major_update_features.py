@@ -197,7 +197,7 @@ async def run():
         assert actions[-1]["action"] == "test_action"
         # Owner can define a manager and toggle only explicit permissions.
         settings = bot.load_settings()
-        settings["admin_managers"] = {"12345": {"name": "tester", "permissions": ["assistant", "gallery"]}}
+        settings["admin_managers"] = {"12345": {"name": "tester", "permissions": ["assistant", "gallery"], "assistant_capabilities": ["gallery"]}}
         bot.save_settings(settings)
         assert bot.is_admin(12345)
         assert bot.has_admin_permission(12345, "gallery")
@@ -252,6 +252,7 @@ async def run():
         # The free command assistant parses only permitted commands and sends results in a safe order.
         settings = bot.load_settings()
         settings["admin_managers"]["12345"]["permissions"] = ["assistant", "gallery"]
+        settings["admin_managers"]["12345"]["assistant_capabilities"] = ["gallery"]
         bot.save_settings(settings)
         assistant_bot = FakeBot()
         assistant_message = FakeMessage("שלח סרטונים מ-10 עד 20 שניות")
@@ -264,15 +265,44 @@ async def run():
         blocked_assistant_message = FakeMessage("מצא כפילויות")
         blocked_assistant_update = SimpleNamespace(effective_user=SimpleNamespace(id=12345), message=blocked_assistant_message)
         assert await bot.admin_assistant_command(blocked_assistant_update, assistant_context) == bot.ADMIN_ASSISTANT_COMMAND
-        assert "לא זיהיתי" in blocked_assistant_message.replies[-1][0]
+        assert "לא הייתי בטוח" in blocked_assistant_message.replies[-1][0]
 
         settings = bot.load_settings()
         settings["admin_managers"]["12345"]["permissions"] = ["assistant", "duplicates"]
+        settings["admin_managers"]["12345"]["assistant_capabilities"] = ["duplicates"]
         bot.save_settings(settings)
         duplicate_assistant_message = FakeMessage("תמצא סרטונים שחשודים בכפילויות")
         duplicate_assistant_update = SimpleNamespace(effective_user=SimpleNamespace(id=12345), message=duplicate_assistant_message)
         assert await bot.admin_assistant_command(duplicate_assistant_update, SimpleNamespace(bot=FakeBot(), user_data={})) == bot.ConversationHandler.END
         assert "admin_dup_scan" in button_callbacks(duplicate_assistant_message.replies[-1][1]["reply_markup"])
+
+        # The owner can set every assistant capability inside the selected manager's settings.
+        manager_settings_update = FakeUpdate("admin_mgr_assistant", owner)
+        manager_settings_context = SimpleNamespace(user_data={"selected_manager_id": "12345"})
+        await bot.admin_manager_assistant_menu(manager_settings_update, manager_settings_context)
+        manager_settings_buttons = button_callbacks(manager_settings_update.callback_query.edits[-1][1]["reply_markup"])
+        assert "admin_mgr_assist_toggle_gallery" in manager_settings_buttons
+        assert "admin_mgr_assist_toggle_duplicates" in manager_settings_buttons
+        toggle_update = FakeUpdate("admin_mgr_assist_toggle_gallery", owner)
+        await bot.admin_manager_assistant_toggle(toggle_update, manager_settings_context)
+        assert "gallery" in bot.assistant_capabilities(12345)
+        await bot.admin_manager_assistant_toggle(toggle_update, manager_settings_context)
+        assert "gallery" not in bot.assistant_capabilities(12345)
+
+        # Greeting, clarification, and back control are safe within the assistant conversation.
+        greeting_message = FakeMessage("היי מה קורה")
+        greeting_update = SimpleNamespace(effective_user=SimpleNamespace(id=12345), message=greeting_message)
+        manager_settings = bot.load_settings()
+        manager_settings["admin_managers"]["12345"]["permissions"] = ["assistant", "gallery"]
+        manager_settings["admin_managers"]["12345"]["assistant_capabilities"] = ["gallery"]
+        bot.save_settings(manager_settings)
+        assert await bot.admin_assistant_command(greeting_update, SimpleNamespace(bot=FakeBot(), user_data={})) == bot.ADMIN_ASSISTANT_COMMAND
+        assert "היי" in greeting_message.replies[-1][0]
+        clarification_message = FakeMessage("שלח סרטונים")
+        clarification_update = SimpleNamespace(effective_user=SimpleNamespace(id=12345), message=clarification_message)
+        assert await bot.admin_assistant_command(clarification_update, SimpleNamespace(bot=FakeBot(), user_data={})) == bot.ADMIN_ASSISTANT_COMMAND
+        assert "איזה סרטונים" in clarification_message.replies[-1][0]
+        assert bot.callback_permission("admin_assistant_back") == "assistant"
 
         # Gallery-only and duplicates-only managers enter the same category but receive different controls.
         settings = bot.load_settings()

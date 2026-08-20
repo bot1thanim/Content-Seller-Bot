@@ -383,6 +383,20 @@ ADMIN_PERMISSIONS = [
 ]
 PERMISSION_LABELS = dict(ADMIN_PERMISSIONS)
 
+# These are a second, finer-grained permission layer for commands executed through the assistant.
+# A manager must hold both the regular permission and the matching assistant capability.
+ASSISTANT_CAPABILITIES = [
+    ("gallery", "🎬 חיפוש, עיון ושליחת סרטונים"),
+    ("duplicates", "🔎 כפילויות, סל מיחזור ומחיקה"),
+    ("users", "👥 משתמשים, הזמנות וסטטיסטיקה"),
+    ("user_messages", "📩 שליחה למשתמש ואישור תשלום"),
+    ("broadcast", "📢 הודעה לכל המשתמשים"),
+    ("coins", "🪙 מטבעות, קופונים ודרגות"),
+    ("audit_log", "📜 יומן פעולות"),
+    ("backup", "💾 גיבוי ושחזור"),
+]
+ASSISTANT_CAPABILITY_LABELS = dict(ASSISTANT_CAPABILITIES)
+
 
 def is_owner(user_id: int) -> bool:
     return int(user_id) == ADMIN_ID
@@ -410,11 +424,29 @@ def has_admin_permission(user_id: int, permission: str) -> bool:
     return is_owner(user_id) or permission in admin_permissions(user_id)
 
 
+def assistant_capabilities(user_id: int) -> set[str]:
+    """Return only explicitly enabled assistant capabilities for a manager."""
+    if is_owner(user_id):
+        return set(ASSISTANT_CAPABILITY_LABELS)
+    record = admin_managers().get(str(user_id), {})
+    capabilities = record.get("assistant_capabilities", []) if isinstance(record, dict) else []
+    return {capability for capability in capabilities if capability in ASSISTANT_CAPABILITY_LABELS}
+
+
+def has_assistant_capability(user_id: int, capability: str) -> bool:
+    """Assistant actions require the assistant switch, normal permission, and capability switch."""
+    return (
+        has_admin_permission(user_id, "assistant")
+        and has_admin_permission(user_id, capability)
+        and capability in assistant_capabilities(user_id)
+    )
+
+
 def callback_permission(callback_data: str) -> str | None:
     """Map private callback data to its required permission; None means owner-only/unknown."""
     if callback_data in {"admin_panel", "back_admin"}:
         return "panel"
-    if callback_data == "admin_assistant":
+    if callback_data in {"admin_assistant", "admin_assistant_back"}:
         return "assistant"
     if callback_data == "admin_gallery":
         return "gallery_or_duplicates"
@@ -1350,6 +1382,7 @@ async def admin_manager_add_input(update: Update, context: ContextTypes.DEFAULT_
     managers = settings.setdefault("admin_managers", {})
     record = managers.get(str(manager_id), {})
     record.setdefault("permissions", [])
+    record.setdefault("assistant_capabilities", [])
     record.setdefault("name", "")
     managers[str(manager_id)] = record
     save_settings(settings)
@@ -1371,10 +1404,75 @@ def _manager_permissions_keyboard(manager_id: str) -> InlineKeyboardMarkup:
         mark = "✅" if permission in assigned else "⬜"
         buttons.append([InlineKeyboardButton(f"{mark} {label}", callback_data=f"admin_mgr_toggle_{permission}")])
     buttons.extend([
+        [InlineKeyboardButton("🤖 הגדרות עוזר", callback_data="admin_mgr_assistant")],
         [InlineKeyboardButton("🗑 הסר מנהל", callback_data="admin_mgr_remove")],
         [InlineKeyboardButton("🔙 חזרה לרשימה", callback_data="admin_managers")],
     ])
     return InlineKeyboardMarkup(buttons)
+
+
+def _manager_assistant_keyboard(manager_id: str) -> InlineKeyboardMarkup:
+    record = admin_managers().get(manager_id, {})
+    enabled = set(record.get("assistant_capabilities", [])) if isinstance(record, dict) else set()
+    buttons = []
+    for capability, label in ASSISTANT_CAPABILITIES:
+        mark = "✅" if capability in enabled else "⬜"
+        buttons.append([InlineKeyboardButton(f"{mark} {label}", callback_data=f"admin_mgr_assist_toggle_{capability}")])
+    buttons.append([InlineKeyboardButton("🔙 חזרה להרשאות המנהל", callback_data=f"admin_mgr_pick_{manager_id}")])
+    return InlineKeyboardMarkup(buttons)
+
+
+async def admin_manager_assistant_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if not is_owner(query.from_user.id):
+        return
+    manager_id = context.user_data.get("selected_manager_id")
+    if not manager_id or manager_id not in admin_managers():
+        await query.answer("בחר מנהל מחדש.", show_alert=True)
+        await admin_managers_menu(update, context)
+        return
+    record = admin_managers()[manager_id]
+    title = record.get("name") or manager_id
+    await query.edit_message_text(
+        f"🤖 *הגדרות עוזר — {title}*\n\n"
+        "סמן מה העוזר רשאי לעשות עבור המנהל. פעולה תעבוד רק אם קיימת גם ההרשאה הרגילה המתאימה.",
+        parse_mode="Markdown",
+        reply_markup=_manager_assistant_keyboard(manager_id),
+    )
+
+
+async def admin_manager_assistant_toggle(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if not is_owner(query.from_user.id):
+        return
+    capability = query.data.replace("admin_mgr_assist_toggle_", "")
+    manager_id = context.user_data.get("selected_manager_id")
+    if capability not in ASSISTANT_CAPABILITY_LABELS or not manager_id:
+        await query.answer("נתוני ההרשאה אינם זמינים. בחר מנהל מחדש.", show_alert=True)
+        return
+    settings = load_settings()
+    managers = settings.get("admin_managers", {})
+    record = managers.get(manager_id)
+    if not isinstance(record, dict):
+        await query.answer("המנהל אינו קיים יותר.", show_alert=True)
+        return
+    capabilities = set(record.get("assistant_capabilities", []))
+    if capability in capabilities:
+        capabilities.remove(capability)
+    else:
+        capabilities.add(capability)
+    record["assistant_capabilities"] = sorted(capabilities)
+    managers[manager_id] = record
+    settings["admin_managers"] = managers
+    save_settings(settings)
+    log_admin_action(query.from_user.id, "manager_assistant_capability_changed", {
+        "manager_id": manager_id,
+        "capability": capability,
+        "enabled": capability in capabilities,
+    })
+    await query.edit_message_reply_markup(reply_markup=_manager_assistant_keyboard(manager_id))
 
 
 async def admin_manager_pick(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1477,7 +1575,7 @@ async def back_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def _assistant_examples(user_id: int) -> list[str]:
     """Return only examples that match the requesting administrator's permissions."""
     examples = []
-    if has_admin_permission(user_id, "gallery"):
+    if has_assistant_capability(user_id, "gallery"):
         examples.extend([
             "• שלח סרטונים מ-10 עד 20 שניות",
             "• תשלח לי סרטונים בין 1:30 ל-2:10",
@@ -1485,19 +1583,19 @@ def _assistant_examples(user_id: int) -> list[str]:
             "• פתח גלריה או קטגוריות",
             "• שלח את כל הסרטונים",
         ])
-    if has_admin_permission(user_id, "duplicates"):
+    if has_assistant_capability(user_id, "duplicates"):
         examples.extend(["• מצא כפילויות", "• פתח סל מיחזור"])
-    if has_admin_permission(user_id, "users"):
+    if has_assistant_capability(user_id, "users"):
         examples.extend(["• הצג סטטיסטיקה", "• פתח הזמנות", "• פתח רשימת משתמשים"])
-    if has_admin_permission(user_id, "user_messages"):
+    if has_assistant_capability(user_id, "user_messages"):
         examples.append("• שלח למשתמש או אשר תשלום")
-    if has_admin_permission(user_id, "broadcast"):
+    if has_assistant_capability(user_id, "broadcast"):
         examples.append("• הודעה לכולם")
-    if has_admin_permission(user_id, "coins"):
+    if has_assistant_capability(user_id, "coins"):
         examples.append("• פתח מטבעות, קופונים או דרגות")
-    if has_admin_permission(user_id, "backup"):
+    if has_assistant_capability(user_id, "backup"):
         examples.extend(["• צור גיבוי", "• שחזר גיבוי"])
-    if has_admin_permission(user_id, "audit_log"):
+    if has_assistant_capability(user_id, "audit_log"):
         examples.append("• פתח יומן פעולות")
     return examples or ["• אין כרגע פעולות שמותר לבצע עם העוזר."]
 
@@ -1517,9 +1615,31 @@ async def admin_assistant_start(update: Update, context: ContextTypes.DEFAULT_TY
     await query.edit_message_text(
         text,
         parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ ביטול / חזרה לפאנל", callback_data="back_admin")]]),
+        reply_markup=_assistant_navigation_keyboard(),
     )
     return ADMIN_ASSISTANT_COMMAND
+
+
+def _assistant_navigation_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔙 חזרה לפאנל", callback_data="admin_assistant_back")],
+        [InlineKeyboardButton("❌ ביטול", callback_data="admin_assistant_back")],
+    ])
+
+
+async def admin_assistant_back(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Leave the assistant safely and return to the normal admin panel."""
+    query = update.callback_query
+    await _assistant_clear_previous_media(context, query.from_user.id)
+    await back_admin(update, context)
+    return ConversationHandler.END
+
+
+async def admin_assistant_exit_to_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """The persistent admin-panel keyboard must never be interpreted as an assistant command."""
+    await _assistant_clear_previous_media(context, update.effective_user.id)
+    await admin_panel(update, context)
+    return ConversationHandler.END
 
 
 def _assistant_normalize(text: str) -> str:
@@ -1573,7 +1693,7 @@ async def _assistant_send_videos(
     await update.message.reply_text(f"🤖 נמצאו {len(selected)} סרטונים: {description}. שולח לפי הסדר...")
     sent_ids = []
     success = 0
-    can_delete = has_admin_permission(user_id, "duplicates")
+    can_delete = has_assistant_capability(user_id, "duplicates")
     for video in selected:
         try:
             markup = None
@@ -1589,13 +1709,18 @@ async def _assistant_send_videos(
         except Exception:
             logger.exception("Assistant could not send a selected video")
     context.user_data["assistant_sent_media_message_ids"] = sent_ids
-    await update.message.reply_text(f"✅ העוזר סיים: {success}/{len(selected)} סרטונים נשלחו.")
+    context.user_data["assistant_last_selection_ids"] = [video.get("entry_id") for video in selected if video.get("entry_id")]
+    await update.message.reply_text(
+        f"✅ העוזר סיים: {success}/{len(selected)} סרטונים נשלחו.",
+        reply_markup=_assistant_navigation_keyboard(),
+    )
 
 
 def _assistant_action_button(label: str, callback_data: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [InlineKeyboardButton(label, callback_data=callback_data)],
         [InlineKeyboardButton("🤖 המשך עם העוזר", callback_data="admin_assistant")],
+        [InlineKeyboardButton("🔙 חזרה לפאנל", callback_data="admin_assistant_back")],
     ])
 
 
@@ -1605,18 +1730,48 @@ async def admin_assistant_command(update: Update, context: ContextTypes.DEFAULT_
     if not has_admin_permission(user_id, "assistant"):
         return ConversationHandler.END
     text = _assistant_normalize(update.message.text)
-    if text in {"ביטול", "חזור", "חזרה", "יציאה", "צא"}:
+    if text in {"ביטול", "חזור", "חזרה", "יציאה", "צא", "חזור לפאנל", "חזרה לפאנל"}:
         await _assistant_clear_previous_media(context, user_id)
         await update.message.reply_text("🤖 יצאת מעוזר הפקודות.", reply_markup=get_admin_inline_keyboard(user_id))
         return ConversationHandler.END
-    if text in {"עזרה", "דוגמאות", "מה אתה יודע לעשות", "מה אפשר לעשות"}:
+    if text in {"היי", "הי", "שלום", "מה קורה", "מה נשמע", "בוקר טוב", "ערב טוב"} or text.startswith(("היי ", "הי ", "שלום ")):
+        await update.message.reply_text(
+            "🤖 היי! הכול טוב. מה תרצה שאעשה היום? אפשר לכתוב `עזרה` כדי לראות פעולות שמתאימות להרשאות שלך.",
+            reply_markup=_assistant_navigation_keyboard(),
+        )
+        return ADMIN_ASSISTANT_COMMAND
+    if text in {"תודה", "תודה רבה", "מעולה", "סבבה"}:
+        await update.message.reply_text(
+            "🤖 בשמחה. אני כאן כשתרצה לבצע פעולה נוספת.",
+            reply_markup=_assistant_navigation_keyboard(),
+        )
+        return ADMIN_ASSISTANT_COMMAND
+    if text in {"עזרה", "דוגמאות", "מה אתה יודע לעשות", "מה אפשר לעשות", "מה אתה יכול לעשות"}:
         await update.message.reply_text(
             "🤖 *דוגמאות לפעולות שלך:*\n" + "\n".join(_assistant_examples(user_id)),
             parse_mode="Markdown",
+            reply_markup=_assistant_navigation_keyboard(),
+        )
+        return ADMIN_ASSISTANT_COMMAND
+    if text in {"שוב", "שלח שוב", "תשלח שוב", "שלח את הקודמים", "אותם שוב"}:
+        entry_ids = set(context.user_data.get("assistant_last_selection_ids", []))
+        selected = [video for video in load_json(VIDEOS_FILE) if video.get("entry_id") in entry_ids]
+        if selected and has_assistant_capability(user_id, "gallery"):
+            await _assistant_send_videos(update, context, selected, "מהתוצאה הקודמת")
+        else:
+            await update.message.reply_text(
+                "🤖 אין לי תוצאה קודמת שאפשר לשלוח. כתוב טווח זמן או מספרים, למשל `שלח סרטונים מ-10 עד 20 שניות`.",
+                reply_markup=_assistant_navigation_keyboard(),
+            )
+        return ADMIN_ASSISTANT_COMMAND
+    if ("שלח" in text or "תשלח" in text or "חפש" in text) and any(word in text for word in ("סרטון", "סרטונים", "וידאו")) and not re.search(r"\d", text):
+        await update.message.reply_text(
+            "🤖 בשמחה. איזה סרטונים לחפש? כתוב טווח זמן, למשל `10 עד 20 שניות` או `1:30 עד 2:10`, או טווח מספרים כמו `מספרים 10 עד 28`.",
+            reply_markup=_assistant_navigation_keyboard(),
         )
         return ADMIN_ASSISTANT_COMMAND
 
-    if has_admin_permission(user_id, "gallery"):
+    if has_assistant_capability(user_id, "gallery"):
         if ("כל הסרטונים" in text or "כל סרטון" in text) and any(word in text for word in ("שלח", "תשלח")):
             await update.message.reply_text(
                 "🤖 שליחה של כל המאגר מתחילה רק בלחיצה מודעת.",
@@ -1634,7 +1789,10 @@ async def admin_assistant_command(update: Update, context: ContextTypes.DEFAULT_
             ]
             selected.sort(key=lambda video: (int(video.get("duration", 0) or 0), str(video.get("entry_id", ""))))
             if not selected:
-                await update.message.reply_text(f"🤖 לא נמצאו סרטונים בטווח {format_duration(first)}–{format_duration(last)}.")
+                await update.message.reply_text(
+                    f"🤖 לא נמצאו סרטונים בטווח {format_duration(first)}–{format_duration(last)}. רוצה לנסות טווח אחר?",
+                    reply_markup=_assistant_navigation_keyboard(),
+                )
             else:
                 await _assistant_send_videos(
                     update, context, selected,
@@ -1647,7 +1805,10 @@ async def admin_assistant_command(update: Update, context: ContextTypes.DEFAULT_
             first, last = number_range
             videos = load_json(VIDEOS_FILE)
             if last > len(videos):
-                await update.message.reply_text(f"🤖 המספרים חייבים להיות בין 1 ל-{len(videos)}.")
+                await update.message.reply_text(
+                    f"🤖 המספרים חייבים להיות בין 1 ל-{len(videos)}. כתוב טווח אחר.",
+                    reply_markup=_assistant_navigation_keyboard(),
+                )
             else:
                 selected = videos[first - 1:last]
                 await _assistant_send_videos(update, context, selected, f"במספרים {first}-{last}")
@@ -1660,7 +1821,7 @@ async def admin_assistant_command(update: Update, context: ContextTypes.DEFAULT_
             await update.message.reply_text("🤖 פותח את הקטגוריות.", reply_markup=_assistant_action_button("🏷 פתח קטגוריות", "admin_categories"))
             return ConversationHandler.END
 
-    if has_admin_permission(user_id, "duplicates"):
+    if has_assistant_capability(user_id, "duplicates"):
         if ("כפיל" in text or "כפול" in text or "חשוד" in text) and any(
             word in text for word in ("מצא", "תמצא", "בדוק", "תבדוק", "סרוק", "תסרוק", "הראה", "תראה")
         ):
@@ -1672,7 +1833,7 @@ async def admin_assistant_command(update: Update, context: ContextTypes.DEFAULT_
             await update.message.reply_text("🤖 פותח את סל המיחזור.", reply_markup=_assistant_action_button("🗑 פתח סל מיחזור", "admin_trash_page_0"))
             return ConversationHandler.END
 
-    if has_admin_permission(user_id, "users"):
+    if has_assistant_capability(user_id, "users"):
         if "סטט" in text or "נתונים" in text:
             await update.message.reply_text("🤖 פותח את הסטטיסטיקה.", reply_markup=_assistant_action_button("📊 הצג סטטיסטיקה", "admin_stats"))
             return ConversationHandler.END
@@ -1683,7 +1844,7 @@ async def admin_assistant_command(update: Update, context: ContextTypes.DEFAULT_
             await update.message.reply_text("🤖 פותח את רשימת המשתמשים.", reply_markup=_assistant_action_button("👥 פתח רשימת משתמשים", "users_page_0"))
             return ConversationHandler.END
 
-    if has_admin_permission(user_id, "user_messages"):
+    if has_assistant_capability(user_id, "user_messages"):
         if "אשר" in text and "תשלום" in text:
             await update.message.reply_text("🤖 פותח אישור תשלום.", reply_markup=_assistant_action_button("✅ אישור תשלום", "admin_approve"))
             return ConversationHandler.END
@@ -1691,11 +1852,11 @@ async def admin_assistant_command(update: Update, context: ContextTypes.DEFAULT_
             await update.message.reply_text("🤖 פותח שליחה למשתמש.", reply_markup=_assistant_action_button("📩 שלח למשתמש", "admin_send"))
             return ConversationHandler.END
 
-    if has_admin_permission(user_id, "broadcast") and ("הודעה לכולם" in text or "שלח לכולם" in text or "פרסם" in text):
+    if has_assistant_capability(user_id, "broadcast") and ("הודעה לכולם" in text or "שלח לכולם" in text or "פרסם" in text):
         await update.message.reply_text("🤖 פותח הודעה לכל המשתמשים.", reply_markup=_assistant_action_button("📢 הודעה לכולם", "admin_broadcast"))
         return ConversationHandler.END
 
-    if has_admin_permission(user_id, "coins"):
+    if has_assistant_capability(user_id, "coins"):
         if "קופון" in text:
             await update.message.reply_text("🤖 פותח ניהול קופונים.", reply_markup=_assistant_action_button("🎟 ניהול קופונים", "admin_coupons"))
             return ConversationHandler.END
@@ -1706,19 +1867,20 @@ async def admin_assistant_command(update: Update, context: ContextTypes.DEFAULT_
             await update.message.reply_text("🤖 פותח ניהול מטבעות.", reply_markup=_assistant_action_button("🪙 ניהול מטבעות", "admin_coins"))
             return ConversationHandler.END
 
-    if has_admin_permission(user_id, "audit_log") and ("יומן" in text or "פעולות" in text):
+    if has_assistant_capability(user_id, "audit_log") and ("יומן" in text or "פעולות" in text):
         await update.message.reply_text("🤖 פותח את יומן הפעולות.", reply_markup=_assistant_action_button("📜 יומן פעולות", "admin_actions_page_0"))
         return ConversationHandler.END
 
-    if has_admin_permission(user_id, "backup") and ("גיבוי" in text and any(word in text for word in ("צור", "עשה", "הכן"))):
+    if has_assistant_capability(user_id, "backup") and ("גיבוי" in text and any(word in text for word in ("צור", "עשה", "הכן"))):
         await update.message.reply_text("🤖 יצירת הגיבוי דורשת לחיצה מודעת.", reply_markup=_assistant_action_button("💾 צור גיבוי ZIP", "admin_backup"))
         return ConversationHandler.END
-    if has_admin_permission(user_id, "backup") and ("שחזור" in text or "שחזר" in text):
+    if has_assistant_capability(user_id, "backup") and ("שחזור" in text or "שחזר" in text):
         await update.message.reply_text("🤖 שחזור דורש בחירת קובץ ואישור ידני.", reply_markup=_assistant_action_button("📥 שחזור גיבוי", "admin_restore"))
         return ConversationHandler.END
 
     await update.message.reply_text(
-        "🤖 לא זיהיתי פעולה מותרת. כתוב `עזרה` כדי לראות דוגמאות שמתאימות להרשאות שלך."
+        "🤖 לא הייתי בטוח למה התכוונת. נסה לנסח אחרת או כתוב `עזרה` כדי לראות פעולות שמתאימות להרשאות שלך.",
+        reply_markup=_assistant_navigation_keyboard(),
     )
     return ADMIN_ASSISTANT_COMMAND
 
@@ -4704,10 +4866,15 @@ def main():
     )
     assistant_conv = ConversationHandler(
         entry_points=[CallbackQueryHandler(admin_assistant_start, pattern="^admin_assistant$")],
-        states={ADMIN_ASSISTANT_COMMAND: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_assistant_command)]},
+        states={ADMIN_ASSISTANT_COMMAND: [MessageHandler(
+            filters.TEXT & ~filters.COMMAND & ~filters.Regex("^🛠 פאנל אדמין$"),
+            admin_assistant_command,
+        )]},
         fallbacks=[
             CommandHandler("cancel", cancel),
-            CallbackQueryHandler(back_admin, pattern="^back_admin$"),
+            CallbackQueryHandler(admin_assistant_back, pattern="^admin_assistant_back$"),
+            CallbackQueryHandler(admin_assistant_back, pattern="^back_admin$"),
+            MessageHandler(filters.Regex("^🛠 פאנל אדמין$"), admin_assistant_exit_to_panel),
         ],
         per_message=False,
         per_chat=True,
@@ -4766,7 +4933,10 @@ def main():
         ("^admin_menu_system$",         admin_menu_system),
         ("^admin_managers$",            admin_managers_menu),
         (r"^admin_mgr_pick_\d+$",        admin_manager_pick),
+        ("^admin_mgr_assistant$",         admin_manager_assistant_menu),
+        (r"^admin_mgr_assist_toggle_.+$", admin_manager_assistant_toggle),
         (r"^admin_mgr_toggle_.+$",       admin_manager_toggle),
+        ("^admin_assistant_back$",        admin_assistant_back),
         ("^admin_mgr_remove$",           admin_manager_remove),
         ("^admin_stats$",               admin_stats),
         (r"^admin_actions_page_\d+$",    admin_actions_page),
