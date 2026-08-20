@@ -326,6 +326,18 @@ async def run():
         clarification_update = SimpleNamespace(effective_user=SimpleNamespace(id=12345), message=clarification_message)
         assert await bot.admin_assistant_command(clarification_update, SimpleNamespace(bot=FakeBot(), user_data={})) == bot.ADMIN_ASSISTANT_COMMAND
         assert "איזה סרטונים" in clarification_message.replies[-1][0]
+        journal_explanation_message = FakeMessage("מה זה יומן פעולות?")
+        journal_explanation_update = SimpleNamespace(effective_user=SimpleNamespace(id=12345), message=journal_explanation_message)
+        assert await bot.admin_assistant_command(journal_explanation_update, SimpleNamespace(bot=FakeBot(), user_data={})) == bot.ADMIN_ASSISTANT_COMMAND
+        assert "תיעוד של פעולות ניהול" in journal_explanation_message.replies[-1][0]
+        value_explanation_message = FakeMessage("הסבר ערך מטבע")
+        value_explanation_update = SimpleNamespace(effective_user=SimpleNamespace(id=12345), message=value_explanation_message)
+        assert await bot.admin_assistant_command(value_explanation_update, SimpleNamespace(bot=FakeBot(), user_data={})) == bot.ADMIN_ASSISTANT_COMMAND
+        assert "כמה מטבעות משתמש מקבל" in value_explanation_message.replies[-1][0]
+        panel_explanation_message = FakeMessage("מה כל כפתור עושה?")
+        panel_explanation_update = SimpleNamespace(effective_user=SimpleNamespace(id=12345), message=panel_explanation_message)
+        assert await bot.admin_assistant_command(panel_explanation_update, SimpleNamespace(bot=FakeBot(), user_data={})) == bot.ADMIN_ASSISTANT_COMMAND
+        assert "מדריך קצר לפאנל הניהול" in panel_explanation_message.replies[-1][0]
         assert bot.callback_permission("admin_assistant_back") == "assistant"
 
         # Gallery-only and duplicates-only managers enter the same category but receive different controls.
