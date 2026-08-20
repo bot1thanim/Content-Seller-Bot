@@ -1343,13 +1343,16 @@ async def admin_managers_menu(update: Update, context: ContextTypes.DEFAULT_TYPE
     if not is_owner(query.from_user.id):
         return
     managers = admin_managers()
-    buttons = [[InlineKeyboardButton("➕ הוסף מנהל", callback_data="admin_mgr_add")]]
+    buttons = [
+        [InlineKeyboardButton("➕ הוסף מנהל", callback_data="admin_mgr_add")],
+        [InlineKeyboardButton("🤖 הגדרות עוזר למנהלים", callback_data="admin_mgr_assistant_list")],
+    ]
     for manager_id, record in managers.items():
         label = record.get("name") or f"מנהל {manager_id}"
         buttons.append([InlineKeyboardButton(f"👤 {label} ({manager_id})", callback_data=f"admin_mgr_pick_{manager_id}")])
     buttons.append([InlineKeyboardButton("🔙 חזרה לפאנל", callback_data="back_admin")])
     await query.edit_message_text(
-        "👑 *ניהול מנהלים*\n\nבחר מנהל כדי להגדיר את ההרשאות שלו. רק הבעלים יכול להוסיף, לערוך או להסיר מנהלים.",
+        "👑 *ניהול מנהלים*\n\nבחר מנהל כדי להגדיר את ההרשאות שלו, או לחץ על *🤖 הגדרות עוזר למנהלים* כדי לבחור יכולות עוזר. רק הבעלים יכול להוסיף, לערוך או להסיר מנהלים.",
         parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(buttons),
     )
 
@@ -1420,6 +1423,41 @@ def _manager_assistant_keyboard(manager_id: str) -> InlineKeyboardMarkup:
         buttons.append([InlineKeyboardButton(f"{mark} {label}", callback_data=f"admin_mgr_assist_toggle_{capability}")])
     buttons.append([InlineKeyboardButton("🔙 חזרה להרשאות המנהל", callback_data=f"admin_mgr_pick_{manager_id}")])
     return InlineKeyboardMarkup(buttons)
+
+
+async def admin_manager_assistant_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if not is_owner(query.from_user.id):
+        return
+    managers = admin_managers()
+    buttons = [
+        [InlineKeyboardButton(
+            f"🤖 {record.get('name') or manager_id} ({manager_id})",
+            callback_data=f"admin_mgr_assistant_pick_{manager_id}",
+        )]
+        for manager_id, record in managers.items()
+    ]
+    buttons.append([InlineKeyboardButton("🔙 חזרה לניהול מנהלים", callback_data="admin_managers")])
+    await query.edit_message_text(
+        "🤖 *הגדרות עוזר למנהלים*\n\nבחר מנהל כדי להפעיל או לבטל את יכולות העוזר שלו.",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(buttons),
+    )
+
+
+async def admin_manager_assistant_pick(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if not is_owner(query.from_user.id):
+        return
+    manager_id = query.data.replace("admin_mgr_assistant_pick_", "")
+    if manager_id not in admin_managers():
+        await query.answer("המנהל אינו קיים יותר.", show_alert=True)
+        await admin_manager_assistant_list(update, context)
+        return
+    context.user_data["selected_manager_id"] = manager_id
+    await admin_manager_assistant_menu(update, context)
 
 
 async def admin_manager_assistant_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -4932,6 +4970,8 @@ def main():
         ("^admin_menu_communications$", admin_menu_communications),
         ("^admin_menu_system$",         admin_menu_system),
         ("^admin_managers$",            admin_managers_menu),
+        (r"^admin_mgr_assistant_pick_\d+$", admin_manager_assistant_pick),
+        ("^admin_mgr_assistant_list$",    admin_manager_assistant_list),
         (r"^admin_mgr_pick_\d+$",        admin_manager_pick),
         ("^admin_mgr_assistant$",         admin_manager_assistant_menu),
         (r"^admin_mgr_assist_toggle_.+$", admin_manager_assistant_toggle),

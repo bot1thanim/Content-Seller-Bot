@@ -276,6 +276,16 @@ async def run():
         assert await bot.admin_assistant_command(duplicate_assistant_update, SimpleNamespace(bot=FakeBot(), user_data={})) == bot.ConversationHandler.END
         assert "admin_dup_scan" in button_callbacks(duplicate_assistant_message.replies[-1][1]["reply_markup"])
 
+        # Assistant settings are visible immediately from the main manager-management screen.
+        managers_home_update = FakeUpdate("admin_managers", owner)
+        await bot.admin_managers_menu(managers_home_update, SimpleNamespace(user_data={}))
+        managers_home_buttons = button_callbacks(managers_home_update.callback_query.edits[-1][1]["reply_markup"])
+        assert "admin_mgr_assistant_list" in managers_home_buttons
+        assistant_list_update = FakeUpdate("admin_mgr_assistant_list", owner)
+        await bot.admin_manager_assistant_list(assistant_list_update, SimpleNamespace(user_data={}))
+        assistant_list_buttons = button_callbacks(assistant_list_update.callback_query.edits[-1][1]["reply_markup"])
+        assert "admin_mgr_assistant_pick_12345" in assistant_list_buttons
+
         # The owner can set every assistant capability inside the selected manager's settings.
         manager_settings_update = FakeUpdate("admin_mgr_assistant", owner)
         manager_settings_context = SimpleNamespace(user_data={"selected_manager_id": "12345"})
