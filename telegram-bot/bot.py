@@ -34,6 +34,8 @@ from telegram.ext import (
     filters,
 )
 from telegram.error import BadRequest, Conflict, RetryAfter, TimedOut, NetworkError
+from private_bots import PrivateBotStore
+from archive_manifest import archive_manifest_bytes
 
 warnings.filterwarnings("ignore", message=".*per_message=False.*CallbackQueryHandler.*")
 
@@ -61,6 +63,7 @@ SETTINGS_FILE  = DATA_DIR / "settings.json"
 TRASH_FILE     = DATA_DIR / "trash.json"
 ADMIN_ACTIONS_FILE = DATA_DIR / "admin_actions.json"
 DUPLICATE_REVIEWS_FILE = DATA_DIR / "duplicate_reviews.json"
+PRIVATE_BOTS_FILE = DATA_DIR / "private_bots.json"
 AUTO_BACKUPS_DIR = DATA_DIR / "auto_backups"
 MAX_ADMIN_ACTIONS = 2000
 MAX_AUTO_BACKUPS = 30
@@ -77,6 +80,8 @@ BACKUP_ALLOWED_FILES = {
     "trash.json": list,
     "admin_actions.json": list,
     "duplicate_reviews.json": list,
+    # This file may contain encrypted child-bot tokens. Raw tokens must never be written here.
+    "private_bots.json": dict,
 }
 MAX_RESTORE_ARCHIVE_BYTES = 20 * 1024 * 1024
 MAX_RESTORE_UNCOMPRESSED_BYTES = 40 * 1024 * 1024
@@ -157,6 +162,7 @@ def ensure_data_files():
         (TRASH_FILE,     []),
         (ADMIN_ACTIONS_FILE, []),
         (DUPLICATE_REVIEWS_FILE, []),
+        (PRIVATE_BOTS_FILE, PrivateBotStore.empty()),
     ]
     for filepath, default in defaults:
         if not filepath.exists():
@@ -521,7 +527,7 @@ def callback_permission(callback_data: str) -> str | None:
     if callback_data == "admin_gallery":
         return "gallery_or_duplicates"
     if callback_data.startswith((
-        "vid_", "admin_categories", "admin_cat_", "cat_", "admin_repair",
+        "vid_", "admin_categories", "admin_cat_", "cat_", "admin_repair", "admin_archive_export",
         "admin_video_search", "admin_search_sec",
     )):
         return "gallery"
@@ -2502,6 +2508,7 @@ async def admin_gallery(update: Update, context: ContextTypes.DEFAULT_TYPE):
             [InlineKeyboardButton("🎬 עיון בספריה", callback_data="vid_page_0")],
             [InlineKeyboardButton("🏷 קטגוריות", callback_data="admin_categories")],
             [InlineKeyboardButton("📤 שלח את כל הסרטונים", callback_data="vid_send_all")],
+            [InlineKeyboardButton("📦 ייצוא מיון לארכיון", callback_data="admin_archive_export")],
             [InlineKeyboardButton("🛠 תיקון מזהים שבורים", callback_data="admin_repair_start")],
         ])
     if can_manage_duplicates:
@@ -2519,6 +2526,28 @@ async def admin_gallery(update: Update, context: ContextTypes.DEFAULT_TYPE):
 כאן תוכל לנהל את הסרטונים, לאתר כפילויות ולשחזר סרטונים שנמחקו — בהתאם להרשאות שקיבלת."""
     
     await query.edit_message_text(text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(keyboard))
+
+async def admin_archive_export(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Export a portable category manifest without Telegram file identifiers."""
+    query = update.callback_query
+    await query.answer()
+    if not has_admin_permission(query.from_user.id, "gallery"):
+        return
+    videos = load_videos_with_entry_ids()
+    payload = archive_manifest_bytes(videos, load_settings())
+    document = io.BytesIO(payload)
+    document.name = f"content_seller_archive_manifest_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+    await query.message.reply_document(
+        document=document,
+        caption=(
+            "📦 *מניפסט ארכיון נוצר בהצלחה*\n\n"
+            "הקובץ שומר מזהים פנימיים, קטגוריות, משך, גודל ושם קובץ אם קיים. "
+            "הוא אינו כולל `file_id` של Telegram. שמור אותו יחד עם סרטוני המקור בארכיון הפרטי שלך."
+        ),
+        parse_mode="Markdown",
+    )
+    log_admin_action(query.from_user.id, "archive_manifest_export", {"video_count": len(videos)})
+
 
 async def admin_gallery_page(update: Update, context: ContextTypes.DEFAULT_TYPE, page=None):
     query = update.callback_query
@@ -5341,6 +5370,7 @@ def main():
         (r"^users_page_\d+$",           users_page),
         ("^admin_gallery$",             admin_gallery),
         ("^admin_repair_start$",        admin_repair_start),
+        ("^admin_archive_export$",       admin_archive_export),
         ("^admin_dup_scan$",             admin_dup_scan),
         ("^admin_dup_rescan$",           admin_dup_rescan),
         (r"^dup_page_\d+$",            admin_dup_page),
