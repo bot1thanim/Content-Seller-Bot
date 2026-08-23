@@ -22,7 +22,6 @@ from telegram import (
     KeyboardButton,
     InputMediaPhoto,
     InputMediaVideo,
-    Bot,
 )
 from telegram.ext import (
     Application,
@@ -35,14 +34,7 @@ from telegram.ext import (
     filters,
 )
 from telegram.error import BadRequest, Conflict, RetryAfter, TimedOut, NetworkError
-from private_bots import (
-    PRIVATE_BOT_CREATION_COINS,
-    PRIVATE_BOT_CREATION_PAYPAL_NIS,
-    PrivateBotError,
-    PrivateBotStore,
-    TokenCipher,
-    private_bot_public_view,
-)
+from private_bots import PrivateBotStore
 from archive_manifest import archive_manifest_bytes
 
 warnings.filterwarnings("ignore", message=".*per_message=False.*CallbackQueryHandler.*")
@@ -152,8 +144,7 @@ VIP_LEVELS = [
     ADMIN_CATEGORY_RENAME,   # 31
     ADMIN_MANAGER_ADD_ID,    # 32
     ADMIN_ASSISTANT_COMMAND, # 33
-    PRIVATE_BOT_TOKEN,       # 34
-) = range(35)
+) = range(34)
 
 
 # ─── Data helpers ─────────────────────────────────────────────────────────────
@@ -544,7 +535,7 @@ def callback_permission(callback_data: str) -> str | None:
         return "duplicates"
     if callback_data.startswith(("admin_stats", "admin_orders", "users_page", "admin_check", "support_reply")):
         return "users"
-    if callback_data.startswith(("admin_send", "admin_approve", "admin_privatebot", "admin_private_bots")):
+    if callback_data.startswith(("admin_send", "admin_approve")):
         return "user_messages"
     if callback_data.startswith("admin_broadcast"):
         return "broadcast"
@@ -835,292 +826,7 @@ def build_zip_of_data() -> io.BytesIO:
     buf.seek(0)
     return buf
 
-
-# ─── Private bots: paid request and secure token enrollment ───────────────────
-
-def private_bot_store(cipher: TokenCipher | None = None) -> PrivateBotStore:
-    return PrivateBotStore(PRIVATE_BOTS_FILE, cipher)
-
-
-def _private_bot_pending_for_creator(creator_id: int) -> dict | None:
-    pending_states = {"payment_pending", "approved_waiting_token", "configured_waiting_media_sync"}
-    for record in private_bot_store().list_bots():
-        if int(record.get("creator_id", -1)) == int(creator_id) and record.get("state") in pending_states:
-            return record
-    return None
-
-
-def _private_bot_request_link(record: dict) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🔐 הזנת טוקן הבוט", callback_data=f"privatebot_token_{record['id']}")],
-        [InlineKeyboardButton("🔙 חזרה", callback_data="back_main")],
-    ])
-
-
-async def private_bot_purchase_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    if await maintenance_gate(update):
-        return
-    uid = str(query.from_user.id)
-    balance = int(load_json(COINS_FILE).get(uid, 0))
-    pending = _private_bot_pending_for_creator(query.from_user.id)
-    if pending:
-        state_text = {
-            "payment_pending": "יש לך בקשה קיימת שממתינה לאישור מנהל.",
-            "approved_waiting_token": "הבקשה אושרה. אפשר להמשיך להזנת הטוקן.",
-            "configured_waiting_media_sync": "הטוקן נשמר. הבוט ממתין לסנכרון ספריית המדיה.",
-        }.get(pending.get("state"), "יש לך בקשה קיימת.")
-        rows = []
-        if pending.get("state") == "approved_waiting_token":
-            rows.append([InlineKeyboardButton("🔐 הזנת טוקן הבוט", callback_data=f"privatebot_token_{pending['id']}")])
-        rows.append([InlineKeyboardButton("🔙 חזרה", callback_data="back_main")])
-        await query.edit_message_text(
-            f"🤖 *יצירת בוט פרטי*\n\n{state_text}",
-            parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(rows),
-        )
-        return
-    await query.edit_message_text(
-        "🤖 *יצירת בוט פרטי*\n\n"
-        "הבוט הפרטי משתמש באותה מערכת מרכזית, באותו מאגר משתמשים ובאותן הגדרות. "
-        "בעל הבוט אינו מקבל הרשאות ניהול.\n\n"
-        f"🪙 מחיר במטבעות: *{PRIVATE_BOT_CREATION_COINS}*\n"
-        f"💳 מחיר ב־PayPal: *₪{int(PRIVATE_BOT_CREATION_PAYPAL_NIS)}*\n\n"
-        "לאחר תשלום הבקשה ממתינה לאישור מנהל. רק לאחר אישור תקבל מסך מאובטח להזנת טוקן הבוט שלך.",
-        parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton(f"🪙 תשלום במטבעות ({PRIVATE_BOT_CREATION_COINS})", callback_data="privatebot_pay_coins")],
-            [InlineKeyboardButton(f"💳 תשלום ב־PayPal (₪{int(PRIVATE_BOT_CREATION_PAYPAL_NIS)})", callback_data="privatebot_pay_paypal")],
-            [InlineKeyboardButton("🔙 חזרה", callback_data="back_main")],
-        ]),
-    )
-
-
-async def private_bot_pay_coins(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    if await maintenance_gate(update):
-        return
-    if _private_bot_pending_for_creator(query.from_user.id):
-        await query.answer("כבר קיימת בקשת בוט פרטית פעילה עבורך.", show_alert=True)
-        return
-    uid = str(query.from_user.id)
-    coins = load_json(COINS_FILE)
-    balance = int(coins.get(uid, 0))
-    if balance < PRIVATE_BOT_CREATION_COINS:
-        await query.answer(
-            f"אין מספיק מטבעות. חסרים לך {PRIVATE_BOT_CREATION_COINS - balance} מטבעות.",
-            show_alert=True,
-        )
-        return
-    backup = create_auto_backup("private_bot_coin_purchase", query.from_user.id)
-    if backup is None:
-        await query.answer("לא נוצר גיבוי בטיחות. הפעולה בוטלה.", show_alert=True)
-        return
-    record = private_bot_store().create_paid_request(query.from_user.id, "coins")
-    coins[uid] = balance - PRIVATE_BOT_CREATION_COINS
-    save_json(COINS_FILE, coins)
-    log_admin_action(query.from_user.id, "private_bot_coin_request", {"request_id": record["id"]})
-    await alert_admin(
-        context,
-        "🤖 *בקשה חדשה ליצירת בוט פרטי*\n\n"
-        f"👤 משתמש: {query.from_user.first_name} (`{query.from_user.id}`)\n"
-        f"🪙 תשלום: {PRIVATE_BOT_CREATION_COINS} מטבעות\n"
-        f"🆔 בקשה: `{record['id']}`\n\n"
-        "פתח את פאנל הניהול > בקשות בוטים פרטיים כדי לאשר או לדחות.",
-    )
-    await query.edit_message_text(
-        "✅ *הבקשה נרשמה והתשלום במטבעות נשמר.*\n\n"
-        "הבקשה ממתינה לאישור מנהל. לאחר האישור תקבל כאן כפתור מאובטח להזנת הטוקן.",
-        parse_mode="Markdown", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 חזרה", callback_data="back_main")]]),
-    )
-
-
-async def private_bot_pay_paypal(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    if await maintenance_gate(update):
-        return
-    if _private_bot_pending_for_creator(query.from_user.id):
-        await query.answer("כבר קיימת בקשת בוט פרטית פעילה עבורך.", show_alert=True)
-        return
-    record = private_bot_store().create_paid_request(query.from_user.id, "paypal")
-    final_link = f"{PAYPAL_LINK}/{PRIVATE_BOT_CREATION_PAYPAL_NIS:g}"
-    await alert_admin(
-        context,
-        "🤖 *בקשת PayPal חדשה ליצירת בוט פרטי*\n\n"
-        f"👤 משתמש: {query.from_user.first_name} (`{query.from_user.id}`)\n"
-        f"💳 סכום מבוקש: ₪{int(PRIVATE_BOT_CREATION_PAYPAL_NIS)}\n"
-        f"🆔 בקשה: `{record['id']}`\n\n"
-        "המתן לאסמכתת תשלום מהמשתמש ולאחר מכן אשר דרך בקשות בוטים פרטיים.",
-    )
-    await query.edit_message_text(
-        "💳 *תשלום עבור יצירת בוט פרטי*\n\n"
-        f"המחיר הוא *₪{int(PRIVATE_BOT_CREATION_PAYPAL_NIS)}*. לאחר התשלום שלח צילום אסמכתה לתמיכה וציין שמדובר ביצירת בוט פרטי. "
-        "מנהל יאשר את הבקשה ורק אז יישלח לך כפתור הזנת טוקן.\n\n"
-        f"מזהה הבקשה שלך: `{record['id']}`",
-        parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("🔗 מעבר לתשלום ב־PayPal", url=final_link)],
-            [InlineKeyboardButton("💬 שלח אסמכתה לתמיכה", callback_data="support")],
-            [InlineKeyboardButton("🔙 חזרה", callback_data="back_main")],
-        ]),
-    )
-
-
-async def admin_private_bots_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    if not has_admin_permission(query.from_user.id, "user_messages"):
-        return
-    pending = [record for record in private_bot_store().list_bots() if record.get("state") == "payment_pending"]
-    rows = []
-    for record in pending[:20]:
-        creator_id = record["creator_id"]
-        method = "PayPal" if record["payment_method"] == "paypal" else "מטבעות"
-        rows.append([
-            InlineKeyboardButton(f"✅ אשר {creator_id} ({method})", callback_data=f"admin_privatebot_approve_{record['id']}"),
-            InlineKeyboardButton("❌ דחה", callback_data=f"admin_privatebot_reject_{record['id']}"),
-        ])
-    rows.append(_back_to_admin_row())
-    text = "🤖 *בקשות בוטים פרטיים*\n\n"
-    text += f"בקשות שממתינות לאישור: *{len(pending)}*"
-    if not pending:
-        text += "\n\nאין כרגע בקשות שממתינות לאישור."
-    await query.edit_message_text(text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(rows))
-
-
-async def admin_private_bot_approve(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    if not has_admin_permission(query.from_user.id, "user_messages"):
-        return
-    request_id = query.data.replace("admin_privatebot_approve_", "")
-    try:
-        # Do not approve a purchase that cannot safely accept an encrypted token.
-        TokenCipher()
-        record = private_bot_store().approve_paypal_request(request_id, query.from_user.id)
-    except PrivateBotError as exc:
-        await query.answer(str(exc), show_alert=True)
-        return
-    log_admin_action(query.from_user.id, "private_bot_payment_approved", {"request_id": record["id"], "creator_id": record["creator_id"]})
-    try:
-        await context.bot.send_message(
-            chat_id=record["creator_id"],
-            text=(
-                "✅ *הבקשה ליצירת הבוט הפרטי אושרה.*\n\n"
-                "צור בוט חדש דרך BotFather והעתק את הטוקן שלו. לאחר מכן לחץ על הכפתור הבא. "
-                "הטוקן יוצפן ולא יוצג למנהלים או למשתמשים."
-            ),
-            parse_mode="Markdown",
-            reply_markup=_private_bot_request_link(record),
-        )
-    except Exception as exc:
-        logger.warning("Could not notify private-bot creator %s: %s", record["creator_id"], exc)
-    await query.answer("הבקשה אושרה והמשתמש קיבל כפתור להזנת טוקן.", show_alert=True)
-    await admin_private_bots_menu(update, context)
-
-
-async def admin_private_bot_reject(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    if not has_admin_permission(query.from_user.id, "user_messages"):
-        return
-    request_id = query.data.replace("admin_privatebot_reject_", "")
-    if create_auto_backup("private_bot_request_rejection", query.from_user.id) is None:
-        await query.answer("לא נוצר גיבוי בטיחות. הדחייה בוטלה.", show_alert=True)
-        return
-    try:
-        record = private_bot_store().reject_or_cancel(request_id, query.from_user.id, "נדחה על ידי מנהל")
-    except PrivateBotError as exc:
-        await query.answer(str(exc), show_alert=True)
-        return
-    if record.get("payment_method") == "coins":
-        coins = load_json(COINS_FILE)
-        uid = str(record["creator_id"])
-        coins[uid] = int(coins.get(uid, 0)) + PRIVATE_BOT_CREATION_COINS
-        save_json(COINS_FILE, coins)
-    log_admin_action(query.from_user.id, "private_bot_payment_rejected", {"request_id": record["id"], "creator_id": record["creator_id"]})
-    try:
-        refund_text = "הוחזרו לחשבונך 400 מטבעות." if record.get("payment_method") == "coins" else "אם בוצע תשלום, פנה לתמיכה להמשך הטיפול."
-        await context.bot.send_message(
-            chat_id=record["creator_id"],
-            text=f"❌ *הבקשה ליצירת בוט פרטי נדחתה.*\n\n{refund_text}",
-            parse_mode="Markdown",
-        )
-    except Exception:
-        pass
-    await admin_private_bots_menu(update, context)
-
-
-async def private_bot_token_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    request_id = query.data.replace("privatebot_token_", "")
-    record = private_bot_store().get(request_id)
-    if not record or int(record.get("creator_id", -1)) != query.from_user.id:
-        await query.answer("אין לך הרשאה לבקשת בוט זו.", show_alert=True)
-        return ConversationHandler.END
-    if record.get("state") != "approved_waiting_token":
-        await query.answer("בקשה זו אינה ממתינה לטוקן כרגע.", show_alert=True)
-        return ConversationHandler.END
-    context.user_data["private_bot_token_request_id"] = request_id
-    await query.edit_message_text(
-        "🔐 *הזנת טוקן בוט פרטי*\n\n"
-        "שלח עכשיו את הטוקן שקיבלת מ־BotFather. לאחר האימות ההודעה שלך תימחק ככל שניתן, והטוקן יישמר מוצפן בלבד. "
-        "אל תשלח סיסמה לחשבון Telegram או ל־MEGA.\n\n"
-        "אפשר לשלוח /cancel כדי לבטל.",
-        parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 ביטול", callback_data="back_main")]]),
-    )
-    return PRIVATE_BOT_TOKEN
-
-
-async def private_bot_token_receive(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    request_id = context.user_data.get("private_bot_token_request_id")
-    if not request_id:
-        return ConversationHandler.END
-    record = private_bot_store().get(request_id)
-    if not record or int(record.get("creator_id", -1)) != update.effective_user.id:
-        return ConversationHandler.END
-    token = (update.message.text or "").strip()
-    try:
-        cipher = TokenCipher()
-        async with Bot(token=token) as candidate_bot:
-            remote_bot = await candidate_bot.get_me()
-        configured = private_bot_store(cipher).save_token_after_validation(
-            request_id,
-            token,
-            int(remote_bot.id),
-            remote_bot.username,
-        )
-    except PrivateBotError as exc:
-        await update.message.reply_text(f"❌ {exc}\n\nנסה שוב או שלח /cancel.")
-        return PRIVATE_BOT_TOKEN
-    except Exception:
-        await update.message.reply_text("❌ הטוקן לא אומת מול Telegram. בדוק שהעתקת אותו במלואו מ־BotFather ונסה שוב.")
-        return PRIVATE_BOT_TOKEN
-    finally:
-        # Never leave a raw customer token in the private chat if Telegram permits deletion.
-        try:
-            await update.message.delete()
-        except Exception:
-            pass
-    context.user_data.pop("private_bot_token_request_id", None)
-    log_admin_action(update.effective_user.id, "private_bot_token_encrypted", {"request_id": configured["id"], "telegram_bot_id": configured["telegram_bot_id"]})
-    await context.bot.send_message(
-        chat_id=update.effective_chat.id,
-        text=(
-            "✅ *הטוקן אומת ונשמר בצורה מוצפנת.*\n\n"
-            "הבוט הפרטי שלך ממתין כעת לסנכרון מאובטח של ספריית המדיה. הוא לא יופעל לפני שכל הסרטונים הקיימים יהיו זמינים לו, כדי למנוע מצב של בוט ריק או שליחה שגויה."
-        ),
-        parse_mode="Markdown",
-        reply_markup=get_main_keyboard(update.effective_user.id),
-    )
-    return ConversationHandler.END
-
-
-# ─── Keyboard builders ───────────────────────────────────────────────────────
+# ─── Keyboard builders ────────────────────────────────────────────────────────
 
 def get_main_keyboard(user_id):
     vip = get_user_vip(str(user_id))
@@ -1138,7 +844,6 @@ def get_main_keyboard(user_id):
             InlineKeyboardButton("🎟 מימוש קופון", callback_data="coupon_redeem"),
         ],
         [InlineKeyboardButton("ℹ️ איך זה עובד?", callback_data="purchase_help")],
-        [InlineKeyboardButton("🤖 יצירת בוט פרטי", callback_data="privatebot_purchase")],
         [InlineKeyboardButton("💬 תמיכה", callback_data="support")],
     ])
 
@@ -1234,8 +939,6 @@ async def admin_menu_system(update: Update, context: ContextTypes.DEFAULT_TYPE):
         rows.append([InlineKeyboardButton("📜 יומן פעולות", callback_data="admin_actions_page_0")])
     if has_admin_permission(user_id, "backup"):
         rows.append([InlineKeyboardButton("💾 גיבוי ZIP", callback_data="admin_backup"), InlineKeyboardButton("📥 שחזור גיבוי", callback_data="admin_restore")])
-    if has_admin_permission(user_id, "user_messages"):
-        rows.append([InlineKeyboardButton("🤖 בקשות בוטים פרטיים", callback_data="admin_private_bots")])
     if has_admin_permission(user_id, "dangerous_delete"):
         rows.append([InlineKeyboardButton("🔄 איפוס נתונים", callback_data="admin_global_reset"), InlineKeyboardButton("🧹 מחק סרטונים", callback_data="admin_delete")])
     if is_owner(user_id):
@@ -5565,16 +5268,6 @@ def main():
         ],
         per_message=False, per_chat=True,
     )
-    private_bot_token_conv = ConversationHandler(
-        entry_points=[CallbackQueryHandler(private_bot_token_start, pattern=r"^privatebot_token_[0-9a-f]+$")],
-        states={PRIVATE_BOT_TOKEN: [MessageHandler(filters.TEXT & ~filters.COMMAND, private_bot_token_receive)]},
-        fallbacks=[
-            CommandHandler("cancel", cancel),
-            CallbackQueryHandler(back_main, pattern="^back_main$"),
-        ],
-        per_message=False,
-        per_chat=True,
-    )
     support_reply_conv = ConversationHandler(
         entry_points=[CallbackQueryHandler(admin_support_reply_start, pattern=r"^support_reply_\d+$")],
         states={SUPPORT_REPLY_MSG: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_support_reply_send)]},
@@ -5632,7 +5325,7 @@ def main():
         check_conv, send_conv, approve_conv, broadcast_conv, coins_conv, vip_conv,
         coupon_new_conv, multiplier_conv, restore_conv, global_reset_conv,
         video_search_conv, video_search_sec_conv, repair_conv, support_conv, coupon_redeem_conv, support_reply_conv,
-        cat_add_conv, cat_rename_conv, manager_add_conv, assistant_conv, private_bot_token_conv, video_upload_conv
+        cat_add_conv, cat_rename_conv, manager_add_conv, assistant_conv, video_upload_conv
     ]:
         app.add_handler(conv)
 
@@ -5648,9 +5341,6 @@ def main():
         ("^noop$",                      noop_callback),
         ("^payment_method$",            payment_method_menu),
         ("^purchase_help$",             purchase_help),
-        ("^privatebot_purchase$",        private_bot_purchase_menu),
-        ("^privatebot_pay_coins$",       private_bot_pay_coins),
-        ("^privatebot_pay_paypal$",      private_bot_pay_paypal),
         ("^paypal_menu$",               paypal_menu),
         (r"^pp_\d+$",                   paypal_package_selected),
         ("^coins_menu$",                coins_menu),
@@ -5665,9 +5355,6 @@ def main():
         ("^admin_menu_communications$", admin_menu_communications),
         ("^admin_menu_system$",         admin_menu_system),
         ("^admin_managers$",            admin_managers_menu),
-        ("^admin_private_bots$",         admin_private_bots_menu),
-        (r"^admin_privatebot_approve_[0-9a-f]+$", admin_private_bot_approve),
-        (r"^admin_privatebot_reject_[0-9a-f]+$",  admin_private_bot_reject),
         ("^admin_owner_assistant_settings$", admin_owner_assistant_settings),
         (r"^admin_mgr_assistant_pick_\d+$", admin_manager_assistant_pick),
         ("^admin_mgr_assistant_list$",    admin_manager_assistant_list),
