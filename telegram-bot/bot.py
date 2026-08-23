@@ -271,6 +271,11 @@ def normalize_restored_settings(settings):
         settings["categories"] = normalize_category_list(
             settings.get("categories", []), alphabetical=(order_mode == "alphabetical")
         )
+        reviewed_entries = settings.get(CATEGORY_SORT_REVIEWED_KEY, [])
+        settings[CATEGORY_SORT_REVIEWED_KEY] = sorted({
+            str(entry_id) for entry_id in reviewed_entries
+            if isinstance(entry_id, str) and entry_id
+        })
     return settings
 
 
@@ -388,9 +393,35 @@ def load_videos_with_entry_ids():
     return videos
 
 
-async def send_admin_video_with_delete_button(bot, file_id, entry_id, max_attempts=5):
-    """Send one video with a unique delete button and return its Telegram message on success."""
-    markup = InlineKeyboardMarkup([[InlineKeyboardButton(
+def _quick_category_markup(entry_id: str, menu_open: bool = False) -> InlineKeyboardMarkup:
+    """Build media-message controls for direct category assignment by stable entry ID."""
+    if not menu_open:
+        return InlineKeyboardMarkup([
+            [InlineKeyboardButton("🗑 מחק סרטון זה", callback_data=f"del_eid_{entry_id}")],
+            [InlineKeyboardButton("🏷 שיוך לקטגוריה", callback_data=f"cat_quick_menu_{entry_id}")],
+        ])
+    videos = load_videos_with_entry_ids()
+    video = next((item for item in videos if item.get("entry_id") == entry_id), None)
+    if not video:
+        return InlineKeyboardMarkup([[InlineKeyboardButton("🔙 סגור", callback_data=f"cat_quick_done_{entry_id}")]])
+    memberships = video_categories(video)
+    rows = []
+    row = []
+    for index, category in enumerate(_admin_categories()):
+        label = f"✅ {category}" if category in memberships else category
+        row.append(InlineKeyboardButton(label, callback_data=f"cat_quick_toggle_{entry_id}_{index}"))
+        if len(row) == 2:
+            rows.append(row)
+            row = []
+    if row:
+        rows.append(row)
+    rows.append([InlineKeyboardButton("🔙 סיום שיוך", callback_data=f"cat_quick_done_{entry_id}")])
+    return InlineKeyboardMarkup(rows)
+
+
+async def send_admin_video_with_delete_button(bot, file_id, entry_id, max_attempts=5, include_category_assignment=False):
+    """Send one video with a unique delete button and optional direct category controls."""
+    markup = _quick_category_markup(entry_id) if include_category_assignment else InlineKeyboardMarkup([[InlineKeyboardButton(
         "🗑 מחק סרטון זה", callback_data=f"del_eid_{entry_id}"
     )]])
 
@@ -626,6 +657,7 @@ def log_admin_action(actor_id: int, action: str, details: dict | None = None) ->
 
 
 DUPLICATE_REVIEWED_KEY = "reviewed_non_duplicate_groups"
+CATEGORY_SORT_REVIEWED_KEY = "category_sort_reviewed_entry_ids"
 
 
 def duplicate_group_signature(group: list[dict]) -> str:
@@ -659,17 +691,47 @@ def save_reviewed_non_duplicate_signatures(signatures) -> None:
 
 
 def mark_group_as_not_duplicate(group: list[dict]) -> bool:
-    """Persist a manual review decision for this exact duplicate-group snapshot."""
+    """Persist a manual review decision for this exact duplicate-group snapshot.
+
+    The dedicated review file and the legacy settings field are merged first.
+    This prevents a restore containing decisions in only one location from being
+    accidentally overwritten when a new group is marked.
+    """
     signature = duplicate_group_signature(group)
-    settings = load_settings()
-    reviewed = settings.get(DUPLICATE_REVIEWED_KEY, [])
-    if not isinstance(reviewed, list):
-        reviewed = []
+    reviewed = reviewed_non_duplicate_signatures()
     if signature in reviewed:
         return False
-    reviewed.append(signature)
+    reviewed.add(signature)
     save_reviewed_non_duplicate_signatures(reviewed)
     return True
+
+
+def category_sort_reviewed_entry_ids() -> set[str]:
+    """Return videos already handled in the normal, incremental category sort."""
+    stored = load_settings().get(CATEGORY_SORT_REVIEWED_KEY, [])
+    return {str(entry_id) for entry_id in stored if isinstance(entry_id, str) and entry_id}
+
+
+def save_category_sort_reviewed_entry_ids(entry_ids) -> None:
+    """Persist category-sort progress in settings, which is included in every backup."""
+    settings = load_settings()
+    settings[CATEGORY_SORT_REVIEWED_KEY] = sorted({str(entry_id) for entry_id in entry_ids if entry_id})
+    save_settings(settings)
+
+
+def mark_category_sort_reviewed(entry_id: str) -> bool:
+    reviewed = category_sort_reviewed_entry_ids()
+    if entry_id in reviewed:
+        return False
+    reviewed.add(entry_id)
+    save_category_sort_reviewed_entry_ids(reviewed)
+    return True
+
+
+def clear_category_sort_progress() -> int:
+    reviewed = category_sort_reviewed_entry_ids()
+    save_category_sort_reviewed_entry_ids([])
+    return len(reviewed)
 
 
 def clear_not_duplicate_marks() -> int:
@@ -2528,7 +2590,7 @@ async def admin_gallery_page(update: Update, context: ContextTypes.DEFAULT_TYPE,
     # Cleanup previous review media
     await clear_sent_duplicate_group_media(context)
     
-    videos = load_json(VIDEOS_FILE)
+    videos = load_videos_with_entry_ids()
     total  = len(videos)
     if total == 0:
         await query.edit_message_text("אין סרטונים במאגר.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 חזרה", callback_data="admin_gallery")]]))
@@ -2563,8 +2625,10 @@ async def admin_gallery_page(update: Update, context: ContextTypes.DEFAULT_TYPE,
     except Exception:
         pass
     
-    sent_msg = await context.bot.send_video(chat_id=ADMIN_ID, video=v["file_id"])
-    if sent_msg:
+    sent_msg = await send_admin_video_with_delete_button(
+        context.bot, v["file_id"], v["entry_id"], include_category_assignment=True
+    )
+    if sent_msg and sent_msg != "INVALID_FILE_ID":
         context.user_data["dup_sent_media_message_ids"] = [sent_msg.message_id]
 
 def find_duplicate_groups(include_reviewed: bool) -> list[list[dict]]:
@@ -3336,7 +3400,7 @@ def parse_number_range(text: str, maximum: int) -> tuple[int, int] | None:
 async def admin_video_search_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not has_admin_permission(update.effective_user.id, "gallery"):
         return ConversationHandler.END
-    videos = load_json(VIDEOS_FILE)
+    videos = load_videos_with_entry_ids()
     number_range = parse_number_range(update.message.text, len(videos))
     if not number_range:
         await update.message.reply_text(
@@ -3355,7 +3419,9 @@ async def admin_video_search_input(update: Update, context: ContextTypes.DEFAULT
     sent_message_ids = []
     for index, video in selected:
         try:
-            sent = await send_admin_video_with_delete_button(context.bot, video["file_id"], video["entry_id"])
+            sent = await send_admin_video_with_delete_button(
+                context.bot, video["file_id"], video["entry_id"], include_category_assignment=True
+            )
             if sent and sent != "INVALID_FILE_ID":
                 success += 1
                 sent_message_ids.append(sent.message_id)
@@ -3437,7 +3503,7 @@ async def admin_search_sec_input(update: Update, context: ContextTypes.DEFAULT_T
         return ADMIN_VIDEO_SEARCH_SECONDS
 
     first, last = time_range
-    videos = load_json(VIDEOS_FILE)
+    videos = load_videos_with_entry_ids()
     results = [
         video for video in videos
         if isinstance(video, dict) and first <= int(video.get("duration", 0) or 0) <= last
@@ -3459,7 +3525,9 @@ async def admin_search_sec_input(update: Update, context: ContextTypes.DEFAULT_T
     sent_message_ids = []
     for video in results:
         try:
-            sent = await send_admin_video_with_delete_button(context.bot, video["file_id"], video["entry_id"])
+            sent = await send_admin_video_with_delete_button(
+                context.bot, video["file_id"], video["entry_id"], include_category_assignment=True
+            )
             if sent and sent != "INVALID_FILE_ID":
                 success += 1
                 sent_message_ids.append(sent.message_id)
@@ -3507,7 +3575,8 @@ async def admin_categories_menu(update: Update, context: ContextTypes.DEFAULT_TY
         [InlineKeyboardButton("📂 עיון ושליחה לפי קטגוריה", callback_data="admin_cat_browse")],
         [InlineKeyboardButton("↕️ סדר קטגוריות", callback_data="admin_cat_order")],
         [InlineKeyboardButton("✏️ עריכת קטגוריות", callback_data="admin_cat_edit")],
-        [InlineKeyboardButton("🏷 מיון לקטגוריות", callback_data="admin_cat_sort_start")],
+        [InlineKeyboardButton(f"▶️ המשך מיון ({len(_category_sort_pending_videos())})", callback_data="admin_cat_sort_continue")],
+        [InlineKeyboardButton("🔄 מיון מחדש — כל הסרטונים", callback_data="admin_cat_sort_rescan")],
         [InlineKeyboardButton("🔙 חזרה לגלריה", callback_data="admin_gallery")],
     ]
     await query.edit_message_text(text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(buttons))
@@ -4097,11 +4166,60 @@ async def admin_cat_delete_confirm(update: Update, context: ContextTypes.DEFAULT
 
 
 def _category_sort_videos() -> list[dict]:
-    """Return sortable videos from the shortest to the longest, with a stable tie-breaker."""
+    """Return all sortable videos from the shortest to the longest."""
     return sorted(
         load_videos_with_entry_ids(),
         key=lambda video: (int(video.get("duration", 0) or 0), str(video.get("entry_id", ""))),
     )
+
+
+def _category_sort_pending_videos() -> list[dict]:
+    """Return only videos not yet handled by normal category sorting."""
+    reviewed = category_sort_reviewed_entry_ids()
+    return [video for video in _category_sort_videos() if str(video.get("entry_id", "")) not in reviewed]
+
+
+def _category_sort_context_videos(context: ContextTypes.DEFAULT_TYPE) -> list[dict]:
+    """Resolve the current fixed sort session by entry ID, preserving its order safely."""
+    entry_ids = context.user_data.get("cat_sort_entry_ids")
+    if not isinstance(entry_ids, list):
+        return _category_sort_videos()
+    current = {str(video.get("entry_id", "")): video for video in load_videos_with_entry_ids()}
+    return [current[entry_id] for entry_id in entry_ids if entry_id in current]
+
+
+def _start_category_sort_session(context: ContextTypes.DEFAULT_TYPE, mode: str) -> list[dict]:
+    """Freeze a deterministic category-sort session so navigation never skips videos."""
+    videos = _category_sort_videos() if mode == "rescan" else _category_sort_pending_videos()
+    context.user_data["cat_sort_mode"] = mode
+    context.user_data["cat_sort_entry_ids"] = [str(video.get("entry_id", "")) for video in videos]
+    return videos
+
+
+async def admin_cat_sort_continue(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    videos = _start_category_sort_session(context, "continue")
+    if not videos:
+        await query.edit_message_text(
+            "✅ כל הסרטונים כבר טופלו במיון הקטגוריות. סרטונים חדשים שיועלו יופיעו כאן בהמשך המיון.",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔄 מיון מחדש", callback_data="admin_cat_sort_rescan")],
+                [InlineKeyboardButton("🔙 חזרה לקטגוריות", callback_data="admin_categories")],
+            ]),
+        )
+        return
+    await admin_cat_sort_page(update, context, 0)
+
+
+async def admin_cat_sort_rescan(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    cleared = clear_category_sort_progress()
+    _start_category_sort_session(context, "rescan")
+    if cleared:
+        log_admin_action(query.from_user.id, "category_sort_rescan", {"cleared_progress": cleared})
+    await admin_cat_sort_page(update, context, 0)
 
 
 async def admin_cat_sort_navigation(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -4115,7 +4233,7 @@ async def admin_cat_sort_navigation(update: Update, context: ContextTypes.DEFAUL
 
 
 async def admin_cat_sort_page(update: Update, context: ContextTypes.DEFAULT_TYPE, page=0):
-    videos = _category_sort_videos()
+    videos = _category_sort_context_videos(context)
     query = update.callback_query
     if not videos:
         await query.edit_message_text("אין סרטונים למיון.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 חזרה", callback_data="admin_categories")]]))
@@ -4125,11 +4243,14 @@ async def admin_cat_sort_page(update: Update, context: ContextTypes.DEFAULT_TYPE
     video = videos[page]
     await clear_sent_duplicate_group_media(context)
     current_categories = video_categories(video)
+    mode = context.user_data.get("cat_sort_mode", "rescan")
+    mode_label = "המשך מיון — סרטונים חדשים בלבד" if mode == "continue" else "מיון מחדש — כל הסרטונים"
     text = (
-        f"🏷 *מיון לקטגוריות ({page + 1}/{len(videos)})*\n\n"
+        f"🏷 *מיון לקטגוריות ({page + 1}/{len(videos)})*\n"
+        f"מצב: *{mode_label}*\n\n"
         f"⏱ אורך: *{format_duration(video.get('duration', 0))}*\n"
         f"📁 קטגוריות נוכחיות: *{', '.join(current_categories)}*\n\n"
-        "הסרטונים מסודרים מהקצר לארוך. אפשר לסמן כמה קטגוריות; לחיצה מוסיפה או מסירה סימון."
+        "אפשר לסמן כמה קטגוריות. לחיצה על קטגוריה שומרת את ההתקדמות; אם לא משנים קטגוריה, לחץ על ׳סיים סרטון׳ כדי לשמור את הטיפול בו."
     )
 
     categories = _admin_categories()
@@ -4151,6 +4272,8 @@ async def admin_cat_sort_page(update: Update, context: ContextTypes.DEFAULT_TYPE
     if page < len(videos) - 1:
         navigation.append(InlineKeyboardButton("הבא ➡️", callback_data=f"cat_sort_page_{page + 1}"))
     buttons.append(navigation)
+    done_label = "✅ סיים והבא" if page < len(videos) - 1 else "✅ סיים מיון"
+    buttons.append([InlineKeyboardButton(done_label, callback_data=f"cat_sort_done_{page}")])
     buttons.append([InlineKeyboardButton("🔙 סיום", callback_data="admin_categories")])
 
     await query.edit_message_text(text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(buttons))
@@ -4172,7 +4295,7 @@ async def admin_cat_assign(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.answer("הקטגוריה כבר אינה זמינה. חזור ונסה שוב.", show_alert=True)
         return
 
-    videos = _category_sort_videos()
+    videos = _category_sort_context_videos(context)
     if not 0 <= page < len(videos):
         await query.answer("הסרטון כבר אינו זמין. חזור ונסה שוב.", show_alert=True)
         return
@@ -4194,7 +4317,86 @@ async def admin_cat_assign(update: Update, context: ContextTypes.DEFAULT_TYPE):
             all_videos[index] = selected_video
             break
     save_json(VIDEOS_FILE, all_videos)
+    mark_category_sort_reviewed(str(selected_video.get("entry_id", "")))
     await admin_cat_sort_page(update, context, page)
+
+
+async def admin_cat_sort_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Mark the displayed video as handled even when its existing categories stay unchanged."""
+    query = update.callback_query
+    await query.answer()
+    try:
+        page = int(query.data.rsplit("_", 1)[1])
+    except (IndexError, ValueError):
+        return
+    videos = _category_sort_context_videos(context)
+    if not 0 <= page < len(videos):
+        await query.answer("הסרטון כבר אינו זמין. חזור ונסה שוב.", show_alert=True)
+        return
+    mark_category_sort_reviewed(str(videos[page].get("entry_id", "")))
+    if page < len(videos) - 1:
+        await admin_cat_sort_page(update, context, page + 1)
+        return
+    await clear_sent_duplicate_group_media(context)
+    context.user_data.pop("cat_sort_entry_ids", None)
+    context.user_data.pop("cat_sort_mode", None)
+    await query.edit_message_text(
+        "✅ סיימת את המיון הנוכחי. מיון המשך יציג בהמשך רק סרטונים חדשים שלא טופלו.",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 חזרה לקטגוריות", callback_data="admin_categories")]]),
+    )
+
+async def admin_quick_category_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    entry_id = query.data.replace("cat_quick_menu_", "")
+    if not any(video.get("entry_id") == entry_id for video in load_videos_with_entry_ids()):
+        await query.answer("הסרטון כבר אינו זמין.", show_alert=True)
+        return
+    await query.edit_message_reply_markup(reply_markup=_quick_category_markup(entry_id, menu_open=True))
+
+
+async def admin_quick_category_toggle(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    payload = query.data.replace("cat_quick_toggle_", "")
+    try:
+        entry_id, category_index_text = payload.rsplit("_", 1)
+        category_index = int(category_index_text)
+    except (ValueError, AttributeError):
+        return
+    categories = _admin_categories()
+    if not 0 <= category_index < len(categories):
+        await query.answer("הקטגוריה כבר אינה זמינה. חזור ונסה שוב.", show_alert=True)
+        return
+    all_videos = load_videos_with_entry_ids()
+    video = next((item for item in all_videos if item.get("entry_id") == entry_id), None)
+    if not video:
+        await query.answer("הסרטון כבר אינו זמין.", show_alert=True)
+        return
+    category = categories[category_index]
+    memberships = video_categories(video)
+    if category == DEFAULT_CATEGORY and category in memberships and len(memberships) == 1:
+        await query.answer("כל סרטון חייב להשתייך לפחות לקטגוריה אחת.", show_alert=True)
+        return
+    if category in memberships:
+        memberships = [item for item in memberships if item != category]
+    else:
+        memberships.append(category)
+    video["categories"] = memberships or [DEFAULT_CATEGORY]
+    normalize_video_categories(video)
+    save_json(VIDEOS_FILE, all_videos)
+    mark_category_sort_reviewed(entry_id)
+    await query.edit_message_reply_markup(reply_markup=_quick_category_markup(entry_id, menu_open=True))
+
+
+async def admin_quick_category_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    entry_id = query.data.replace("cat_quick_done_", "")
+    if any(video.get("entry_id") == entry_id for video in load_videos_with_entry_ids()):
+        mark_category_sort_reviewed(entry_id)
+    await query.edit_message_reply_markup(reply_markup=_quick_category_markup(entry_id, menu_open=False))
+
 
 # ─── Admin: broadcast (enhanced + media) ──────────────────────────────────────
 
@@ -5380,8 +5582,14 @@ def main():
         (r"^cat_delete_pick_\d+$",    admin_cat_delete_pick),
         (r"^cat_delete_confirm_\d+$", admin_cat_delete_confirm),
         (r"^cat_sort_page_\d+$",       admin_cat_sort_navigation),
-        ("^admin_cat_sort_start$",      lambda u, c: admin_cat_sort_page(u, c, 0)),
+        (r"^cat_sort_done_\d+$",       admin_cat_sort_done),
+        ("^admin_cat_sort_start$",      admin_cat_sort_continue),
+        ("^admin_cat_sort_continue$",   admin_cat_sort_continue),
+        ("^admin_cat_sort_rescan$",     admin_cat_sort_rescan),
         (r"^cat_assign_",               admin_cat_assign),
+        (r"^cat_quick_menu_[0-9a-f]+$", admin_quick_category_menu),
+        (r"^cat_quick_toggle_[0-9a-f]+_\d+$", admin_quick_category_toggle),
+        (r"^cat_quick_done_[0-9a-f]+$", admin_quick_category_done),
         ("^admin_coupons$",             admin_coupons_menu),
         (r"^coupon_del_",               admin_coupon_delete),
         ("^admin_backup$",              admin_backup),
