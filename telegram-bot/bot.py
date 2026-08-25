@@ -1896,12 +1896,22 @@ _ASSISTANT_AI_PROMPT = """אתה עוזר AI חכם, ידידותי ומדויק
 שליחת כל הסרטונים, פתיחת גלריה, קטגוריות, כפילויות, סל מיחזור, סטטיסטיקה, הזמנות, משתמשים,
 אישור תשלום, שליחה למשתמש, הודעה לכולם, מטבעות, קופונים, דרגות, יומן, גיבוי, שחזור ותחזוקה.
 
-החזר JSON בלבד. אם המשתמש מבקש פעולה קיימת שאפשר לתרגם לפקודה קצרה שהמערכת מבינה, החזר kind=\"rewrite\"
-ו-canonical_text. אם המשתמש שואל שאלה, מבקש הסבר כללי או מנהל שיחה, החזר kind=\"answer\" ו-reply מועיל,
-קצר וישיר. אל תטען שביצעת פעולה. אם הפעולה המבוקשת אינה קיימת, החזר kind=\"unsupported\" והסבר זאת ב-reply.
-אם חסר מידע הכרחי לביצוע פעולה, החזר kind=\"clarification\" ושאל רק את שאלת ההבהרה הדרושה.
+החזר JSON בלבד. אם המשתמש מבקש פעולה קיימת שאפשר לתרגם לפקודה קצרה שהמערכת מבינה, החזר kind="rewrite"
+ו-canonical_text. אם המשתמש שואל שאלה, מבקש הסבר כללי או מנהל שיחה, החזר kind="answer" ו-reply מועיל,
+קצר וישיר. אל תטען שביצעת פעולה. אם הפעולה המבוקשת אינה קיימת, החזר kind="unsupported" והסבר זאת ב-reply.
+אם חסר מידע הכרחי לביצוע פעולה, החזר kind="clarification" ושאל רק את שאלת ההבהרה הדרושה.
 אל תבצע פעולות, אל תנהל הרשאות ואל תחזיר טוקנים או מידע אישי.
 """
+
+_GEMINI_ASSISTANT_RESPONSE_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "kind": {"type": "string", "enum": ["rewrite", "answer", "unsupported", "clarification"]},
+        "canonical_text": {"type": ["string", "null"]},
+        "reply": {"type": ["string", "null"]},
+    },
+    "required": ["kind", "canonical_text", "reply"],
+}
 
 
 def _assistant_ai_enabled() -> bool:
@@ -1925,10 +1935,11 @@ def _assistant_gemini_payload(text: str) -> dict:
     model = os.environ.get("GEMINI_ASSISTANT_MODEL", "gemini-2.5-flash").strip()
     if not api_key:
         raise RuntimeError("GEMINI_API_KEY is not configured")
+
+    # Keep the API key out of the URL so it cannot accidentally appear in request logs.
     endpoint = (
         "https://generativelanguage.googleapis.com/v1beta/models/"
-        f"{urllib.parse.quote(model, safe='.-_')}:generateContent?key="
-        f"{urllib.parse.quote(api_key, safe='')}"
+        f"{urllib.parse.quote(model, safe='.-_')}:generateContent"
     )
     body = {
         "systemInstruction": {"parts": [{"text": _ASSISTANT_AI_PROMPT}]},
@@ -1937,22 +1948,51 @@ def _assistant_gemini_payload(text: str) -> dict:
             "temperature": 0.35,
             "maxOutputTokens": 600,
             "responseMimeType": "application/json",
+            "responseSchema": _GEMINI_ASSISTANT_RESPONSE_SCHEMA,
         },
     }
-    request = urllib.request.Request(
-        endpoint,
-        data=json.dumps(body, ensure_ascii=False).encode("utf-8"),
-        headers={"Content-Type": "application/json"},
-        method="POST",
-    )
-    with urllib.request.urlopen(request, timeout=25) as response:
-        raw = json.loads(response.read().decode("utf-8"))
+    request_data = json.dumps(body, ensure_ascii=False).encode("utf-8")
+    transient_statuses = {408, 429, 500, 502, 503, 504}
+    last_error = None
+
+    for attempt in range(3):
+        request = urllib.request.Request(
+            endpoint,
+            data=request_data,
+            headers={
+                "Content-Type": "application/json",
+                "x-goog-api-key": api_key,
+            },
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=25) as response:
+                raw = json.loads(response.read().decode("utf-8"))
+            break
+        except urllib.error.HTTPError as exc:
+            last_error = RuntimeError(f"Gemini HTTP status {exc.code}")
+            if exc.code not in transient_statuses or attempt == 2:
+                raise last_error from None
+        except (urllib.error.URLError, TimeoutError) as exc:
+            last_error = RuntimeError(f"Gemini network error: {type(exc).__name__}")
+            if attempt == 2:
+                raise last_error from None
+        time.sleep((2 ** attempt) + random.uniform(0, 0.25))
+    else:
+        raise last_error or RuntimeError("Gemini request failed")
+
     candidates = raw.get("candidates") or []
     parts = ((candidates[0].get("content") or {}).get("parts") or []) if candidates else []
     content = "".join(str(part.get("text", "")) for part in parts if isinstance(part, dict)).strip()
     if not content:
-        raise RuntimeError("Gemini returned no text content")
-    return json.loads(content)
+        raise RuntimeError("Gemini returned no usable text content")
+    try:
+        payload = json.loads(content)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError("Gemini returned invalid JSON") from exc
+    if not isinstance(payload, dict):
+        raise RuntimeError("Gemini returned a JSON value instead of an object")
+    return payload
 
 
 async def _assistant_ai_rewrite(raw_text: str, user_id: int) -> tuple[str | None, str | None]:
@@ -1982,7 +2022,12 @@ async def _assistant_ai_rewrite(raw_text: str, user_id: int) -> tuple[str | None
         return _assistant_ai_payload_result(payload)
     except Exception as exc:
         provider = "Gemini" if os.environ.get("GEMINI_API_KEY") else "OpenAI"
-        logger.warning("Assistant %s layer failed; using deterministic fallback: %s", provider, exc)
+        # Do not include provider URLs, request bodies or environment values in logs.
+        logger.warning(
+            "Assistant %s layer failed; using deterministic fallback (%s)",
+            provider,
+            type(exc).__name__,
+        )
     return None, None
 
 

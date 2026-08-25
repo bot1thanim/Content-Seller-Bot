@@ -30,9 +30,24 @@ class FakeClient:
         self.chat = SimpleNamespace(completions=FakeCompletions(payload))
 
 
+class FakeGeminiResponse:
+    def __init__(self, payload):
+        self.payload = payload
+
+    def read(self):
+        return json.dumps(self.payload, ensure_ascii=False).encode("utf-8")
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc, traceback):
+        return False
+
+
 async def run() -> None:
     old_key = os.environ.get("OPENAI_API_KEY")
     old_gemini_key = os.environ.get("GEMINI_API_KEY")
+    old_urlopen = bot.urllib.request.urlopen
     os.environ["OPENAI_API_KEY"] = "test-only"
     os.environ.pop("GEMINI_API_KEY", None)
     try:
@@ -64,15 +79,44 @@ async def run() -> None:
         assert "שאלות כלליות" in reply
 
         os.environ["GEMINI_API_KEY"] = "gemini-test-only"
-        bot._assistant_gemini_payload = lambda message: {
-            "kind": "answer",
-            "canonical_text": None,
-            "reply": "🤖 תשובת Gemini חופשית בעברית.",
-        }
+        captured = {}
+
+        def fake_urlopen(request, timeout):
+            captured["url"] = request.full_url
+            captured["headers"] = {key.lower(): value for key, value in request.header_items()}
+            captured["body"] = json.loads(request.data.decode("utf-8"))
+            assert timeout == 25
+            return FakeGeminiResponse({
+                "candidates": [{
+                    "content": {
+                        "parts": [{
+                            "text": json.dumps({
+                                "kind": "answer",
+                                "canonical_text": None,
+                                "reply": "🤖 תשובת Gemini חופשית בעברית.",
+                            }, ensure_ascii=False)
+                        }]
+                    }
+                }]
+            })
+
+        bot.urllib.request.urlopen = fake_urlopen
+        payload = bot._assistant_gemini_payload("ספר לי משהו כללי")
+        assert payload["kind"] == "answer"
+        assert "Gemini" in payload["reply"]
+        assert captured["url"].endswith("/models/gemini-2.5-flash:generateContent")
+        assert "gemini-test-only" not in captured["url"]
+        assert captured["headers"]["x-goog-api-key"] == "gemini-test-only"
+        assert captured["body"]["generationConfig"]["responseMimeType"] == "application/json"
+        assert captured["body"]["generationConfig"]["responseSchema"]["required"] == [
+            "kind", "canonical_text", "reply"
+        ]
+
         rewritten, reply = await bot._assistant_ai_rewrite("ספר לי משהו כללי", 1)
         assert rewritten is None
         assert "Gemini" in reply
     finally:
+        bot.urllib.request.urlopen = old_urlopen
         if old_gemini_key is None:
             os.environ.pop("GEMINI_API_KEY", None)
         else:
