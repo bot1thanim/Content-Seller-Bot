@@ -274,7 +274,7 @@ async def run():
             "users": (["admin_stats", "admin_orders_page_0", "admin_check", "users_page_0"], "admin_backup"),
             "user_messages": (["admin_send", "admin_approve"], "admin_backup"),
             "broadcast": (["admin_broadcast"], "admin_backup"),
-            "coins": (["admin_coins", "admin_vip", "admin_coupons", "admin_multiplier"], "admin_backup"),
+            "coins": (["admin_coins", "admin_vip", "admin_coupons", "admin_coin_control"], "admin_backup"),
             "maintenance": (["admin_maintenance"], "admin_backup"),
             "audit_log": (["admin_menu_system"], "admin_backup"),
             "backup": (["admin_menu_system"], "admin_delete"),

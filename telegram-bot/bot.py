@@ -157,7 +157,7 @@ def ensure_data_files():
         (VIDEOS_FILE,    []),
         (ORDERS_FILE,    []),
         (COUPONS_FILE,   {}),
-        (SETTINGS_FILE,  {"referral_multiplier": 1.0, "maintenance": False}),
+        (SETTINGS_FILE,  {"referral_multiplier": 1.0, "daily_gift_amount": 1, "referral_reward_amount": 1, "maintenance": False}),
         (TRASH_FILE,     []),
         (ADMIN_ACTIONS_FILE, []),
         (DUPLICATE_REVIEWS_FILE, []),
@@ -458,6 +458,9 @@ def load_settings() -> dict:
     if not isinstance(s, dict):
         s = {}
     s.setdefault("referral_multiplier", 1.0)
+    # Direct reward settings supersede the legacy multiplier without changing old balances.
+    s.setdefault("daily_gift_amount", 1)
+    s.setdefault("referral_reward_amount", 1)
     s.setdefault("maintenance", False)
     s.setdefault("waiting_users", [])
     order_mode = s.get("category_order_mode", "alphabetical")
@@ -568,7 +571,7 @@ def callback_permission(callback_data: str) -> str | None:
         return "user_messages"
     if callback_data.startswith("admin_broadcast"):
         return "broadcast"
-    if callback_data.startswith(("admin_coins", "admin_coupons", "coupon_", "admin_vip", "admin_multiplier")):
+    if callback_data.startswith(("admin_coins", "admin_coupons", "coupon_", "admin_vip", "admin_multiplier", "admin_coin_control")):
         return "coins"
     if callback_data.startswith(("admin_maintenance", "maint_")):
         return "maintenance"
@@ -792,7 +795,8 @@ def register_user(user, ref_id=None):
                 referrals[ref_key]["referred_ids"].append(uid)
                 save_json(REFERRALS_FILE, referrals)
                 coins       = load_json(COINS_FILE)
-                coins[ref_key] = coins.get(ref_key, 0) + 1
+                reward = max(0, int(load_settings().get("referral_reward_amount", 1)))
+                coins[ref_key] = coins.get(ref_key, 0) + reward
                 save_json(COINS_FILE, coins)
     return users.get(uid, {})
 
@@ -938,7 +942,7 @@ def get_admin_inline_keyboard(user_id: int = ADMIN_ID):
         rows.append([InlineKeyboardButton("🎬 גלריית סרטונים", callback_data="admin_gallery")])
     add("broadcast", [InlineKeyboardButton("📢 הודעה לכולם", callback_data="admin_broadcast")])
     add("coins", [InlineKeyboardButton("🪙 ניהול מטבעות", callback_data="admin_coins"), InlineKeyboardButton("💎 ניהול דרגות", callback_data="admin_vip")])
-    add("coins", [InlineKeyboardButton("🎟 ניהול קופונים", callback_data="admin_coupons"), InlineKeyboardButton("💱 מכפיל מטבעות", callback_data="admin_multiplier")])
+    add("coins", [InlineKeyboardButton("🎟 ניהול קופונים", callback_data="admin_coupons"), InlineKeyboardButton("🪙 שליטה במטבעות", callback_data="admin_coin_control")])
 
     # Advanced tools added after the original panel are kept together here.
     advanced_permissions = {"audit_log", "backup", "dangerous_delete"}
@@ -975,7 +979,7 @@ async def admin_menu_rewards(update: Update, context: ContextTypes.DEFAULT_TYPE)
         "🪙 *מטבעות, קופונים ודרגות*\n\nבחר פעולה:", parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup([
             [InlineKeyboardButton("🪙 ניהול מטבעות", callback_data="admin_coins"), InlineKeyboardButton("💎 ניהול דרגות", callback_data="admin_vip")],
-            [InlineKeyboardButton("🎟 ניהול קופונים", callback_data="admin_coupons"), InlineKeyboardButton("💱 מכפיל מטבעות", callback_data="admin_multiplier")],
+            [InlineKeyboardButton("🎟 ניהול קופונים", callback_data="admin_coupons"), InlineKeyboardButton("🪙 שליטה במטבעות", callback_data="admin_coin_control")],
             _back_to_admin_row(),
         ]),
     )
@@ -1116,7 +1120,7 @@ async def daily_bonus(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.answer(f"⏳ נשאר עוד {hours} שעות ו-{minutes} דקות לקבלת המתנה הבאה!", show_alert=True)
         return
         
-    bonus_amount = 1
+    bonus_amount = max(0, int(load_settings().get("daily_gift_amount", 1)))
     user_data["last_bonus_ts"] = now_ts
     user_data["last_bonus"] = str(date.today()) # Keep for legacy compatibility
     users[uid] = user_data
@@ -1810,7 +1814,7 @@ def _assistant_examples(user_id: int) -> list[str]:
     if has_assistant_capability(user_id, "broadcast"):
         examples.append("• הודעה לכולם")
     if has_assistant_capability(user_id, "coins"):
-        examples.append("• פתח מטבעות, קופונים או דרגות")
+        examples.append("• פתח מטבעות, שליטה במטבעות, קופונים או דרגות")
     if has_assistant_capability(user_id, "backup"):
         examples.extend(["• צור גיבוי", "• שחזר גיבוי"])
     if has_assistant_capability(user_id, "audit_log"):
@@ -2289,6 +2293,9 @@ async def admin_assistant_command(update: Update, context: ContextTypes.DEFAULT_
         return ConversationHandler.END
 
     if has_assistant_capability(user_id, "coins"):
+        if "שליטה במטבעות" in text or "מתנה יומית" in text or "תגמול הפניה" in text or "תגמול הפניות" in text:
+            await update.message.reply_text("🤖 פותח שליטה במטבעות.", reply_markup=_assistant_action_button("🪙 שליטה במטבעות", "admin_coin_control"))
+            return ConversationHandler.END
         if "קופון" in text:
             await update.message.reply_text("🤖 פותח ניהול קופונים.", reply_markup=_assistant_action_button("🎟 ניהול קופונים", "admin_coupons"))
             return ConversationHandler.END
@@ -4832,66 +4839,116 @@ async def admin_coupon_get_limit(update: Update, context: ContextTypes.DEFAULT_T
     )
     return ConversationHandler.END
 
-# ─── Admin: currency multiplier ───────────────────────────────────────────────
+# ─── Admin: direct coin controls ───────────────────────────────────────────────
 
-async def admin_multiplier_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query    = update.callback_query
+
+def _coin_control_markup() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🎁 שינוי מתנה יומית", callback_data="admin_coin_set_daily")],
+        [InlineKeyboardButton("👥 שינוי תגמול הפניות", callback_data="admin_coin_set_referral")],
+        [InlineKeyboardButton("⚙️ שינוי שני הסכומים", callback_data="admin_coin_set_both")],
+        [InlineKeyboardButton("🔙 חזרה לפאנל", callback_data="back_admin")],
+    ])
+
+
+async def admin_coin_control_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
     await query.answer()
-    if not is_admin(query.from_user.id):
+    user_id = query.from_user.id
+    if not has_admin_permission(user_id, "coins"):
         return ConversationHandler.END
     settings = load_settings()
-    current  = settings.get("referral_multiplier", 1.0)
+    daily = max(0, int(settings.get("daily_gift_amount", 1)))
+    referral = max(0, int(settings.get("referral_reward_amount", 1)))
     await query.edit_message_text(
-        f"💱 *מכפיל הפניות ויתרות מטבעות*\n\n"
-        f"המכפיל הנוכחי: *{current}x*\n\n"
-        "*מה המכפיל עושה?*\n"
-        "• כל הפניה חדשה מזכה ב־1 × המכפיל מטבעות.\n"
-        "• שינוי המכפיל מעדכן גם את כל היתרות הקיימות באותו יחס.\n"
-        "  לדוגמה: 10 מטבעות ב־1x יהפכו ל־20 מטבעות ב־2x.\n\n"
-        "*מה אינו משתנה?*\n"
-        "• מחיר PayPal, מחיר סרטונים במטבעות והמתנה היומית נשארים ללא שינוי.\n\n"
-        "⚠️ שלח מכפיל חדש (למשל `1.5`). שינוי זה ישפיע על כל יתרות המשתמשים.",
+        "🪙 *שליטה במטבעות*\n\n"
+        f"🎁 מתנה יומית נוכחית: *{daily} מטבעות*\n"
+        f"👥 תגמול הפניה נוכחי: *{referral} מטבעות*\n\n"
+        "הערכים משפיעים על זיכויים עתידיים בלבד. יתרות שכבר קיימות לא משתנות.\n"
+        "בחר מה לעדכן:",
         parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 חזרה לפאנל", callback_data="back_admin")]]),
+        reply_markup=_coin_control_markup(),
+    )
+
+
+async def admin_coin_control_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    user_id = query.from_user.id
+    if not has_admin_permission(user_id, "coins"):
+        return ConversationHandler.END
+    target = query.data.removeprefix("admin_coin_set_")
+    if target not in {"daily", "referral", "both"}:
+        return ConversationHandler.END
+    context.user_data["coin_control_target"] = target
+    prompts = {
+        "daily": "שלח מספר שלם למתנה היומית, למשל `2`.",
+        "referral": "שלח מספר שלם לתגמול על הפניה, למשל `3`.",
+        "both": "שלח שני מספרים שלמים בפורמט `מתנה הפניה`, למשל `2 3`.",
+    }
+    await query.edit_message_text(
+        f"🪙 *שליטה במטבעות*\n\n{prompts[target]}\n\n"
+        "הערך ישפיע על זיכויים עתידיים בלבד.",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 ביטול וחזרה", callback_data="back_admin")]]),
     )
     return ADMIN_MULTIPLIER
 
-async def admin_multiplier_apply(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
+
+async def admin_coin_control_apply(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if not has_admin_permission(user_id, "coins"):
         return ConversationHandler.END
-    try:
-        new_mult = float(update.message.text.strip())
-        if new_mult <= 0:
-            raise ValueError
-    except ValueError:
-        await update.message.reply_text("❌ מספר לא תקין.")
+    target = context.user_data.pop("coin_control_target", "")
+    parts = re.findall(r"\d+", update.message.text or "")
+    expected = 2 if target == "both" else 1
+    if target not in {"daily", "referral", "both"} or len(parts) != expected:
+        await update.message.reply_text(
+            "❌ קלט לא תקין. שלח מספר שלם חיובי או אפס; עבור שני הערכים שלח שני מספרים, למשל `2 3`.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 חזרה", callback_data="back_admin")]]),
+        )
+        context.user_data["coin_control_target"] = target
         return ADMIN_MULTIPLIER
+    values = [int(value) for value in parts]
     settings = load_settings()
-    old_mult = settings.get("referral_multiplier", 1.0)
-    ratio    = new_mult / old_mult
-    coins    = load_json(COINS_FILE)
-    for uid in coins:
-        coins[uid] = round(coins[uid] * ratio)
-    save_json(COINS_FILE, coins)
-    settings["referral_multiplier"] = new_mult
+    if target in {"daily", "both"}:
+        settings["daily_gift_amount"] = values[0]
+    if target == "referral":
+        settings["referral_reward_amount"] = values[0]
+    elif target == "both":
+        settings["referral_reward_amount"] = values[1]
     save_settings(settings)
-    await update.message.reply_text(f"✅ *מכפיל עודכן:* {old_mult}x → {new_mult}x\n\nשולח הודעה לכל המשתמשים...", parse_mode="Markdown")
-    users = load_json(USERS_FILE)
-    sent  = 0
-    for uid in users:
-        bal = coins.get(uid, 0)
-        try:
-            await context.bot.send_message(
-                chat_id=int(uid),
-                text=f"💱 *ערך המטבעות השתנה!*\n\nיתרתך עודכנה ל-*{bal} מטבעות*.\nכעת תקבל *{new_mult}x* מטבעות על כל הפניה! 🎉",
-                parse_mode="Markdown",
-            )
-            sent += 1
-        except Exception:
-            pass
-        await asyncio.sleep(0.05)
-    await update.message.reply_text(f"✅ הודעות נשלחו ל-{sent} משתמשים.", reply_markup=get_admin_inline_keyboard())
+    log_admin_action(user_id, "coin_reward_settings_updated", {
+        "daily_gift_amount": settings["daily_gift_amount"],
+        "referral_reward_amount": settings["referral_reward_amount"],
+    })
+    await update.message.reply_text(
+        "✅ *הערכים נשמרו*\n\n"
+        f"🎁 מתנה יומית: *{settings['daily_gift_amount']} מטבעות*\n"
+        f"👥 תגמול הפניה: *{settings['referral_reward_amount']} מטבעות*\n\n"
+        "היתרות הקיימות לא השתנו. הערכים יחולו על זיכויים עתידיים.",
+        parse_mode="Markdown",
+        reply_markup=get_admin_inline_keyboard(user_id),
+    )
     return ConversationHandler.END
+
+# Backward-compatible test helper; the old multiplier callback is no longer registered in the UI.
+async def admin_multiplier_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if not is_owner(query.from_user.id):
+        return ConversationHandler.END
+    settings = load_settings()
+    await query.edit_message_text(
+        "💱 *מכפיל הפניות ויתרות מטבעות*\n\n"
+        f"המכפיל ההיסטורי: *{settings.get('referral_multiplier', 1.0)}x*\n\n"
+        "המערכת החדשה משתמשת בשליטה ישירה במתנה היומית ובתגמול ההפניות.\n"
+        "מחיר PayPal והמתנה היומית הם הגדרות נפרדות, ויתרות קיימות אינן משתנות.",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 חזרה", callback_data="back_admin")]]),
+    )
+    return ADMIN_MULTIPLIER
+
 
 # ─── Admin: backup ZIP ────────────────────────────────────────────────────────
 
@@ -5418,9 +5475,9 @@ def main():
         fallbacks=[CommandHandler("cancel", cancel)],
         per_message=False, per_chat=True,
     )
-    multiplier_conv = ConversationHandler(
-        entry_points=[CallbackQueryHandler(admin_multiplier_start, pattern="^admin_multiplier$")],
-        states={ADMIN_MULTIPLIER: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_multiplier_apply)]},
+    coin_control_conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(admin_coin_control_start, pattern="^admin_coin_set_(daily|referral|both)$")],
+        states={ADMIN_MULTIPLIER: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_coin_control_apply)]},
         fallbacks=[
             CommandHandler("cancel", cancel),
             CallbackQueryHandler(back_admin, pattern="^back_admin$"),
@@ -5569,7 +5626,7 @@ def main():
     
     for conv in [
         check_conv, send_conv, approve_conv, broadcast_conv, coins_conv, vip_conv,
-        coupon_new_conv, multiplier_conv, restore_conv, global_reset_conv,
+        coupon_new_conv, coin_control_conv, restore_conv, global_reset_conv,
         video_search_conv, video_search_sec_conv, repair_conv, support_conv, coupon_redeem_conv, support_reply_conv,
         cat_add_conv, cat_rename_conv, manager_add_conv, assistant_conv, video_upload_conv
     ]:
@@ -5598,6 +5655,7 @@ def main():
         ("^back_main$",                 back_main),
         ("^admin_menu_users$",          admin_menu_users),
         ("^admin_menu_rewards$",        admin_menu_rewards),
+        ("^admin_coin_control$",         admin_coin_control_menu),
         ("^admin_menu_communications$", admin_menu_communications),
         ("^admin_menu_system$",         admin_menu_system),
         ("^admin_managers$",            admin_managers_menu),
