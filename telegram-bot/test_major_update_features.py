@@ -2,6 +2,7 @@ import asyncio
 import importlib.util
 import io
 import json
+import os
 import zipfile
 import tempfile
 from pathlib import Path
@@ -25,6 +26,7 @@ class FakeBot:
         self.sent_videos = []
         self.sent_texts = []
         self.deleted = []
+        self.chat_actions = []
     async def send_video(self, chat_id, video, reply_markup=None):
         self.sent_videos.append((chat_id, video, reply_markup))
         return Msg()
@@ -33,6 +35,8 @@ class FakeBot:
         return Msg()
     async def delete_message(self, chat_id, message_id):
         self.deleted.append((chat_id, message_id))
+    async def send_chat_action(self, chat_id, action):
+        self.chat_actions.append((chat_id, action))
 
 
 class FakeMessage:
@@ -356,6 +360,36 @@ async def run():
         bot.save_settings(manager_settings)
         assert await bot.admin_assistant_command(greeting_update, SimpleNamespace(bot=FakeBot(), user_data={})) == bot.ADMIN_ASSISTANT_COMMAND
         assert "היי" in greeting_message.replies[-1][0]
+
+        # Gemini requests display Telegram's typing indicator before a free-form answer.
+        previous_gemini_key = os.environ.get("GEMINI_API_KEY")
+        previous_gemini_payload = bot._assistant_gemini_payload
+        try:
+            os.environ["GEMINI_API_KEY"] = "test-only"
+            bot._assistant_gemini_payload = lambda _: {
+                "kind": "answer",
+                "canonical_text": None,
+                "reply": "תשובת Gemini מדומה.",
+            }
+            typing_bot = FakeBot()
+            typing_message = FakeMessage("מה ההבדל בין גיבוי לשחזור?")
+            typing_update = SimpleNamespace(
+                effective_user=SimpleNamespace(id=12345),
+                effective_chat=SimpleNamespace(id=98765),
+                message=typing_message,
+            )
+            assert await bot.admin_assistant_command(
+                typing_update, SimpleNamespace(bot=typing_bot, user_data={})
+            ) == bot.ADMIN_ASSISTANT_COMMAND
+            assert typing_bot.chat_actions == [(98765, bot.ChatAction.TYPING)]
+            assert typing_message.replies[-1][0] == "תשובת Gemini מדומה."
+        finally:
+            bot._assistant_gemini_payload = previous_gemini_payload
+            if previous_gemini_key is None:
+                os.environ.pop("GEMINI_API_KEY", None)
+            else:
+                os.environ["GEMINI_API_KEY"] = previous_gemini_key
+
         clarification_message = FakeMessage("שלח סרטונים")
         clarification_update = SimpleNamespace(effective_user=SimpleNamespace(id=12345), message=clarification_message)
         assert await bot.admin_assistant_command(clarification_update, SimpleNamespace(bot=FakeBot(), user_data={})) == bot.ADMIN_ASSISTANT_COMMAND

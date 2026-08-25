@@ -37,6 +37,7 @@ from telegram.ext import (
     filters,
 )
 from telegram.error import BadRequest, Conflict, RetryAfter, TimedOut, NetworkError
+from telegram.constants import ChatAction
 try:
     from openai import OpenAI
 except ImportError:
@@ -2242,6 +2243,15 @@ async def admin_assistant_command(update: Update, context: ContextTypes.DEFAULT_
     if not has_admin_permission(user_id, "assistant"):
         return ConversationHandler.END
     text = _assistant_normalize(update.message.text)
+    # Telegram displays this animation briefly while Gemini is preparing an answer.
+    # It is sent only for external-AI processing and never changes bot permissions.
+    chat_id = getattr(getattr(update, "effective_chat", None), "id", None)
+    bot = getattr(context, "bot", None)
+    if _assistant_ai_enabled() and len(text) >= 4 and chat_id and bot:
+        try:
+            await bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
+        except (BadRequest, NetworkError, TimedOut):
+            logger.debug("Could not show assistant typing indicator", exc_info=True)
     ai_rewrite, ai_reply = await _assistant_ai_rewrite(text, user_id)
     if ai_reply:
         await update.message.reply_text(ai_reply, reply_markup=_assistant_navigation_keyboard())
