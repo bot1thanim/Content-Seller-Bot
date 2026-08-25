@@ -152,6 +152,8 @@ async def run() -> None:
         assert image == b"image-test" and mime == "image/png"
         assert bot._assistant_explicit_coin_command("תוסיף 5 מטבעות למשתמש 123") == "ADJUST_COINS:123:+5"
         assert bot._assistant_explicit_coin_command("תוריד 4 coins למשתמש 42") == "ADJUST_COINS:42:-4"
+        assert bot._assistant_explicit_image_command("צור תמונה של רובוט כחול") == "GENERATE_IMAGE:רובוט כחול"
+        assert bot._assistant_explicit_image_command("generate image of a small blue robot") == "GENERATE_IMAGE:a small blue robot"
     finally:
         bot.urllib.request.urlopen = old_urlopen
         if old_gemini_key is None:

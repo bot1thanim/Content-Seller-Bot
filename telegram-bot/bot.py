@@ -2116,6 +2116,19 @@ def _assistant_explicit_coin_command(text: str) -> str | None:
     return f"ADJUST_COINS:{target_match.group(1)}:{amount:+d}"
 
 
+def _assistant_explicit_image_command(text: str) -> str | None:
+    """Route clear image-creation requests before a general AI rewrite can misclassify them."""
+    patterns = (
+        r"^(?:צור|תיצור|תכין|צייר)\s+(?:לי\s+)?(?:תמונה|תמונת)\s*(?:של|שלי|עם)?\s*(.+)$",
+        r"^(?:create|generate|make|draw)\s+(?:an?\s+)?image\s*(?:of|with)?\s*(.+)$",
+    )
+    for pattern in patterns:
+        match = re.match(pattern, text, flags=re.IGNORECASE)
+        if match and match.group(1).strip():
+            return "GENERATE_IMAGE:" + match.group(1).strip()
+    return None
+
+
 async def _assistant_apply_reward_command(
     update: Update, context: ContextTypes.DEFAULT_TYPE, canonical_text: str, user_id: int
 ) -> bool:
@@ -2714,6 +2727,10 @@ async def admin_assistant_command(update: Update, context: ContextTypes.DEFAULT_
         return ConversationHandler.END
     text = _assistant_normalize(update.message.text)
     _assistant_append_history(context, "user", update.message.text)
+    explicit_image_command = _assistant_explicit_image_command(text)
+    if explicit_image_command:
+        if await _assistant_apply_runtime_command(update, context, explicit_image_command, user_id):
+            return ADMIN_ASSISTANT_COMMAND
     live_answer = _assistant_live_answer(text, user_id)
     if live_answer:
         _assistant_append_history(context, "assistant", live_answer)
