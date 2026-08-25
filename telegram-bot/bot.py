@@ -34,6 +34,10 @@ from telegram.ext import (
     filters,
 )
 from telegram.error import BadRequest, Conflict, RetryAfter, TimedOut, NetworkError
+try:
+    from openai import OpenAI
+except ImportError:
+    OpenAI = None
 
 warnings.filterwarnings("ignore", message=".*per_message=False.*CallbackQueryHandler.*")
 
@@ -1861,6 +1865,69 @@ def _assistant_normalize(text: str) -> str:
     return re.sub(r"\s+", " ", text.strip().lower().replace("–", "-").replace("—", "-"))
 
 
+_ASSISTANT_AI_SCHEMA = {
+    "type": "json_schema",
+    "json_schema": {
+        "name": "hebrew_admin_intent",
+        "strict": True,
+        "schema": {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "kind": {"type": "string", "enum": ["rewrite", "unsupported", "clarification"]},
+                "canonical_text": {"type": ["string", "null"]},
+                "reply": {"type": ["string", "null"]},
+            },
+            "required": ["kind", "canonical_text", "reply"],
+        },
+    },
+}
+
+_ASSISTANT_AI_PROMPT = """אתה שכבת הבנת שפה לעוזר ניהול של בוט Telegram בעברית.
+המערכת הקיימת תומכת בפקודות: הסברים על יכולות, עזרה, שליחת סרטונים לפי טווח זמן או מספר, שליחת כל הסרטונים,
+פתיחת גלריה, קטגוריות, כפילויות, סל מיחזור, סטטיסטיקה, הזמנות, משתמשים, אישור תשלום, שליחה למשתמש,
+הודעה לכולם, מטבעות, קופונים, דרגות, יומן, גיבוי, שחזור ותחזוקה.
+קבל ניסוח טבעי בעברית והחזר JSON בלבד. אם אפשר למפות אותו לפקודה קצרה שהמערכת הקיימת מבינה, החזר rewrite
+עם canonical_text. אל תמציא פעולה שאינה קיימת. אם הבקשה אינה נתמכת, החזר unsupported. אם חסר מידע הכרחי,
+החזר clarification. אל תבצע פעולות, אל תנהל הרשאות ואל תחזיר טוקנים או מידע אישי.
+"""
+
+
+def _assistant_ai_enabled() -> bool:
+    return bool(os.environ.get("OPENAI_API_KEY")) and OpenAI is not None
+
+
+async def _assistant_ai_rewrite(raw_text: str, user_id: int) -> tuple[str | None, str | None]:
+    """Use an optional LLM only as a constrained Hebrew intent rewriter."""
+    text = raw_text.strip()
+    if not _assistant_ai_enabled() or len(text) < 4:
+        return None, None
+    try:
+        client = OpenAI()
+        response = await asyncio.to_thread(
+            client.chat.completions.create,
+            model=os.environ.get("ADMIN_ASSISTANT_MODEL", "gpt-5-mini"),
+            messages=[
+                {"role": "system", "content": _ASSISTANT_AI_PROMPT},
+                {"role": "user", "content": text},
+            ],
+            response_format=_ASSISTANT_AI_SCHEMA,
+            max_completion_tokens=500,
+        )
+        content = getattr(response.choices[0].message, "content", None)
+        if not content:
+            logger.warning("Optional assistant AI returned empty content; using deterministic fallback")
+            return None, None
+        payload = json.loads(content)
+        if payload.get("kind") == "rewrite" and isinstance(payload.get("canonical_text"), str):
+            return payload["canonical_text"].strip(), None
+        if payload.get("kind") in {"unsupported", "clarification"}:
+            return None, payload.get("reply") or "🤖 לא הצלחתי לזהות בקשה נתמכת."
+    except Exception as exc:
+        logger.warning("Optional assistant AI intent layer failed; using deterministic fallback: %s", exc)
+    return None, None
+
+
 def _assistant_time_range(text: str) -> tuple[int, int] | None:
     """Extract a time range from Hebrew command text without accepting unrelated numbers."""
     if not any(marker in text for marker in ("שני", "זמן", "אורך", "דקה", ":")):
@@ -2070,6 +2137,12 @@ async def admin_assistant_command(update: Update, context: ContextTypes.DEFAULT_
     if not has_admin_permission(user_id, "assistant"):
         return ConversationHandler.END
     text = _assistant_normalize(update.message.text)
+    ai_rewrite, ai_reply = await _assistant_ai_rewrite(text, user_id)
+    if ai_reply:
+        await update.message.reply_text(ai_reply, reply_markup=_assistant_navigation_keyboard())
+        return ADMIN_ASSISTANT_COMMAND
+    if ai_rewrite and ai_rewrite != text:
+        text = _assistant_normalize(ai_rewrite)
     explanation_markers = (
         "מה זה", "מהו", "מה עושה", "מה עושים", "מה המשמעות", "הסבר", "תסביר",
         "איך עובד", "איך משתמשים", "למה משמש", "מה כל", "על מה",
