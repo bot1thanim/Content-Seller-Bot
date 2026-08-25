@@ -955,6 +955,11 @@ def _back_to_admin_row():
     return [InlineKeyboardButton("🔙 חזרה לפאנל", callback_data="back_admin")]
 
 
+def _flow_back_markup(callback_data: str = "back_admin", label: str = "🔙 חזרה לפאנל") -> InlineKeyboardMarkup:
+    """Visible exit control for every text-input management step."""
+    return InlineKeyboardMarkup([[InlineKeyboardButton(label, callback_data=callback_data)]])
+
+
 async def admin_menu_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -1466,7 +1471,7 @@ async def admin_support_reply_start(update: Update, context: ContextTypes.DEFAUL
         return ConversationHandler.END
     target = query.data.replace("support_reply_", "")
     context.user_data["support_reply_target"] = target
-    await query.message.reply_text(f"✏️ תשובה ל-`{target}`:\n\nכתוב את ההודעה:", parse_mode="Markdown")
+    await query.message.reply_text(f"✏️ תשובה ל-`{target}`:\n\nכתוב את ההודעה:", parse_mode="Markdown", reply_markup=_flow_back_markup())
     return SUPPORT_REPLY_MSG
 
 async def admin_support_reply_send(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2447,7 +2452,7 @@ async def admin_check_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     if not is_admin(query.from_user.id):
         return ConversationHandler.END
-    await query.edit_message_text("🔍 *בדיקת משתמש*\n\nשלח את ה-ID:", parse_mode="Markdown")
+    await query.edit_message_text("🔍 *בדיקת משתמש*\n\nשלח את ה-ID:", parse_mode="Markdown", reply_markup=_flow_back_markup())
     return ADMIN_CHECK_USER
 
 async def admin_check_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2531,7 +2536,7 @@ async def admin_send_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     if not is_admin(query.from_user.id):
         return ConversationHandler.END
-    await query.edit_message_text("📩 *שליחת הודעה למשתמש*\n\nרשום את ההודעה שברצונך לשלוח:", parse_mode="Markdown")
+    await query.edit_message_text("📩 *שליחת הודעה למשתמש*\n\nרשום את ההודעה שברצונך לשלוח:", parse_mode="Markdown", reply_markup=_flow_back_markup())
     return ADMIN_SEND_MSG
 
 async def admin_send_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2539,7 +2544,7 @@ async def admin_send_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ConversationHandler.END
     msg = update.message.text.strip()
     context.user_data["admin_msg_text"] = msg
-    await update.message.reply_text("שלח את ה-ID של המשתמש אליו תישלח ההודעה:")
+    await update.message.reply_text("שלח את ה-ID של המשתמש אליו תישלח ההודעה:", reply_markup=_flow_back_markup())
     return ADMIN_SEND_ID
 
 async def admin_send_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2563,7 +2568,7 @@ async def admin_approve_start(update: Update, context: ContextTypes.DEFAULT_TYPE
     await query.answer()
     if not is_admin(query.from_user.id):
         return ConversationHandler.END
-    await query.edit_message_text("✅ *אישור תשלום ידני*\n\nכמה סרטונים לשלוח למשתמש?", parse_mode="Markdown")
+    await query.edit_message_text("✅ *אישור תשלום ידני*\n\nכמה סרטונים לשלוח למשתמש?", parse_mode="Markdown", reply_markup=_flow_back_markup())
     return ADMIN_APPROVE_COUNT
 
 async def admin_approve_count(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2573,9 +2578,9 @@ async def admin_approve_count(update: Update, context: ContextTypes.DEFAULT_TYPE
         count = int(update.message.text.strip())
         context.user_data["approve_v_count"] = count
     except ValueError:
-        await update.message.reply_text("❌ מספר לא תקין.")
+        await update.message.reply_text("❌ מספר לא תקין.", reply_markup=_flow_back_markup())
         return ADMIN_APPROVE_COUNT
-    await update.message.reply_text("שלח את ה-ID של המשתמש לאישור:")
+    await update.message.reply_text("שלח את ה-ID של המשתמש לאישור:", reply_markup=_flow_back_markup())
     return ADMIN_APPROVE_ID
 
 async def admin_approve_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -4085,11 +4090,11 @@ async def admin_cat_add_start(update: Update, context: ContextTypes.DEFAULT_TYPE
 async def admin_cat_add_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     name = _valid_category_name(update.message.text)
     if not name:
-        await update.message.reply_text("❌ שם קטגוריה לא תקין. שלח שם באורך של עד 32 תווים.")
+        await update.message.reply_text("❌ שם קטגוריה לא תקין. שלח שם באורך של עד 32 תווים.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 חזרה", callback_data="admin_cat_edit")]]))
         return ADMIN_VIDEO_CAT_ADD
     categories = _admin_categories()
     if name in categories:
-        await update.message.reply_text("⚠️ קטגוריה בשם זה כבר קיימת.")
+        await update.message.reply_text("⚠️ קטגוריה בשם זה כבר קיימת.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 חזרה", callback_data="admin_cat_edit")]]))
         return ADMIN_VIDEO_CAT_ADD
     categories.append(name)
     settings = load_settings()
@@ -4140,14 +4145,14 @@ async def admin_cat_rename_input(update: Update, context: ContextTypes.DEFAULT_T
     if not old_name:
         return ConversationHandler.END
     if not new_name:
-        await update.message.reply_text("❌ שם קטגוריה לא תקין. שלח שם באורך של עד 32 תווים.")
+        await update.message.reply_text("❌ שם קטגוריה לא תקין. שלח שם באורך של עד 32 תווים.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 חזרה", callback_data="admin_cat_edit")]]))
         return ADMIN_CATEGORY_RENAME
     categories = _admin_categories()
     if new_name in categories:
-        await update.message.reply_text("⚠️ קטגוריה בשם זה כבר קיימת.")
+        await update.message.reply_text("⚠️ קטגוריה בשם זה כבר קיימת.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 חזרה", callback_data="admin_cat_edit")]]))
         return ADMIN_CATEGORY_RENAME
     if old_name not in categories or old_name == DEFAULT_CATEGORY:
-        await update.message.reply_text("❌ לא ניתן לשנות את הקטגוריה הזו.")
+        await update.message.reply_text("❌ לא ניתן לשנות את הקטגוריה הזו.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 חזרה", callback_data="admin_cat_edit")]]))
         return ConversationHandler.END
 
     settings = load_settings()
@@ -4475,7 +4480,7 @@ async def admin_broadcast_start(update: Update, context: ContextTypes.DEFAULT_TY
     await query.answer()
     if not is_admin(query.from_user.id):
         return ConversationHandler.END
-    await query.edit_message_text("📢 *הודעה לכולם*\n\nשלח את תוכן ההודעה (טקסט בלבד):", parse_mode="Markdown")
+    await query.edit_message_text("📢 *הודעה לכולם*\n\nשלח את תוכן ההודעה (טקסט בלבד):", parse_mode="Markdown", reply_markup=_flow_back_markup())
     return ADMIN_BROADCAST
 
 async def admin_broadcast_get_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -4485,6 +4490,7 @@ async def admin_broadcast_get_msg(update: Update, context: ContextTypes.DEFAULT_
     await update.message.reply_text(
         "🖼 *הוספת מדיה (אופציונלי)*\n\nשלח תמונה או סרטון, או שלח `skip` לדלג:",
         parse_mode="Markdown",
+        reply_markup=_flow_back_markup(),
     )
     return ADMIN_BROADCAST_MEDIA
 
@@ -4502,6 +4508,7 @@ async def admin_broadcast_get_media(update: Update, context: ContextTypes.DEFAUL
     await update.message.reply_text(
         "🔗 *כפתור קישור (אופציונלי)*\n\nפורמט: `טקסט|https://קישור`\nאו `skip` לדלג:",
         parse_mode="Markdown",
+        reply_markup=_flow_back_markup(),
     )
     return ADMIN_BROADCAST_BTN
 
@@ -4517,15 +4524,16 @@ async def admin_broadcast_get_btn(update: Update, context: ContextTypes.DEFAULT_
             if btn_url.startswith("http"):
                 markup = InlineKeyboardMarkup([[InlineKeyboardButton(btn_text, url=btn_url)]])
             else:
-                await update.message.reply_text("❌ קישור לא תקין (חייב להתחיל ב-http).")
+                await update.message.reply_text("❌ קישור לא תקין (חייב להתחיל ב-http).", reply_markup=_flow_back_markup())
                 return ADMIN_BROADCAST_BTN
         else:
-            await update.message.reply_text("❌ פורמט לא תקין. השתמש ב-`טקסט|קישור` או `skip`.", parse_mode="Markdown")
+            await update.message.reply_text("❌ פורמט לא תקין. השתמש ב-`טקסט|קישור` או `skip`.", parse_mode="Markdown", reply_markup=_flow_back_markup())
             return ADMIN_BROADCAST_BTN
     context.user_data["broadcast_markup"] = markup
     await update.message.reply_text(
         "⏰ *השהיית שליחה (בדקות)*\n\nשלח `0` לשליחה מיידית, או מספר דקות להשהיה:",
         parse_mode="Markdown",
+        reply_markup=_flow_back_markup(),
     )
     return ADMIN_BROADCAST_DELAY
 
@@ -4537,7 +4545,7 @@ async def admin_broadcast_get_delay(update: Update, context: ContextTypes.DEFAUL
         if delay_min < 0:
             raise ValueError
     except ValueError:
-        await update.message.reply_text("❌ מספר לא תקין. שלח 0 לשליחה מיידית.")
+        await update.message.reply_text("❌ מספר לא תקין. שלח 0 לשליחה מיידית.", reply_markup=_flow_back_markup())
         return ADMIN_BROADCAST_DELAY
 
     msg    = context.user_data.get("broadcast_msg", "")
@@ -4591,7 +4599,7 @@ async def admin_vip_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     if not is_admin(query.from_user.id):
         return ConversationHandler.END
-    await query.edit_message_text("💎 *ניהול דרגות VIP*\n\nשלח את ה-ID של המשתמש:", parse_mode="Markdown")
+    await query.edit_message_text("💎 *ניהול דרגות VIP*\n\nשלח את ה-ID של המשתמש:", parse_mode="Markdown", reply_markup=_flow_back_markup())
     return ADMIN_VIP_ID
 
 async def admin_vip_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -4601,12 +4609,12 @@ async def admin_vip_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
         uid = str(int(update.message.text.strip()))
         context.user_data["vip_target_id"] = uid
     except ValueError:
-        await update.message.reply_text("❌ ID לא תקין.")
+        await update.message.reply_text("❌ ID לא תקין.", reply_markup=_flow_back_markup())
         return ConversationHandler.END
     
     users = load_json(USERS_FILE)
     if uid not in users:
-        await update.message.reply_text("❌ משתמש לא נמצא במערכת.")
+        await update.message.reply_text("❌ משתמש לא נמצא במערכת.", reply_markup=_flow_back_markup())
         return ConversationHandler.END
         
     user = users[uid]
@@ -4821,7 +4829,7 @@ async def admin_coupon_new_start(update: Update, context: ContextTypes.DEFAULT_T
     await query.answer()
     if not is_admin(query.from_user.id):
         return ConversationHandler.END
-    await query.edit_message_text("🎟 *קופון חדש*\n\nשלח את *קוד הקופון* (אותיות/מספרים):", parse_mode="Markdown")
+    await query.edit_message_text("🎟 *קופון חדש*\n\nשלח את *קוד הקופון* (אותיות/מספרים):", parse_mode="Markdown", reply_markup=_flow_back_markup())
     return ADMIN_COUPON_CODE
 
 async def admin_coupon_get_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -4829,14 +4837,14 @@ async def admin_coupon_get_code(update: Update, context: ContextTypes.DEFAULT_TY
         return ConversationHandler.END
     code = update.message.text.strip().upper()
     if not code.replace("_", "").replace("-", "").isalnum():
-        await update.message.reply_text("❌ קוד לא תקין. רק אותיות ומספרים.")
+        await update.message.reply_text("❌ קוד לא תקין. רק אותיות ומספרים.", reply_markup=_flow_back_markup())
         return ADMIN_COUPON_CODE
     coupons = load_json(COUPONS_FILE)
     if code in coupons:
-        await update.message.reply_text("❌ קוד כבר קיים.")
+        await update.message.reply_text("❌ קוד כבר קיים.", reply_markup=_flow_back_markup())
         return ADMIN_COUPON_CODE
     context.user_data["new_coupon_code"] = code
-    await update.message.reply_text(f"✅ קוד: `{code}`\n\nכמה 🪙 מטבעות?", parse_mode="Markdown")
+    await update.message.reply_text(f"✅ קוד: `{code}`\n\nכמה 🪙 מטבעות?", parse_mode="Markdown", reply_markup=_flow_back_markup())
     return ADMIN_COUPON_COINS
 
 async def admin_coupon_get_coins(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -4848,9 +4856,9 @@ async def admin_coupon_get_coins(update: Update, context: ContextTypes.DEFAULT_T
             raise ValueError
         context.user_data["new_coupon_coins"] = val
     except ValueError:
-        await update.message.reply_text("❌ מספר לא תקין.")
+        await update.message.reply_text("❌ מספר לא תקין.", reply_markup=_flow_back_markup())
         return ADMIN_COUPON_COINS
-    await update.message.reply_text("📅 תאריך תפוגה? (`YYYY-MM-DD` או `skip`):", parse_mode="Markdown")
+    await update.message.reply_text("📅 תאריך תפוגה? (`YYYY-MM-DD` או `skip`):", parse_mode="Markdown", reply_markup=_flow_back_markup())
     return ADMIN_COUPON_EXPIRY
 
 async def admin_coupon_get_expiry(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -4864,9 +4872,9 @@ async def admin_coupon_get_expiry(update: Update, context: ContextTypes.DEFAULT_
             datetime.strptime(raw, "%Y-%m-%d")
             context.user_data["new_coupon_expiry"] = raw
         except ValueError:
-            await update.message.reply_text("❌ פורמט לא תקין. נסה `YYYY-MM-DD` או `skip`.", parse_mode="Markdown")
+            await update.message.reply_text("❌ פורמט לא תקין. נסה `YYYY-MM-DD` או `skip`.", parse_mode="Markdown", reply_markup=_flow_back_markup())
             return ADMIN_COUPON_EXPIRY
-    await update.message.reply_text("👥 מגבלת שימושים? (מספר או `skip`):", parse_mode="Markdown")
+    await update.message.reply_text("👥 מגבלת שימושים? (מספר או `skip`):", parse_mode="Markdown", reply_markup=_flow_back_markup())
     return ADMIN_COUPON_LIMIT
 
 async def admin_coupon_get_limit(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -4880,7 +4888,7 @@ async def admin_coupon_get_limit(update: Update, context: ContextTypes.DEFAULT_T
             if max_uses <= 0:
                 raise ValueError
         except ValueError:
-            await update.message.reply_text("❌ מספר לא תקין.")
+            await update.message.reply_text("❌ מספר לא תקין.", reply_markup=_flow_back_markup())
             return ADMIN_COUPON_LIMIT
     code  = context.user_data["new_coupon_code"]
     coins_val = context.user_data["new_coupon_coins"]
@@ -5464,7 +5472,7 @@ def main():
     check_conv = ConversationHandler(
         entry_points=[CallbackQueryHandler(admin_check_start, pattern="^admin_check$")],
         states={ADMIN_CHECK_USER: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_check_user)]},
-        fallbacks=[CommandHandler("cancel", cancel)],
+        fallbacks=[CommandHandler("cancel", cancel), CallbackQueryHandler(back_admin, pattern="^back_admin$")],
         per_message=False, per_chat=True,
     )
     send_conv = ConversationHandler(
@@ -5473,7 +5481,7 @@ def main():
             ADMIN_SEND_MSG: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_send_msg)],
             ADMIN_SEND_ID:  [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_send_id)],
         },
-        fallbacks=[CommandHandler("cancel", cancel)],
+        fallbacks=[CommandHandler("cancel", cancel), CallbackQueryHandler(back_admin, pattern="^back_admin$")],
         per_message=False, per_chat=True,
     )
     approve_conv = ConversationHandler(
@@ -5482,7 +5490,7 @@ def main():
             ADMIN_APPROVE_COUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_approve_count)],
             ADMIN_APPROVE_ID:    [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_approve_id)],
         },
-        fallbacks=[CommandHandler("cancel", cancel)],
+        fallbacks=[CommandHandler("cancel", cancel), CallbackQueryHandler(back_admin, pattern="^back_admin$")],
         per_message=False, per_chat=True,
     )
     broadcast_conv = ConversationHandler(
@@ -5496,7 +5504,7 @@ def main():
             ADMIN_BROADCAST_BTN:   [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_broadcast_get_btn)],
             ADMIN_BROADCAST_DELAY: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_broadcast_get_delay)],
         },
-        fallbacks=[CommandHandler("cancel", cancel)],
+        fallbacks=[CommandHandler("cancel", cancel), CallbackQueryHandler(back_admin, pattern="^back_admin$")],
         per_message=False, per_chat=True,
     )
     coins_conv = ConversationHandler(
@@ -5532,7 +5540,7 @@ def main():
             ADMIN_COUPON_EXPIRY: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_coupon_get_expiry)],
             ADMIN_COUPON_LIMIT:  [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_coupon_get_limit)],
         },
-        fallbacks=[CommandHandler("cancel", cancel)],
+        fallbacks=[CommandHandler("cancel", cancel), CallbackQueryHandler(back_admin, pattern="^back_admin$")],
         per_message=False, per_chat=True,
     )
     coin_control_conv = ConversationHandler(
@@ -5634,20 +5642,25 @@ def main():
     support_reply_conv = ConversationHandler(
         entry_points=[CallbackQueryHandler(admin_support_reply_start, pattern=r"^support_reply_\d+$")],
         states={SUPPORT_REPLY_MSG: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_support_reply_send)]},
-        fallbacks=[CommandHandler("cancel", cancel)],
+        fallbacks=[CommandHandler("cancel", cancel), CallbackQueryHandler(back_admin, pattern="^back_admin$")],
         per_message=False, per_chat=True,
     )
     # ── Register handlers ─────────────────────────────────────────────────────────────────────────────
     cat_add_conv = ConversationHandler(
         entry_points=[CallbackQueryHandler(admin_cat_add_start, pattern="^admin_cat_add$")],
         states={ADMIN_VIDEO_CAT_ADD: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_cat_add_input)]},
-        fallbacks=[CallbackQueryHandler(admin_categories_menu, pattern="^admin_categories$")],
+        fallbacks=[
+            CommandHandler("cancel", cancel),
+            CallbackQueryHandler(admin_cat_edit_menu, pattern="^admin_cat_edit$"),
+            CallbackQueryHandler(admin_categories_menu, pattern="^admin_categories$"),
+            CallbackQueryHandler(back_admin, pattern="^back_admin$"),
+        ],
         per_message=False, per_chat=True,
     )
     manager_add_conv = ConversationHandler(
         entry_points=[CallbackQueryHandler(admin_manager_add_start, pattern="^admin_mgr_add$")],
         states={ADMIN_MANAGER_ADD_ID: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_manager_add_input)]},
-        fallbacks=[CommandHandler("cancel", cancel), CallbackQueryHandler(admin_managers_menu, pattern="^admin_managers$")],
+        fallbacks=[CommandHandler("cancel", cancel), CallbackQueryHandler(admin_managers_menu, pattern="^admin_managers$"), CallbackQueryHandler(back_admin, pattern="^back_admin$")],
         per_message=False, per_chat=True,
     )
     assistant_conv = ConversationHandler(
@@ -5672,6 +5685,7 @@ def main():
             CommandHandler("cancel", cancel),
             CallbackQueryHandler(admin_cat_edit_menu, pattern="^admin_cat_edit$"),
             CallbackQueryHandler(admin_categories_menu, pattern="^admin_categories$"),
+            CallbackQueryHandler(back_admin, pattern="^back_admin$"),
         ],
         per_message=False,
         per_chat=True,
