@@ -2036,6 +2036,7 @@ SET_DAILY_GIFT:3, ו"תעשה מתנות 3 והפניות 2" צריך להחזי
 
 לתשלום ולשליטה במטבעות, אפשר להשתמש גם ב-ADJUST_COINS:<מזהה משתמש רשום>:<מספר שלם עם פלוס או מינוס>.
 לדוגמה, "תוסיף 5 מטבעות למשתמש 123" מחזיר ADJUST_COINS:123:+5.
+אם מופיעים בבקשה גם המילים מטבע, מטבעות, coins או balance וגם מזהה משתמש ומספר, זו תמיד בקשת ADJUST_COINS ולא תחזוקה.
 להפעלת או כיבוי מצב תחזוקה השתמש ב-SET_MAINTENANCE:on או SET_MAINTENANCE:off.
 פעולת תחזוקה תבקש אישור מהמשתמש לפני ביצוע.
 לבקשה ליצור תמונה, החזר kind="rewrite" ו-GENERATE_IMAGE:<תיאור התמונה בשפת המשתמש>. אל תשתמש בזה לבקשה שאינה תמונה.
@@ -2097,6 +2098,22 @@ def _assistant_append_history(context: ContextTypes.DEFAULT_TYPE, role: str, tex
         history = []
     history.append({"role": role, "text": clean[:1000]})
     context.user_data["assistant_ai_history"] = history[-8:]
+
+
+def _assistant_explicit_coin_command(text: str) -> str | None:
+    """Force unambiguous Hebrew/English coin requests away from unrelated AI actions."""
+    if not any(marker in text for marker in ("מטבע", "coins", "coin", "balance")):
+        return None
+    target_match = re.search(r"(?:למשתמש|משתמש|user)\s*(\d+)", text)
+    amount_match = re.search(r"(?:הוסף|תוסיף|תן|הורד|תוריד|remove|add)\s*([+-]?\d+)", text)
+    if not target_match or not amount_match:
+        return None
+    amount = int(amount_match.group(1))
+    if any(marker in text for marker in ("הורד", "תוריד", "remove")):
+        amount = -abs(amount)
+    else:
+        amount = abs(amount)
+    return f"ADJUST_COINS:{target_match.group(1)}:{amount:+d}"
 
 
 async def _assistant_apply_reward_command(
@@ -2220,9 +2237,9 @@ async def _assistant_apply_runtime_command(
             await update.message.reply_photo(photo=photo, caption="🎨 התמונה מוכנה.")
             log_admin_action(user_id, "assistant_image_generated", {"mime_type": mime_type})
         except Exception as exc:
-            logger.warning("Gemini image request failed: %s", type(exc).__name__)
+            logger.warning("Gemini image request failed safely: %s", str(exc)[:240])
             await update.message.reply_text(
-                "❌ הבוט לא הצליח ליצור תמונה כרגע. ייתכן שמודל התמונות אינו זמין עבור מפתח Gemini הזה או שהבקשה נדחתה.",
+                f"❌ הבוט לא הצליח ליצור תמונה כרגע. {str(exc)[:140]}",
                 reply_markup=_assistant_navigation_keyboard(),
             )
         return True
@@ -2234,7 +2251,8 @@ def _assistant_gemini_image(prompt: str) -> tuple[bytes, str]:
     api_key = os.environ.get("GEMINI_API_KEY", "").strip()
     if not api_key:
         raise RuntimeError("Gemini API key missing")
-    model = os.environ.get("GEMINI_IMAGE_MODEL", "gemini-2.5-flash-image").strip()
+    configured_model = os.environ.get("GEMINI_IMAGE_MODEL", "").strip()
+    model = configured_model or _assistant_gemini_image_model(api_key)
     payload = {
         "model": model,
         "input": [{"type": "text", "text": prompt}],
@@ -2245,8 +2263,11 @@ def _assistant_gemini_image(prompt: str) -> tuple[bytes, str]:
         headers={"Content-Type": "application/json", "x-goog-api-key": api_key},
         method="POST",
     )
-    with urllib.request.urlopen(request, timeout=60) as response:
-        response_payload = json.loads(response.read().decode("utf-8"))
+    try:
+        with urllib.request.urlopen(request, timeout=60) as response:
+            response_payload = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        raise RuntimeError(f"Gemini image request was rejected (HTTP {exc.code}).") from exc
 
     def locate_image(value):
         if isinstance(value, dict):
@@ -2271,6 +2292,33 @@ def _assistant_gemini_image(prompt: str) -> tuple[bytes, str]:
         raise RuntimeError("Gemini returned no image")
     encoded, mime_type = found
     return base64.b64decode(encoded), mime_type
+
+
+def _assistant_gemini_image_model(api_key: str) -> str:
+    """Discover an image-capable Gemini model instead of assuming a model is enabled for this API key."""
+    request = urllib.request.Request(
+        "https://generativelanguage.googleapis.com/v1beta/models?pageSize=100",
+        headers={"x-goog-api-key": api_key},
+        method="GET",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=25) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        raise RuntimeError(f"Gemini model discovery failed (HTTP {exc.code}).") from exc
+    names = []
+    for item in payload.get("models", []):
+        name = str(item.get("name", "")).removeprefix("models/")
+        methods = item.get("supportedGenerationMethods", [])
+        if "image" in name.lower() and (not methods or "generateContent" in methods or "interactions" in methods):
+            names.append(name)
+    preferred = ["gemini-3.1-flash-image", "gemini-3.1-flash-lite-image", "gemini-2.5-flash-image"]
+    for candidate in preferred:
+        if candidate in names:
+            return candidate
+    if names:
+        return names[0]
+    raise RuntimeError("No image-generation model is available for this Gemini API key.")
 
 
 async def assistant_confirm_action(update: Update, context: ContextTypes.DEFAULT_TYPE):

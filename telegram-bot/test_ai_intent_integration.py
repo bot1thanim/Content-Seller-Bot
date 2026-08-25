@@ -139,6 +139,8 @@ async def run() -> None:
 
         image_bytes = base64.b64encode(b"image-test").decode("ascii")
         def fake_image_urlopen(request, timeout):
+            if request.full_url.endswith("/v1beta/models?pageSize=100"):
+                return FakeGeminiResponse({"models": [{"name": "models/gemini-2.5-flash-image", "supportedGenerationMethods": ["generateContent"]}]})
             assert request.full_url.endswith("/v1beta/interactions")
             assert timeout == 60
             body = json.loads(request.data.decode("utf-8"))
@@ -148,6 +150,8 @@ async def run() -> None:
         bot.urllib.request.urlopen = fake_image_urlopen
         image, mime = bot._assistant_gemini_image("create a blue icon")
         assert image == b"image-test" and mime == "image/png"
+        assert bot._assistant_explicit_coin_command("תוסיף 5 מטבעות למשתמש 123") == "ADJUST_COINS:123:+5"
+        assert bot._assistant_explicit_coin_command("תוריד 4 coins למשתמש 42") == "ADJUST_COINS:42:-4"
     finally:
         bot.urllib.request.urlopen = old_urlopen
         if old_gemini_key is None:
