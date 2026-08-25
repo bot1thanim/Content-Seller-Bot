@@ -113,6 +113,27 @@ async def run():
         ])
         assert bot._assistant_live_answer("כמה סרטונים יש במאגר?", owner) == "🎬 כרגע יש *4* סרטונים במאגר."
         assert bot._assistant_live_answer("כמה סרטונים יש במאגר?", 12345) is None
+        reward_message = FakeMessage("תעשה את המתנה היומית 3 ואת ההפניות 2")
+        reward_context = SimpleNamespace(user_data={})
+        previous_reward_key = os.environ.get("GEMINI_API_KEY")
+        previous_reward_payload = bot._assistant_gemini_payload
+        try:
+            os.environ["GEMINI_API_KEY"] = "test-only"
+            bot._assistant_gemini_payload = lambda _: {
+                "kind": "rewrite", "canonical_text": "SET_REWARDS:3,2", "reply": None
+            }
+            reward_update = SimpleNamespace(effective_user=SimpleNamespace(id=owner), message=reward_message)
+            assert await bot.admin_assistant_command(reward_update, reward_context) == bot.ADMIN_ASSISTANT_COMMAND
+            reward_settings = bot.load_settings()
+            assert reward_settings["daily_gift_amount"] == 3
+            assert reward_settings["referral_reward_amount"] == 2
+            assert "Gemini הבין" in reward_message.replies[-1][0]
+        finally:
+            bot._assistant_gemini_payload = previous_reward_payload
+            if previous_reward_key is None:
+                os.environ.pop("GEMINI_API_KEY", None)
+            else:
+                os.environ["GEMINI_API_KEY"] = previous_reward_key
         # The currency-multiplier button opens for the owner and explains its exact effect.
         multiplier_query = FakeQuery("admin_multiplier", owner)
         multiplier_state = await bot.admin_multiplier_start(

@@ -119,6 +119,22 @@ async def run() -> None:
         assert rewritten is None
         assert "Gemini" in reply
         assert "מצב חי מורשה" in captured["body"]["contents"][0]["parts"][0]["text"]
+
+        def fake_reward_urlopen(request, timeout):
+            return FakeGeminiResponse({
+                "candidates": [{
+                    "content": {"parts": [{"text": json.dumps({
+                        "kind": "rewrite",
+                        "canonical_text": "SET_REWARDS:3,2",
+                        "reply": None,
+                    }, ensure_ascii=False)}]}
+                }]
+            })
+
+        bot.urllib.request.urlopen = fake_reward_urlopen
+        rewritten, reply = await bot._assistant_ai_rewrite("תעשה מתנות 3 והפניות 2", 1)
+        assert rewritten == "SET_REWARDS:3,2"
+        assert reply is None
     finally:
         bot.urllib.request.urlopen = old_urlopen
         if old_gemini_key is None:

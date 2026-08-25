@@ -1889,8 +1889,8 @@ _ASSISTANT_AI_SCHEMA = {
     },
 }
 
-_ASSISTANT_AI_PROMPT = """אתה עוזר AI חכם, ידידותי ומדויק בתוך בוט ניהול Telegram בעברית.
-ענה בעברית טבעית לשאלות כלליות, לשיחות קצרות ולהסברים, גם כשהשאלה אינה פקודה או אינה קשורה ישירות לבוט.
+_ASSISTANT_AI_PROMPT = """אתה Gemini, עוזר AI חכם, ידידותי ומדויק בתוך בוט ניהול Telegram.
+ענה בשפה שבה המשתמש כתב — עברית, English או שפה אחרת — לשאלות כלליות, לשיחות קצרות ולהסברים, גם כשהשאלה אינה פקודה או אינה קשורה ישירות לבוט.
 עם זאת, אין לך גישה לאינטרנט, לקבצים, לסרטונים, לטוקנים, לסיסמאות או לנתונים אישיים, ואסור לך להמציא מידע כזה.
 
 המערכת הקיימת יודעת לבצע רק פעולות מוגדרות: הסברים על יכולות, עזרה, שליחת סרטונים לפי טווח זמן או מספר,
@@ -1902,7 +1902,11 @@ _ASSISTANT_AI_PROMPT = """אתה עוזר AI חכם, ידידותי ומדויק
 שמות, פרטי הזמנות, תוכן הודעות, מפתחות או רשומות גולמיות, ואל תטען שביצעת פעולה.
 
 החזר JSON בלבד. אם המשתמש מבקש פעולה קיימת שאפשר לתרגם לפקודה קצרה שהמערכת מבינה, החזר kind="rewrite"
-ו-canonical_text. אם המשתמש שואל שאלה, מבקש הסבר כללי או מנהל שיחה, החזר kind="answer" ו-reply מועיל,
+ו-canonical_text. עבור שינוי תגמולים, השתמש רק באחת מהצורות המדויקות הבאות:
+SET_DAILY_GIFT:<מספר שלם אי-שלילי>, SET_REFERRAL_REWARD:<מספר שלם אי-שלילי>,
+או SET_REWARDS:<מתנה יומית>,<תגמול הפניה>. לדוגמה, "שנה את המתנה היומית ל-3" צריך להחזיר
+SET_DAILY_GIFT:3, ו"תעשה מתנות 3 והפניות 2" צריך להחזיר SET_REWARDS:3,2.
+פעולות אלו קיימות במערכת, לכן אל תסמן אותן כלא נתמכות. אם המשתמש שואל שאלה, מבקש הסבר כללי או מנהל שיחה, החזר kind="answer" ו-reply מועיל,
 קצר וישיר. אל תטען שביצעת פעולה. אם הפעולה המבוקשת אינה קיימת, החזר kind="unsupported" והסבר זאת ב-reply.
 אם חסר מידע הכרחי לביצוע פעולה, החזר kind="clarification" ושאל רק את שאלת ההבהרה הדרושה.
 אל תבצע פעולות, אל תנהל הרשאות ואל תחזיר טוקנים או מידע אישי.
@@ -1934,6 +1938,89 @@ def _assistant_ai_payload_result(payload: dict) -> tuple[str | None, str | None]
     if payload.get("kind") in {"answer", "unsupported", "clarification"}:
         return None, payload.get("reply") or "🤖 לא הצלחתי להבין את הבקשה במלואה. אפשר לנסח אותה אחרת?"
     return None, None
+
+
+def _assistant_history_context(context: ContextTypes.DEFAULT_TYPE) -> str:
+    """Return a short, per-chat conversation window without persisting it to disk."""
+    history = context.user_data.get("assistant_ai_history", [])
+    if not isinstance(history, list):
+        return ""
+    lines = []
+    for item in history[-6:]:
+        if not isinstance(item, dict):
+            continue
+        role = "משתמש" if item.get("role") == "user" else "Gemini"
+        text = str(item.get("text", "")).strip()[:500]
+        if text:
+            lines.append(f"{role}: {text}")
+    return "שיחה קודמת קצרה:\n" + "\n".join(lines) if lines else ""
+
+
+def _assistant_append_history(context: ContextTypes.DEFAULT_TYPE, role: str, text: str) -> None:
+    """Keep a bounded in-memory chat window for the current Telegram conversation."""
+    clean = str(text or "").strip()
+    if not clean:
+        return
+    history = context.user_data.get("assistant_ai_history", [])
+    if not isinstance(history, list):
+        history = []
+    history.append({"role": role, "text": clean[:1000]})
+    context.user_data["assistant_ai_history"] = history[-8:]
+
+
+async def _assistant_apply_reward_command(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, canonical_text: str, user_id: int
+) -> bool:
+    """Apply a Gemini-translated reward update through validated existing settings."""
+    match = re.fullmatch(r"SET_DAILY_GIFT:(\d+)", canonical_text)
+    reward_kind = "daily"
+    values = []
+    if match:
+        values = [int(match.group(1))]
+    else:
+        match = re.fullmatch(r"SET_REFERRAL_REWARD:(\d+)", canonical_text)
+        reward_kind = "referral"
+        if match:
+            values = [int(match.group(1))]
+        else:
+            match = re.fullmatch(r"SET_REWARDS:(\d+),(\d+)", canonical_text)
+            reward_kind = "both"
+            if match:
+                values = [int(match.group(1)), int(match.group(2))]
+    if not values:
+        return False
+    if not has_assistant_capability(user_id, "coins"):
+        await update.message.reply_text(
+            "⛔ אין לך הרשאה לעדכן מתנות או תגמולי הפניה דרך העוזר.",
+            reply_markup=_assistant_navigation_keyboard(),
+        )
+        return True
+    settings = load_settings()
+    if reward_kind in {"daily", "both"}:
+        settings["daily_gift_amount"] = values[0]
+    if reward_kind == "referral":
+        settings["referral_reward_amount"] = values[0]
+    elif reward_kind == "both":
+        settings["referral_reward_amount"] = values[1]
+    save_settings(settings)
+    log_admin_action(user_id, "assistant_reward_update", {
+        "daily_gift_amount": settings["daily_gift_amount"],
+        "referral_reward_amount": settings["referral_reward_amount"],
+    })
+    _assistant_append_history(
+        context,
+        "assistant",
+        f"עודכנו תגמולים: מתנה יומית {settings['daily_gift_amount']}, תגמול הפניה {settings['referral_reward_amount']}.",
+    )
+    await update.message.reply_text(
+        "✅ Gemini הבין את הבקשה והבוט עדכן את ההגדרות הקיימות.\n\n"
+        f"🎁 מתנה יומית: *{settings['daily_gift_amount']}* מטבעות\n"
+        f"👥 תגמול הפניה: *{settings['referral_reward_amount']}* מטבעות\n\n"
+        "הערכים משפיעים על זיכויים עתידיים בלבד; יתרות קיימות לא משתנות.",
+        parse_mode="Markdown",
+        reply_markup=_assistant_navigation_keyboard(),
+    )
+    return True
 
 
 def _assistant_live_answer(text: str, user_id: int) -> str | None:
@@ -2297,8 +2384,10 @@ async def admin_assistant_command(update: Update, context: ContextTypes.DEFAULT_
     if not has_admin_permission(user_id, "assistant"):
         return ConversationHandler.END
     text = _assistant_normalize(update.message.text)
+    _assistant_append_history(context, "user", update.message.text)
     live_answer = _assistant_live_answer(text, user_id)
     if live_answer:
+        _assistant_append_history(context, "assistant", live_answer)
         await update.message.reply_text(
             live_answer,
             parse_mode="Markdown",
@@ -2317,12 +2406,18 @@ async def admin_assistant_command(update: Update, context: ContextTypes.DEFAULT_
     ai_rewrite, ai_reply = await _assistant_ai_rewrite(
         text,
         user_id,
-        runtime_context=_assistant_safe_runtime_context(user_id),
+        runtime_context="\n\n".join(filter(None, [
+            _assistant_safe_runtime_context(user_id),
+            _assistant_history_context(context),
+        ])),
     )
     if ai_reply:
+        _assistant_append_history(context, "assistant", ai_reply)
         await update.message.reply_text(ai_reply, reply_markup=_assistant_navigation_keyboard())
         return ADMIN_ASSISTANT_COMMAND
     if ai_rewrite and ai_rewrite != text:
+        if await _assistant_apply_reward_command(update, context, ai_rewrite, user_id):
+            return ADMIN_ASSISTANT_COMMAND
         text = _assistant_normalize(ai_rewrite)
     explanation_markers = (
         "מה זה", "מהו", "מה עושה", "מה עושים", "מה המשמעות", "הסבר", "תסביר",
