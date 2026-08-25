@@ -62,6 +62,29 @@ async def run():
     assert result == bot.ADMIN_MULTIPLIER
     assert "קלט לא תקין" in update.message.replies[-1][0]
 
+    # Changing a balance is allowed only for users already registered through /start.
+    users = {"42": {"first_name": "משתמש בדיקה"}}
+    coins = {"42": 5}
+    def fake_load_json(filepath):
+        if filepath == bot.USERS_FILE:
+            return dict(users)
+        if filepath == bot.COINS_FILE:
+            return dict(coins)
+        return {}
+    bot.load_json = fake_load_json
+    context = SimpleNamespace(user_data={})
+    invalid = FakeUpdate("123")
+    result = await bot.admin_coins_id(invalid, context)
+    assert result == bot.ADMIN_COINS_ID
+    assert "ID לא תקין" in invalid.message.replies[-1][0]
+    assert "coins_target_id" not in context.user_data
+
+    context = SimpleNamespace(user_data={})
+    valid = FakeUpdate("42")
+    result = await bot.admin_coins_id(valid, context)
+    assert result == bot.ADMIN_COINS_AMOUNT
+    assert context.user_data["coins_target_id"] == "42"
+
 
 if __name__ == "__main__":
     asyncio.run(run())

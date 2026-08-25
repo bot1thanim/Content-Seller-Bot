@@ -941,8 +941,7 @@ def get_admin_inline_keyboard(user_id: int = ADMIN_ID):
     if has_admin_permission(user_id, "gallery") or has_admin_permission(user_id, "duplicates"):
         rows.append([InlineKeyboardButton("🎬 גלריית סרטונים", callback_data="admin_gallery")])
     add("broadcast", [InlineKeyboardButton("📢 הודעה לכולם", callback_data="admin_broadcast")])
-    add("coins", [InlineKeyboardButton("🪙 ניהול מטבעות", callback_data="admin_coins"), InlineKeyboardButton("💎 ניהול דרגות", callback_data="admin_vip")])
-    add("coins", [InlineKeyboardButton("🎟 ניהול קופונים", callback_data="admin_coupons"), InlineKeyboardButton("🪙 שליטה במטבעות", callback_data="admin_coin_control")])
+    add("coins", [InlineKeyboardButton("🪙 מטבעות", callback_data="admin_coins_menu")])
 
     # Advanced tools added after the original panel are kept together here.
     advanced_permissions = {"audit_log", "backup", "dangerous_delete"}
@@ -973,16 +972,7 @@ async def admin_menu_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def admin_menu_rewards(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    await query.edit_message_text(
-        "🪙 *מטבעות, קופונים ודרגות*\n\nבחר פעולה:", parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("🪙 ניהול מטבעות", callback_data="admin_coins"), InlineKeyboardButton("💎 ניהול דרגות", callback_data="admin_vip")],
-            [InlineKeyboardButton("🎟 ניהול קופונים", callback_data="admin_coupons"), InlineKeyboardButton("🪙 שליטה במטבעות", callback_data="admin_coin_control")],
-            _back_to_admin_row(),
-        ]),
-    )
+    await admin_coins_menu(update, context)
 
 
 async def admin_menu_communications(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -4680,49 +4670,115 @@ async def admin_vip_level(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ─── Admin: coins management ──────────────────────────────────────────────────
 
+
+def _coins_menu_markup() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("👤 שינוי יתרה למשתמש", callback_data="admin_coins")],
+        [InlineKeyboardButton("🪙 שליטה במטבעות", callback_data="admin_coin_control")],
+        [InlineKeyboardButton("🎟 ניהול קופונים", callback_data="admin_coupons"), InlineKeyboardButton("💎 ניהול דרגות", callback_data="admin_vip")],
+        [InlineKeyboardButton("🔙 חזרה לפאנל", callback_data="back_admin")],
+    ])
+
+
+async def admin_coins_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    user_id = query.from_user.id
+    if not has_admin_permission(user_id, "coins"):
+        return ConversationHandler.END
+    settings = load_settings()
+    await query.edit_message_text(
+        "🪙 *מטבעות*\n\n"
+        f"🎁 מתנה יומית: *{settings['daily_gift_amount']} מטבעות*\n"
+        f"👥 תגמול הפניה: *{settings['referral_reward_amount']} מטבעות*\n\n"
+        "בחר פעולה:",
+        parse_mode="Markdown",
+        reply_markup=_coins_menu_markup(),
+    )
+
+
 async def admin_coins_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    if not is_admin(query.from_user.id):
+    if not has_admin_permission(query.from_user.id, "coins"):
         return ConversationHandler.END
-    await query.edit_message_text("🪙 *ניהול מטבעות*\n\nשלח את ה-ID של המשתמש:", parse_mode="Markdown")
+    context.user_data.pop("coins_target_id", None)
+    await query.edit_message_text(
+        "🪙 *שינוי יתרת מטבעות*\n\nשלח את ה־ID של משתמש רשום בבוט.",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 חזרה למטבעות", callback_data="admin_coins_menu")]]),
+    )
     return ADMIN_COINS_ID
 
+
 async def admin_coins_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
+    user_id = update.effective_user.id
+    if not has_admin_permission(user_id, "coins"):
         return ConversationHandler.END
     try:
-        uid = str(int(update.message.text.strip()))
-        context.user_data["coins_target_id"] = uid
-    except ValueError:
-        await update.message.reply_text("❌ ID לא תקין.")
-        return ConversationHandler.END
-    users   = load_json(USERS_FILE)
-    coins   = load_json(COINS_FILE)
-    name    = users.get(uid, {}).get("first_name", "לא ידוע")
+        uid = str(int((update.message.text or "").strip()))
+    except (TypeError, ValueError):
+        await update.message.reply_text(
+            "❌ ID לא תקין. שלח מספר ID של משתמש שכבר לחץ /start בבוט.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 חזרה למטבעות", callback_data="admin_coins_menu")]]),
+        )
+        return ADMIN_COINS_ID
+    users = load_json(USERS_FILE)
+    if uid not in users:
+        await update.message.reply_text(
+            "❌ ID לא תקין או שהמשתמש עדיין לא התחיל את הבוט. ניתן לשנות יתרה רק למשתמש רשום.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 חזרה למטבעות", callback_data="admin_coins_menu")]]),
+        )
+        return ADMIN_COINS_ID
+    context.user_data["coins_target_id"] = uid
+    coins = load_json(COINS_FILE)
+    name = users[uid].get("first_name", "ללא שם")
     current = coins.get(uid, 0)
-    await update.message.reply_text(f"👤 {name}\n🪙 יתרה: {current}\n\nשלח כמות (+ להוסיף, - להוריד):")
+    await update.message.reply_text(
+        f"👤 {name}\n🪙 יתרה נוכחית: {current}\n\nשלח כמות: מספר חיובי להוספה או מספר שלילי להורדה.",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 חזרה למטבעות", callback_data="admin_coins_menu")]]),
+    )
     return ADMIN_COINS_AMOUNT
 
+
 async def admin_coins_amount(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
+    user_id = update.effective_user.id
+    if not has_admin_permission(user_id, "coins"):
+        return ConversationHandler.END
+    uid = context.user_data.get("coins_target_id")
+    users = load_json(USERS_FILE)
+    if not uid or uid not in users:
+        context.user_data.pop("coins_target_id", None)
+        await update.message.reply_text(
+            "❌ המשתמש אינו תקין או אינו רשום בבוט. הפעולה בוטלה.",
+            reply_markup=get_admin_inline_keyboard(user_id),
+        )
         return ConversationHandler.END
     try:
-        amount = int(update.message.text.strip())
-    except ValueError:
-        await update.message.reply_text("❌ כמות לא תקינה.")
-        return ConversationHandler.END
-    uid     = context.user_data.get("coins_target_id")
-    coins   = load_json(COINS_FILE)
+        amount = int((update.message.text or "").strip())
+    except (TypeError, ValueError):
+        await update.message.reply_text(
+            "❌ כמות לא תקינה. שלח מספר שלם חיובי או שלילי.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 חזרה למטבעות", callback_data="admin_coins_menu")]]),
+        )
+        return ADMIN_COINS_AMOUNT
+    coins = load_json(COINS_FILE)
     current = coins.get(uid, 0)
     new_bal = max(0, current + amount)
     coins[uid] = new_bal
     save_json(COINS_FILE, coins)
-    action = "נוספו ➕" if amount >= 0 else "הוסרו ➖"
+    context.user_data.pop("coins_target_id", None)
+    log_admin_action(user_id, "coins_balance_changed", {"target_user_id": uid, "amount": amount, "new_balance": new_bal})
     await update.message.reply_text(
-        f"✅ עודכן!\n🪙 {abs(amount)} מטבעות {action}\n💰 יתרה חדשה: {new_bal}",
-        reply_markup=get_admin_inline_keyboard(),
+        f"✅ יתרת המשתמש {uid} עודכנה.\n🪙 שינוי: {amount:+d}\n💰 יתרה חדשה: {new_bal}",
+        reply_markup=get_admin_inline_keyboard(user_id),
     )
+    return ConversationHandler.END
+
+
+async def admin_coins_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.pop("coins_target_id", None)
+    await admin_coins_menu(update, context)
     return ConversationHandler.END
 
 # ─── Admin: coupon management ─────────────────────────────────────────────────
@@ -5449,7 +5505,11 @@ def main():
             ADMIN_COINS_ID:     [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_coins_id)],
             ADMIN_COINS_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_coins_amount)],
         },
-        fallbacks=[CommandHandler("cancel", cancel)],
+        fallbacks=[
+            CommandHandler("cancel", cancel),
+            CallbackQueryHandler(admin_coins_cancel, pattern="^admin_coins_menu$"),
+            CallbackQueryHandler(back_admin, pattern="^back_admin$"),
+        ],
         per_message=False, per_chat=True,
     )
     vip_conv = ConversationHandler(
@@ -5655,6 +5715,7 @@ def main():
         ("^back_main$",                 back_main),
         ("^admin_menu_users$",          admin_menu_users),
         ("^admin_menu_rewards$",        admin_menu_rewards),
+        ("^admin_coins_menu$",          admin_coins_menu),
         ("^admin_coin_control$",         admin_coin_control_menu),
         ("^admin_menu_communications$", admin_menu_communications),
         ("^admin_menu_system$",         admin_menu_system),
