@@ -1876,7 +1876,7 @@ _ASSISTANT_AI_SCHEMA = {
             "type": "object",
             "additionalProperties": False,
             "properties": {
-                "kind": {"type": "string", "enum": ["rewrite", "unsupported", "clarification"]},
+                "kind": {"type": "string", "enum": ["rewrite", "answer", "unsupported", "clarification"]},
                 "canonical_text": {"type": ["string", "null"]},
                 "reply": {"type": ["string", "null"]},
             },
@@ -1885,13 +1885,19 @@ _ASSISTANT_AI_SCHEMA = {
     },
 }
 
-_ASSISTANT_AI_PROMPT = """אתה שכבת הבנת שפה לעוזר ניהול של בוט Telegram בעברית.
-המערכת הקיימת תומכת בפקודות: הסברים על יכולות, עזרה, שליחת סרטונים לפי טווח זמן או מספר, שליחת כל הסרטונים,
-פתיחת גלריה, קטגוריות, כפילויות, סל מיחזור, סטטיסטיקה, הזמנות, משתמשים, אישור תשלום, שליחה למשתמש,
-הודעה לכולם, מטבעות, קופונים, דרגות, יומן, גיבוי, שחזור ותחזוקה.
-קבל ניסוח טבעי בעברית והחזר JSON בלבד. אם אפשר למפות אותו לפקודה קצרה שהמערכת הקיימת מבינה, החזר rewrite
-עם canonical_text. אל תמציא פעולה שאינה קיימת. אם הבקשה אינה נתמכת, החזר unsupported. אם חסר מידע הכרחי,
-החזר clarification. אל תבצע פעולות, אל תנהל הרשאות ואל תחזיר טוקנים או מידע אישי.
+_ASSISTANT_AI_PROMPT = """אתה עוזר AI חכם, ידידותי ומדויק בתוך בוט ניהול Telegram בעברית.
+ענה בעברית טבעית לשאלות כלליות, לשיחות קצרות ולהסברים, גם כשהשאלה אינה פקודה או אינה קשורה ישירות לבוט.
+עם זאת, אין לך גישה לאינטרנט, לקבצים, לסרטונים, לטוקנים, לסיסמאות או לנתונים אישיים, ואסור לך להמציא מידע כזה.
+
+המערכת הקיימת יודעת לבצע רק פעולות מוגדרות: הסברים על יכולות, עזרה, שליחת סרטונים לפי טווח זמן או מספר,
+שליחת כל הסרטונים, פתיחת גלריה, קטגוריות, כפילויות, סל מיחזור, סטטיסטיקה, הזמנות, משתמשים,
+אישור תשלום, שליחה למשתמש, הודעה לכולם, מטבעות, קופונים, דרגות, יומן, גיבוי, שחזור ותחזוקה.
+
+החזר JSON בלבד. אם המשתמש מבקש פעולה קיימת שאפשר לתרגם לפקודה קצרה שהמערכת מבינה, החזר kind=\"rewrite\"
+ו-canonical_text. אם המשתמש שואל שאלה, מבקש הסבר כללי או מנהל שיחה, החזר kind=\"answer\" ו-reply מועיל,
+קצר וישיר. אל תטען שביצעת פעולה. אם הפעולה המבוקשת אינה קיימת, החזר kind=\"unsupported\" והסבר זאת ב-reply.
+אם חסר מידע הכרחי לביצוע פעולה, החזר kind=\"clarification\" ושאל רק את שאלת ההבהרה הדרושה.
+אל תבצע פעולות, אל תנהל הרשאות ואל תחזיר טוקנים או מידע אישי.
 """
 
 
@@ -1908,7 +1914,7 @@ async def _assistant_ai_rewrite(raw_text: str, user_id: int) -> tuple[str | None
         client = OpenAI()
         response = await asyncio.to_thread(
             client.chat.completions.create,
-            model=os.environ.get("ADMIN_ASSISTANT_MODEL", "gpt-5-mini"),
+            model=os.environ.get("ADMIN_ASSISTANT_MODEL", "gpt-4o-mini"),
             messages=[
                 {"role": "system", "content": _ASSISTANT_AI_PROMPT},
                 {"role": "user", "content": text},
@@ -1923,8 +1929,8 @@ async def _assistant_ai_rewrite(raw_text: str, user_id: int) -> tuple[str | None
         payload = json.loads(content)
         if payload.get("kind") == "rewrite" and isinstance(payload.get("canonical_text"), str):
             return payload["canonical_text"].strip(), None
-        if payload.get("kind") in {"unsupported", "clarification"}:
-            return None, payload.get("reply") or "🤖 לא הצלחתי לזהות בקשה נתמכת."
+        if payload.get("kind") in {"answer", "unsupported", "clarification"}:
+            return None, payload.get("reply") or "🤖 לא הצלחתי להבין את הבקשה במלואה. אפשר לנסח אותה אחרת?"
     except Exception as exc:
         logger.warning("Optional assistant AI intent layer failed; using deterministic fallback: %s", exc)
     return None, None

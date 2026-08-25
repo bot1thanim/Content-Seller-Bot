@@ -51,6 +51,15 @@ async def run() -> None:
         rewritten, reply = await bot._assistant_ai_rewrite("תבדוק אותו", 1)
         assert rewritten is None
         assert reply == "איזה משתמש תרצה לבדוק?"
+
+        bot.OpenAI = lambda: FakeClient({
+            "kind": "answer",
+            "canonical_text": None,
+            "reply": "🤖 כן. אני יכול לענות גם על שאלות כלליות בעברית, בלי לבצע פעולה בבוט.",
+        })
+        rewritten, reply = await bot._assistant_ai_rewrite("מה ההבדל בין גיבוי לשחזור?", 1)
+        assert rewritten is None
+        assert "שאלות כלליות" in reply
     finally:
         if old_key is None:
             os.environ.pop("OPENAI_API_KEY", None)
