@@ -11,6 +11,9 @@ import zipfile
 import time
 import uuid
 import re
+import urllib.error
+import urllib.parse
+import urllib.request
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from datetime import datetime, date, timezone, timedelta
 from pathlib import Path
@@ -1902,37 +1905,84 @@ _ASSISTANT_AI_PROMPT = """אתה עוזר AI חכם, ידידותי ומדויק
 
 
 def _assistant_ai_enabled() -> bool:
-    return bool(os.environ.get("OPENAI_API_KEY")) and OpenAI is not None
+    """Gemini is preferred; OpenAI remains a backward-compatible fallback."""
+    return bool(os.environ.get("GEMINI_API_KEY")) or (
+        bool(os.environ.get("OPENAI_API_KEY")) and OpenAI is not None
+    )
+
+
+def _assistant_ai_payload_result(payload: dict) -> tuple[str | None, str | None]:
+    if payload.get("kind") == "rewrite" and isinstance(payload.get("canonical_text"), str):
+        return payload["canonical_text"].strip(), None
+    if payload.get("kind") in {"answer", "unsupported", "clarification"}:
+        return None, payload.get("reply") or "🤖 לא הצלחתי להבין את הבקשה במלואה. אפשר לנסח אותה אחרת?"
+    return None, None
+
+
+def _assistant_gemini_payload(text: str) -> dict:
+    """Call Gemini through its official REST endpoint without logging secrets."""
+    api_key = os.environ.get("GEMINI_API_KEY", "").strip()
+    model = os.environ.get("GEMINI_ASSISTANT_MODEL", "gemini-2.5-flash").strip()
+    if not api_key:
+        raise RuntimeError("GEMINI_API_KEY is not configured")
+    endpoint = (
+        "https://generativelanguage.googleapis.com/v1beta/models/"
+        f"{urllib.parse.quote(model, safe='.-_')}:generateContent?key="
+        f"{urllib.parse.quote(api_key, safe='')}"
+    )
+    body = {
+        "systemInstruction": {"parts": [{"text": _ASSISTANT_AI_PROMPT}]},
+        "contents": [{"role": "user", "parts": [{"text": text}]}],
+        "generationConfig": {
+            "temperature": 0.35,
+            "maxOutputTokens": 600,
+            "responseMimeType": "application/json",
+        },
+    }
+    request = urllib.request.Request(
+        endpoint,
+        data=json.dumps(body, ensure_ascii=False).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with urllib.request.urlopen(request, timeout=25) as response:
+        raw = json.loads(response.read().decode("utf-8"))
+    candidates = raw.get("candidates") or []
+    parts = ((candidates[0].get("content") or {}).get("parts") or []) if candidates else []
+    content = "".join(str(part.get("text", "")) for part in parts if isinstance(part, dict)).strip()
+    if not content:
+        raise RuntimeError("Gemini returned no text content")
+    return json.loads(content)
 
 
 async def _assistant_ai_rewrite(raw_text: str, user_id: int) -> tuple[str | None, str | None]:
-    """Use an optional LLM only as a constrained Hebrew intent rewriter."""
+    """Use Gemini or OpenAI only for language understanding; actions remain code-controlled."""
     text = raw_text.strip()
     if not _assistant_ai_enabled() or len(text) < 4:
         return None, None
     try:
-        client = OpenAI()
-        response = await asyncio.to_thread(
-            client.chat.completions.create,
-            model=os.environ.get("ADMIN_ASSISTANT_MODEL", "gpt-4o-mini"),
-            messages=[
-                {"role": "system", "content": _ASSISTANT_AI_PROMPT},
-                {"role": "user", "content": text},
-            ],
-            response_format=_ASSISTANT_AI_SCHEMA,
-            max_completion_tokens=500,
-        )
-        content = getattr(response.choices[0].message, "content", None)
-        if not content:
-            logger.warning("Optional assistant AI returned empty content; using deterministic fallback")
-            return None, None
-        payload = json.loads(content)
-        if payload.get("kind") == "rewrite" and isinstance(payload.get("canonical_text"), str):
-            return payload["canonical_text"].strip(), None
-        if payload.get("kind") in {"answer", "unsupported", "clarification"}:
-            return None, payload.get("reply") or "🤖 לא הצלחתי להבין את הבקשה במלואה. אפשר לנסח אותה אחרת?"
+        if os.environ.get("GEMINI_API_KEY"):
+            payload = await asyncio.to_thread(_assistant_gemini_payload, text)
+        else:
+            client = OpenAI()
+            response = await asyncio.to_thread(
+                client.chat.completions.create,
+                model=os.environ.get("ADMIN_ASSISTANT_MODEL", "gpt-4o-mini"),
+                messages=[
+                    {"role": "system", "content": _ASSISTANT_AI_PROMPT},
+                    {"role": "user", "content": text},
+                ],
+                response_format=_ASSISTANT_AI_SCHEMA,
+                max_completion_tokens=500,
+            )
+            content = getattr(response.choices[0].message, "content", None)
+            if not content:
+                raise RuntimeError("OpenAI returned no text content")
+            payload = json.loads(content)
+        return _assistant_ai_payload_result(payload)
     except Exception as exc:
-        logger.warning("Optional assistant AI intent layer failed; using deterministic fallback: %s", exc)
+        provider = "Gemini" if os.environ.get("GEMINI_API_KEY") else "OpenAI"
+        logger.warning("Assistant %s layer failed; using deterministic fallback: %s", provider, exc)
     return None, None
 
 

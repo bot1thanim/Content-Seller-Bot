@@ -32,7 +32,9 @@ class FakeClient:
 
 async def run() -> None:
     old_key = os.environ.get("OPENAI_API_KEY")
+    old_gemini_key = os.environ.get("GEMINI_API_KEY")
     os.environ["OPENAI_API_KEY"] = "test-only"
+    os.environ.pop("GEMINI_API_KEY", None)
     try:
         bot.OpenAI = lambda: FakeClient({
             "kind": "rewrite",
@@ -60,7 +62,21 @@ async def run() -> None:
         rewritten, reply = await bot._assistant_ai_rewrite("מה ההבדל בין גיבוי לשחזור?", 1)
         assert rewritten is None
         assert "שאלות כלליות" in reply
+
+        os.environ["GEMINI_API_KEY"] = "gemini-test-only"
+        bot._assistant_gemini_payload = lambda message: {
+            "kind": "answer",
+            "canonical_text": None,
+            "reply": "🤖 תשובת Gemini חופשית בעברית.",
+        }
+        rewritten, reply = await bot._assistant_ai_rewrite("ספר לי משהו כללי", 1)
+        assert rewritten is None
+        assert "Gemini" in reply
     finally:
+        if old_gemini_key is None:
+            os.environ.pop("GEMINI_API_KEY", None)
+        else:
+            os.environ["GEMINI_API_KEY"] = old_gemini_key
         if old_key is None:
             os.environ.pop("OPENAI_API_KEY", None)
         else:
