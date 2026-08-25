@@ -113,9 +113,12 @@ async def run() -> None:
         assert schema["properties"]["canonical_text"] == {"type": "string", "nullable": True}
         assert schema["properties"]["reply"] == {"type": "string", "nullable": True}
 
-        rewritten, reply = await bot._assistant_ai_rewrite("ספר לי משהו כללי", 1)
+        rewritten, reply = await bot._assistant_ai_rewrite(
+            "ספר לי משהו כללי", 1, runtime_context="מצב חי מורשה:\n- סרטונים במאגר: 4"
+        )
         assert rewritten is None
         assert "Gemini" in reply
+        assert "מצב חי מורשה" in captured["body"]["contents"][0]["parts"][0]["text"]
     finally:
         bot.urllib.request.urlopen = old_urlopen
         if old_gemini_key is None:

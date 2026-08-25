@@ -111,6 +111,8 @@ async def run():
             {"file_id": "f3", "duration": 20, "entry_id": "c", "category": "קצר"},
             {"file_id": "f4", "duration": 20, "entry_id": "d", "category": "קצר"},
         ])
+        assert bot._assistant_live_answer("כמה סרטונים יש במאגר?", owner) == "🎬 כרגע יש *4* סרטונים במאגר."
+        assert bot._assistant_live_answer("כמה סרטונים יש במאגר?", 12345) is None
         # The currency-multiplier button opens for the owner and explains its exact effect.
         multiplier_query = FakeQuery("admin_multiplier", owner)
         multiplier_state = await bot.admin_multiplier_start(

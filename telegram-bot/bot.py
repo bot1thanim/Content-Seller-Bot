@@ -1897,6 +1897,10 @@ _ASSISTANT_AI_PROMPT = """אתה עוזר AI חכם, ידידותי ומדויק
 שליחת כל הסרטונים, פתיחת גלריה, קטגוריות, כפילויות, סל מיחזור, סטטיסטיקה, הזמנות, משתמשים,
 אישור תשלום, שליחה למשתמש, הודעה לכולם, מטבעות, קופונים, דרגות, יומן, גיבוי, שחזור ותחזוקה.
 
+ייתכן שהודעת המשתמש כוללת בסופה "מצב חי מורשה" עם סיכומים מספריים בלבד מהבוט. אם הוא קיים,
+השתמש רק בו כדי לענות על שאלות עובדתיות על המערכת. אל תנחש נתון שאינו נמצא בו, אל תחשוף מזהי משתמשים,
+שמות, פרטי הזמנות, תוכן הודעות, מפתחות או רשומות גולמיות, ואל תטען שביצעת פעולה.
+
 החזר JSON בלבד. אם המשתמש מבקש פעולה קיימת שאפשר לתרגם לפקודה קצרה שהמערכת מבינה, החזר kind="rewrite"
 ו-canonical_text. אם המשתמש שואל שאלה, מבקש הסבר כללי או מנהל שיחה, החזר kind="answer" ו-reply מועיל,
 קצר וישיר. אל תטען שביצעת פעולה. אם הפעולה המבוקשת אינה קיימת, החזר kind="unsupported" והסבר זאת ב-reply.
@@ -1930,6 +1934,53 @@ def _assistant_ai_payload_result(payload: dict) -> tuple[str | None, str | None]
     if payload.get("kind") in {"answer", "unsupported", "clarification"}:
         return None, payload.get("reply") or "🤖 לא הצלחתי להבין את הבקשה במלואה. אפשר לנסח אותה אחרת?"
     return None, None
+
+
+def _assistant_live_answer(text: str, user_id: int) -> str | None:
+    """Answer common count/status questions from authorised live summaries only."""
+    asks_count = any(marker in text for marker in ("כמה", "כמות", "מספר"))
+    if asks_count and ("סרטונ" in text or "וידאו" in text) and any(marker in text for marker in ("מאגר", "ספריה", "ספרייה")):
+        if has_assistant_capability(user_id, "gallery"):
+            return f"🎬 כרגע יש *{len(load_json(VIDEOS_FILE))}* סרטונים במאגר."
+    if asks_count and "קטגור" in text:
+        if has_assistant_capability(user_id, "gallery"):
+            return f"🏷 כרגע מוגדרות *{len(load_settings().get('categories', []))}* קטגוריות."
+    if asks_count and "משתמש" in text:
+        if has_assistant_capability(user_id, "users"):
+            return f"👥 כרגע רשומים בבוט *{len(load_json(USERS_FILE))}* משתמשים."
+    if asks_count and "הזמנ" in text:
+        if has_assistant_capability(user_id, "users"):
+            return f"🧾 כרגע רשומות *{len(load_json(ORDERS_FILE))}* הזמנות."
+    if asks_count and ("סל" in text or "מחזור" in text or "אשפה" in text):
+        if has_assistant_capability(user_id, "duplicates"):
+            return f"🗑 כרגע יש *{len(load_json(TRASH_FILE))}* סרטונים בסל המיחזור."
+    if ("מצב" in text and "תחזוקה" in text) or "הבוט פעיל" in text:
+        if has_admin_permission(user_id, "maintenance"):
+            status = "פעיל" if load_settings().get("maintenance") else "כבוי"
+            return f"🔧 מצב התחזוקה כרגע: *{status}*."
+    return None
+
+
+def _assistant_safe_runtime_context(user_id: int) -> str:
+    """Provide Gemini with a minimal, permission-filtered live summary rather than raw data."""
+    facts = []
+    if has_assistant_capability(user_id, "gallery"):
+        facts.extend([
+            f"סרטונים במאגר: {len(load_json(VIDEOS_FILE))}",
+            f"קטגוריות: {len(load_settings().get('categories', []))}",
+        ])
+    if has_assistant_capability(user_id, "duplicates"):
+        facts.append(f"סרטונים בסל המיחזור: {len(load_json(TRASH_FILE))}")
+    if has_assistant_capability(user_id, "users"):
+        facts.extend([
+            f"משתמשים רשומים: {len(load_json(USERS_FILE))}",
+            f"הזמנות רשומות: {len(load_json(ORDERS_FILE))}",
+        ])
+    if has_assistant_capability(user_id, "coins"):
+        facts.append(f"מטבעות בסך הכול: {int(sum(load_json(COINS_FILE).values()))}")
+    if has_admin_permission(user_id, "maintenance"):
+        facts.append("מצב תחזוקה: " + ("פעיל" if load_settings().get("maintenance") else "כבוי"))
+    return "מצב חי מורשה:\n" + "\n".join(f"- {fact}" for fact in facts) if facts else ""
 
 
 def _assistant_gemini_payload(text: str) -> dict:
@@ -1998,14 +2049,17 @@ def _assistant_gemini_payload(text: str) -> dict:
     return payload
 
 
-async def _assistant_ai_rewrite(raw_text: str, user_id: int) -> tuple[str | None, str | None]:
+async def _assistant_ai_rewrite(
+    raw_text: str, user_id: int, runtime_context: str = ""
+) -> tuple[str | None, str | None]:
     """Use Gemini or OpenAI only for language understanding; actions remain code-controlled."""
     text = raw_text.strip()
     if not _assistant_ai_enabled() or len(text) < 4:
         return None, None
+    model_input = f"{text}\n\n{runtime_context}" if runtime_context else text
     try:
         if os.environ.get("GEMINI_API_KEY"):
-            payload = await asyncio.to_thread(_assistant_gemini_payload, text)
+            payload = await asyncio.to_thread(_assistant_gemini_payload, model_input)
         else:
             client = OpenAI()
             response = await asyncio.to_thread(
@@ -2013,7 +2067,7 @@ async def _assistant_ai_rewrite(raw_text: str, user_id: int) -> tuple[str | None
                 model=os.environ.get("ADMIN_ASSISTANT_MODEL", "gpt-4o-mini"),
                 messages=[
                     {"role": "system", "content": _ASSISTANT_AI_PROMPT},
-                    {"role": "user", "content": text},
+                    {"role": "user", "content": model_input},
                 ],
                 response_format=_ASSISTANT_AI_SCHEMA,
                 max_completion_tokens=500,
@@ -2243,6 +2297,14 @@ async def admin_assistant_command(update: Update, context: ContextTypes.DEFAULT_
     if not has_admin_permission(user_id, "assistant"):
         return ConversationHandler.END
     text = _assistant_normalize(update.message.text)
+    live_answer = _assistant_live_answer(text, user_id)
+    if live_answer:
+        await update.message.reply_text(
+            live_answer,
+            parse_mode="Markdown",
+            reply_markup=_assistant_navigation_keyboard(),
+        )
+        return ADMIN_ASSISTANT_COMMAND
     # Telegram displays this animation briefly while Gemini is preparing an answer.
     # It is sent only for external-AI processing and never changes bot permissions.
     chat_id = getattr(getattr(update, "effective_chat", None), "id", None)
@@ -2252,7 +2314,11 @@ async def admin_assistant_command(update: Update, context: ContextTypes.DEFAULT_
             await bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
         except (BadRequest, NetworkError, TimedOut):
             logger.debug("Could not show assistant typing indicator", exc_info=True)
-    ai_rewrite, ai_reply = await _assistant_ai_rewrite(text, user_id)
+    ai_rewrite, ai_reply = await _assistant_ai_rewrite(
+        text,
+        user_id,
+        runtime_context=_assistant_safe_runtime_context(user_id),
+    )
     if ai_reply:
         await update.message.reply_text(ai_reply, reply_markup=_assistant_navigation_keyboard())
         return ADMIN_ASSISTANT_COMMAND
