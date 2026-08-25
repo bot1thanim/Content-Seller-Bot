@@ -5956,15 +5956,16 @@ def main():
                 logger.error(f"Error in notify_back_online: {e}")
 
         def handle_polling_error(error):
-            """Stop only a superseded deployment when Telegram permits one poller."""
+            """Report polling errors while python-telegram-bot retries in the same process."""
             if isinstance(error, Conflict):
+                # Telegram permits one getUpdates poller per token. The updater's internal
+                # network loop backs off and retries; keeping this process alive prevents
+                # Render from marking a normal rolling-deploy handoff as an early exit.
                 logger.info(
-                    "Polling conflict: another deployment owns the Telegram poller; "
-                    "stopping this superseded instance."
+                    "Polling conflict: another instance temporarily owns the Telegram poller; "
+                    "waiting for the automatic retry."
                 )
-                # Telegram permits one getUpdates poller per token. During a rolling deploy,
-                # the previous instance must exit rather than retry forever in parallel.
-                os._exit(0)
+                return
             logger.error("Recoverable polling error: %s", error)
 
         # הפעלת הפולינג
