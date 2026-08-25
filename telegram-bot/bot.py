@@ -2013,7 +2013,7 @@ async def _assistant_apply_reward_command(
         f"עודכנו תגמולים: מתנה יומית {settings['daily_gift_amount']}, תגמול הפניה {settings['referral_reward_amount']}.",
     )
     await update.message.reply_text(
-        "✅ Gemini הבין את הבקשה והבוט עדכן את ההגדרות הקיימות.\n\n"
+        "✅ הבוט הבין את הבקשה ועדכן את ההגדרות הקיימות.\n\n"
         f"🎁 מתנה יומית: *{settings['daily_gift_amount']}* מטבעות\n"
         f"👥 תגמול הפניה: *{settings['referral_reward_amount']}* מטבעות\n\n"
         "הערכים משפיעים על זיכויים עתידיים בלבד; יתרות קיימות לא משתנות.",

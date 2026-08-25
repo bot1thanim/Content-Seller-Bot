@@ -127,7 +127,7 @@ async def run():
             reward_settings = bot.load_settings()
             assert reward_settings["daily_gift_amount"] == 3
             assert reward_settings["referral_reward_amount"] == 2
-            assert "Gemini הבין" in reward_message.replies[-1][0]
+            assert "הבוט הבין" in reward_message.replies[-1][0]
         finally:
             bot._assistant_gemini_payload = previous_reward_payload
             if previous_reward_key is None:
