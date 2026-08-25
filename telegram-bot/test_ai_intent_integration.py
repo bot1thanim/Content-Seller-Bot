@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import importlib.util
 import json
 import os
@@ -135,6 +136,18 @@ async def run() -> None:
         rewritten, reply = await bot._assistant_ai_rewrite("תעשה מתנות 3 והפניות 2", 1)
         assert rewritten == "SET_REWARDS:3,2"
         assert reply is None
+
+        image_bytes = base64.b64encode(b"image-test").decode("ascii")
+        def fake_image_urlopen(request, timeout):
+            assert request.full_url.endswith("/v1beta/interactions")
+            assert timeout == 60
+            body = json.loads(request.data.decode("utf-8"))
+            assert body["model"] == "gemini-2.5-flash-image"
+            return FakeGeminiResponse({"outputs": [{"type": "image", "mime_type": "image/png", "data": image_bytes}]})
+
+        bot.urllib.request.urlopen = fake_image_urlopen
+        image, mime = bot._assistant_gemini_image("create a blue icon")
+        assert image == b"image-test" and mime == "image/png"
     finally:
         bot.urllib.request.urlopen = old_urlopen
         if old_gemini_key is None:

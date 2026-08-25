@@ -89,6 +89,13 @@ async def run_tests():
                 button.callback_data for row in main_keyboard.inline_keyboard for button in row
             ]
             assert main_callbacks.index('referrals') < main_callbacks.index('purchase_help')
+            assert 'lang_menu' in main_callbacks, 'Language selection must be available from the main menu'
+            users = bot.load_json(bot.USERS_FILE)
+            users['100']['language'] = 'en'
+            bot.save_json(bot.USERS_FILE, users)
+            english_keyboard = bot.get_main_keyboard(100)
+            english_labels = [button.text for row in english_keyboard.inline_keyboard for button in row]
+            assert '🎁 Daily gift' in english_labels and '🌐 Language' in english_labels
 
             # Public delivery remains random, never repeats prior deliveries, and excludes broken records.
             context = SimpleNamespace(bot=FakeBot(), user_data={})

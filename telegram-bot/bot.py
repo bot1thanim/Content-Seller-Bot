@@ -1,6 +1,8 @@
 import io
 import os
 import json
+import base64
+import io
 import hashlib
 import random
 import asyncio
@@ -490,6 +492,7 @@ ADMIN_PERMISSIONS = [
     ("audit_log", "📜 יומן פעולות"),
     ("backup", "💾 גיבוי ושחזור"),
     ("dangerous_delete", "🗑 מחיקה לצמיתות ואיפוס"),
+    ("media", "🎨 יצירת תמונות וקבצים עם AI"),
 ]
 PERMISSION_LABELS = dict(ADMIN_PERMISSIONS)
 
@@ -504,6 +507,8 @@ ASSISTANT_CAPABILITIES = [
     ("coins", "🪙 מטבעות, קופונים ודרגות"),
     ("audit_log", "📜 יומן פעולות"),
     ("backup", "💾 גיבוי ושחזור"),
+    ("maintenance", "🔧 מצב תחזוקה"),
+    ("media", "🎨 יצירת תמונות עם AI"),
 ]
 ASSISTANT_CAPABILITY_LABELS = dict(ASSISTANT_CAPABILITIES)
 
@@ -558,7 +563,7 @@ def callback_permission(callback_data: str) -> str | None:
         return "panel"
     if callback_data == "admin_owner_assistant_settings":
         return "owner"
-    if callback_data in {"admin_assistant", "admin_assistant_back"}:
+    if callback_data in {"admin_assistant", "admin_assistant_back"} or callback_data.startswith("assistant_"):
         return "assistant"
     if callback_data == "admin_gallery":
         return "gallery_or_duplicates"
@@ -785,6 +790,7 @@ def register_user(user, ref_id=None):
             "id": user.id,
             "first_name": user.first_name,
             "username": user.username,
+            "language": None,
             "joined": today,
             "purchases": 0,
             "total_spent": 0,
@@ -899,8 +905,80 @@ def build_zip_of_data() -> io.BytesIO:
 
 # ─── Keyboard builders ────────────────────────────────────────────────────────
 
+
+def get_user_language(user_id: int | str) -> str:
+    """Return the persisted UI language; existing users safely default to Hebrew."""
+    user = load_json(USERS_FILE).get(str(user_id), {})
+    return "en" if user.get("language") == "en" else "he"
+
+
+def _language_selection_markup() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("עברית", callback_data="lang_he"), InlineKeyboardButton("English", callback_data="lang_en")],
+    ])
+
+
+def _main_welcome(user_id: int | str, first_name: str) -> str:
+    vip = get_user_vip(str(user_id))
+    if get_user_language(user_id) == "en":
+        return (
+            f"Hello {first_name} 👋\n"
+            f"Tier: {vip['icon']} *{vip['name']}* ({int(vip['discount'] * 100)}% discount)\n"
+            "Welcome to the private content bot 🤫\nChoose an option:"
+        )
+    return (
+        f"שלום {first_name} 👋\n"
+        f"דרגה: {vip['icon']} *{vip['name']}* ({int(vip['discount'] * 100)}% הנחה)\n"
+        "ברוכים הבאים לבוט התכנים האסורים 🤫\nבחר אפשרות:"
+    )
+
+
+def _new_user_guide(language: str) -> str:
+    if language == "en":
+        return """📖 *Quick guide for new users:*
+
+💰 *How do I get videos?*
+• Tap '🎁 Daily gift' for a daily bonus.
+• Invite friends through '👥 My referrals' and earn a coin for every friend.
+• Buy packages through '💳 Payment'.
+
+🎬 *How do I receive content?*
+Once you have enough coins, you can purchase videos and they will be sent to you here in the chat.
+
+💬 For any question, use the Support button."""
+    return """📖 *מדריך קצר למשתמש החדש:*
+
+💰 *איך משיגים סרטונים?*
+• לוחצים על '🎁 מתנה יומית' ומקבלים בונוס כל יום!
+• מזמינים חברים דרך '👥 הפניות שלי' ומקבלים מטבע על כל חבר.
+• קונים חבילות מטבעות דרך '💳 תשלום'.
+
+🎬 *איך צופים בתכנים?*
+ברגע שיש לך מספיק מטבעות, תוכל לרכוש סרטונים והם יישלחו אליך מיד כאן בצ'אט!
+
+💬 בכל שאלה, כפתור 'תמיכה' זמין עבורך."""
+
+
 def get_main_keyboard(user_id):
     vip = get_user_vip(str(user_id))
+    if get_user_language(user_id) == "en":
+        return InlineKeyboardMarkup([
+            [
+                InlineKeyboardButton(f"{vip['icon']} {vip['name']} tier", callback_data="vip_info"),
+                InlineKeyboardButton("🎁 Daily gift", callback_data="daily_bonus"),
+            ],
+            [
+                InlineKeyboardButton("💳 Payment", callback_data="payment_method"),
+                InlineKeyboardButton("👥 My referrals", callback_data="referrals"),
+            ],
+            [
+                InlineKeyboardButton("💰 Coin wallet", callback_data="wallet"),
+                InlineKeyboardButton("🎟 Redeem coupon", callback_data="coupon_redeem"),
+            ],
+            [InlineKeyboardButton("ℹ️ How it works", callback_data="purchase_help")],
+            [InlineKeyboardButton("💬 Support", callback_data="support")],
+            [InlineKeyboardButton("🌐 Language", callback_data="lang_menu")],
+        ])
     return InlineKeyboardMarkup([
         [
             InlineKeyboardButton(f"{vip['icon']} רמת {vip['name']}", callback_data="vip_info"),
@@ -916,6 +994,7 @@ def get_main_keyboard(user_id):
         ],
         [InlineKeyboardButton("ℹ️ איך זה עובד?", callback_data="purchase_help")],
         [InlineKeyboardButton("💬 תמיכה", callback_data="support")],
+        [InlineKeyboardButton("🌐 שפה / Language", callback_data="lang_menu")],
     ])
 
 def get_admin_reply_keyboard():
@@ -1055,23 +1134,23 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except ValueError:
             pass
 
+    users_before = load_json(USERS_FILE)
+    is_new_user = str(user.id) not in users_before
     register_user(user, ref_id)
 
     # Welcome guide for new users
     users = load_json(USERS_FILE)
+    if is_new_user:
+        await update.message.reply_text(
+            "🌐 בחר שפה / Choose your language:",
+            reply_markup=_language_selection_markup(),
+        )
+        return
+    if str(user.id) in users and users[str(user.id)].get("language") not in {"he", "en"}:
+        users[str(user.id)]["language"] = "he"
+        save_json(USERS_FILE, users)
     if str(user.id) not in users or not users[str(user.id)].get("seen_guide"):
-        guide = """📖 *מדריך קצר למשתמש החדש:*
-
-💰 *איך משיגים סרטונים?*
-• לוחצים על '🎁 מתנה יומית' ומקבלים בונוס כל יום!
-• מזמינים חברים דרך '👥 הפניות שלי' ומקבלים מטבע על כל חבר.
-• קונים חבילות מטבעות דרך '💳 תשלום'.
-
-🎬 *איך צופים בתכנים?*
-ברגע שיש לך מספיק מטבעות, תוכל לרכוש סרטונים והם יישלחו אליך מיד כאן בצ'אט!
-
-💬 בכל שאלה, כפתור 'תמיכה' זמין עבורך."""
-        await update.message.reply_text(guide, parse_mode="Markdown")
+        await update.message.reply_text(_new_user_guide(get_user_language(user.id)), parse_mode="Markdown")
         if str(user.id) in users:
             users[str(user.id)]["seen_guide"] = True
             save_json(USERS_FILE, users)
@@ -1080,11 +1159,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if is_admin(user.id):
         await update.message.reply_text("👋 ברוך הבא בפאנל הניהול!", reply_markup=get_admin_reply_keyboard())
 
-    vip = get_user_vip(str(user.id))
     await update.message.reply_text(
-        f"שלום {user.first_name} 👋\n"
-        f"דרגה: {vip['icon']} *{vip['name']}* ({int(vip['discount']*100)}% הנחה)\n"
-        f"ברוכים הבאים לבוט התכנים האסורים 🤫\nבחר אפשרות:",
+        _main_welcome(user.id, user.first_name),
         parse_mode="Markdown",
         reply_markup=get_main_keyboard(user.id),
     )
@@ -1093,11 +1169,42 @@ async def back_main(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     user  = query.from_user
-    vip = get_user_vip(str(user.id))
     await query.edit_message_text(
-        f"שלום {user.first_name} 👋\n"
-        f"דרגה: {vip['icon']} *{vip['name']}* ({int(vip['discount']*100)}% הנחה)\n"
-        f"ברוכים הבאים לבוט התכנים האסורים 🤫\nבחר אפשרות:",
+        _main_welcome(user.id, user.first_name),
+        parse_mode="Markdown",
+        reply_markup=get_main_keyboard(user.id),
+    )
+
+
+async def language_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    await query.edit_message_text(
+        "🌐 בחר שפה / Choose your language:",
+        reply_markup=_language_selection_markup(),
+    )
+
+
+async def language_set(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    language = query.data.removeprefix("lang_")
+    if language not in {"he", "en"}:
+        return
+    uid = str(query.from_user.id)
+    users = load_json(USERS_FILE)
+    if uid not in users:
+        return
+    users[uid]["language"] = language
+    if not users[uid].get("seen_guide"):
+        users[uid]["seen_guide"] = True
+        save_json(USERS_FILE, users)
+        await query.message.reply_text(_new_user_guide(language), parse_mode="Markdown")
+    else:
+        save_json(USERS_FILE, users)
+    user = query.from_user
+    await query.edit_message_text(
+        _main_welcome(user.id, user.first_name),
         parse_mode="Markdown",
         reply_markup=get_main_keyboard(user.id),
     )
@@ -1110,6 +1217,7 @@ async def daily_bonus(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = str(query.from_user.id)
     users = load_json(USERS_FILE)
     user_data = users.get(uid, {})
+    english = get_user_language(uid) == "en"
     
     # Use timestamp for exact 24h timer
     last_bonus_ts = user_data.get("last_bonus_ts", 0)
@@ -1119,7 +1227,11 @@ async def daily_bonus(update: Update, context: ContextTypes.DEFAULT_TYPE):
         remaining = int(24 * 3600 - (now_ts - last_bonus_ts))
         hours = remaining // 3600
         minutes = (remaining % 3600) // 60
-        await query.answer(f"⏳ נשאר עוד {hours} שעות ו-{minutes} דקות לקבלת המתנה הבאה!", show_alert=True)
+        await query.answer(
+            f"⏳ Your next gift is available in {hours}h {minutes}m." if english
+            else f"⏳ נשאר עוד {hours} שעות ו-{minutes} דקות לקבלת המתנה הבאה!",
+            show_alert=True,
+        )
         return
         
     bonus_amount = max(0, int(load_settings().get("daily_gift_amount", 1)))
@@ -1134,13 +1246,17 @@ async def daily_bonus(update: Update, context: ContextTypes.DEFAULT_TYPE):
     coins[uid] = new_balance
     save_json(COINS_FILE, coins)
     
-    await query.answer(f"🎁 קיבלת {bonus_amount} מטבע! כעת יש לך בסך הכול {new_balance} מטבעות.", show_alert=True)
+    await query.answer(
+        f"🎁 You received {bonus_amount} coins. Your total is now {new_balance}." if english
+        else f"🎁 קיבלת {bonus_amount} מטבע! כעת יש לך בסך הכול {new_balance} מטבעות.",
+        show_alert=True,
+    )
     await query.edit_message_text(
-        f"🎁 *המתנה היומית התקבלה!*\n\n"
-        f"קיבלת עכשיו: *{bonus_amount} מטבעות*\n"
-        f"💰 יש לך בסך הכול: *{new_balance} מטבעות*",
+        (f"🎁 *Daily gift received!*\n\nYou received: *{bonus_amount} coins*\n💰 Your total: *{new_balance} coins*"
+         if english else
+         f"🎁 *המתנה היומית התקבלה!*\n\nקיבלת עכשיו: *{bonus_amount} מטבעות*\n💰 יש לך בסך הכול: *{new_balance} מטבעות*"),
         parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 חזרה לתפריט", callback_data="back_main")]]),
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back to menu" if english else "🔙 חזרה לתפריט", callback_data="back_main")]]),
     )
 
 # ─── VIP Info ────────────────────────────────────────────────────────────────
@@ -1152,20 +1268,18 @@ async def vip_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_vip = get_user_vip(uid)
     users = load_json(USERS_FILE)
     purchases = users.get(uid, {}).get("purchases", 0)
-    
-    text = f"👑 *מערכת דרגות VIP*\n\n"
-    text += f"הדרגה שלך: {user_vip['icon']} *{user_vip['name']}*\n"
-    text += f"רכישות שביצעת: *{purchases}*\n\n"
-    text += "📊 *טבלת דרגות:*\n"
+    english = get_user_language(uid) == "en"
+    text = (f"👑 *VIP tiers*\n\nYour tier: {user_vip['icon']} *{user_vip['name']}*\nPurchases: *{purchases}*\n\n📊 *Tier table:*\n"
+            if english else f"👑 *מערכת דרגות VIP*\n\nהדרגה שלך: {user_vip['icon']} *{user_vip['name']}*\nרכישות שביצעת: *{purchases}*\n\n📊 *טבלת דרגות:*\n")
     for level in VIP_LEVELS:
-        text += f"{level['icon']} *{level['name']}*: {level['min_purchases']}+ רכישות | {int(level['discount']*100)}% הנחה\n"
-    
-    text += "\n_ההנחה חלה באופן אוטומטי על תשלום בפייפאל ובמטבעות._"
+        text += (f"{level['icon']} *{level['name']}*: {level['min_purchases']}+ purchases | {int(level['discount']*100)}% discount\n"
+                 if english else f"{level['icon']} *{level['name']}*: {level['min_purchases']}+ רכישות | {int(level['discount']*100)}% הנחה\n")
+    text += "\n_Discounts apply automatically to PayPal and coin payments._" if english else "\n_ההנחה חלה באופן אוטומטי על תשלום בפייפאל ובמטבעות._"
     
     await query.edit_message_text(
         text,
         parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 חזרה", callback_data="back_main")]]),
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back" if english else "🔙 חזרה", callback_data="back_main")]]),
     )
 
 # ─── Payment ──────────────────────────────────────────────────────────────────
@@ -1175,7 +1289,15 @@ async def purchase_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     if await maintenance_gate(update):
         return
+    english = get_user_language(query.from_user.id) == "en"
     text = (
+        "ℹ️ *How do I purchase and receive videos?*\n\n"
+        "1️⃣ Choose a package and pay with PayPal or coins.\n"
+        "2️⃣ After payment approval, the bot sends the package quantity.\n"
+        "3️⃣ Videos are selected *randomly* from the library; you do not choose a specific video.\n"
+        "4️⃣ The bot only sends each user videos they have not received before.\n\n"
+        "For PayPal, send proof of payment through Support. With coins, videos are sent immediately after approval."
+        if english else
         "ℹ️ *איך קונים ומקבלים סרטונים?*\n\n"
         "1️⃣ בוחרים חבילה ותשלום בפייפאל או במטבעות.\n"
         "2️⃣ לאחר אישור התשלום, הבוט שולח את כמות הסרטונים שבחבילה.\n"
@@ -1188,8 +1310,8 @@ async def purchase_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text,
         parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("💳 לרכישה", callback_data="payment_method")],
-            [InlineKeyboardButton("🔙 חזרה", callback_data="back_main")],
+            [InlineKeyboardButton("💳 Purchase" if english else "💳 לרכישה", callback_data="payment_method")],
+            [InlineKeyboardButton("🔙 Back" if english else "🔙 חזרה", callback_data="back_main")],
         ]),
     )
 
@@ -1201,16 +1323,16 @@ async def payment_method_menu(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
     coins = load_json(COINS_FILE)
     balance = coins.get(str(query.from_user.id), 0)
+    english = get_user_language(query.from_user.id) == "en"
     await query.edit_message_text(
-        "💰 *רכישת סרטונים*\n\n"
-        "הסרטונים נשלחים באקראי ורק כאלה שעדיין לא קיבלת. "
-        "בחר אמצעי תשלום:",
+        ("💰 *Purchase videos*\n\nVideos are random and you only receive ones you have not received before. Choose a payment method:"
+         if english else "💰 *רכישת סרטונים*\n\nהסרטונים נשלחים באקראי ורק כאלה שעדיין לא קיבלת. בחר אמצעי תשלום:"),
         parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("💳 תשלום בפייפאל", callback_data="paypal_menu")],
-            [InlineKeyboardButton(f"🪙 שלם במטבעות (יתרה: {balance})", callback_data="coins_menu")],
-            [InlineKeyboardButton("ℹ️ הסבר על הרכישה", callback_data="purchase_help")],
-            [InlineKeyboardButton("🔙 חזרה", callback_data="back_main")],
+            [InlineKeyboardButton("💳 Pay with PayPal" if english else "💳 תשלום בפייפאל", callback_data="paypal_menu")],
+            [InlineKeyboardButton(f"🪙 Pay with coins (balance: {balance})" if english else f"🪙 שלם במטבעות (יתרה: {balance})", callback_data="coins_menu")],
+            [InlineKeyboardButton("ℹ️ Purchase guide" if english else "ℹ️ הסבר על הרכישה", callback_data="purchase_help")],
+            [InlineKeyboardButton("🔙 Back" if english else "🔙 חזרה", callback_data="back_main")],
         ]),
     )
 
@@ -1221,18 +1343,19 @@ async def paypal_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     uid = str(query.from_user.id)
     vip = get_user_vip(uid)
+    english = get_user_language(uid) == "en"
     
     btns = []
     for i, p in enumerate(PACKAGES):
         discounted = round(p["price"] * (1 - vip["discount"]), 2)
-        label = f"₪{discounted} – {p['videos']} סרטונים"
+        label = f"₪{discounted} – {p['videos']} videos" if english else f"₪{discounted} – {p['videos']} סרטונים"
         if vip["discount"] > 0:
-            label += f" ({int(vip['discount']*100)}% הנחה)"
+            label += f" ({int(vip['discount']*100)}% {'discount' if english else 'הנחה'})"
         btns.append([InlineKeyboardButton(label, callback_data=f"pp_{i}")])
         
-    btns.append([InlineKeyboardButton("🔙 חזרה", callback_data="payment_method")])
+    btns.append([InlineKeyboardButton("🔙 Back" if english else "🔙 חזרה", callback_data="payment_method")])
     await query.edit_message_text(
-        "💳 *תשלום בפייפאל*\n\nבחר חבילה לרכישה:",
+        "💳 *PayPal payment*\n\nChoose a package:" if english else "💳 *תשלום בפייפאל*\n\nבחר חבילה לרכישה:",
         parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup(btns),
     )
@@ -1285,18 +1408,20 @@ async def coins_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     vip = get_user_vip(uid)
     coins_d = load_json(COINS_FILE)
     balance = coins_d.get(uid, 0)
+    english = get_user_language(uid) == "en"
     
     btns = []
     for i, p in enumerate(PACKAGES):
         discounted = int(p["coins"] * (1 - vip["discount"]))
-        label = f"🪙{discounted} – {p['videos']} סרטונים"
+        label = f"🪙{discounted} – {p['videos']} videos" if english else f"🪙{discounted} – {p['videos']} סרטונים"
         if vip["discount"] > 0:
-            label += f" ({int(vip['discount']*100)}% הנחה)"
+            label += f" ({int(vip['discount']*100)}% {'discount' if english else 'הנחה'})"
         btns.append([InlineKeyboardButton(label, callback_data=f"coin_{i}")])
         
-    btns.append([InlineKeyboardButton("🔙 חזרה", callback_data="payment_method")])
+    btns.append([InlineKeyboardButton("🔙 Back" if english else "🔙 חזרה", callback_data="payment_method")])
     await query.edit_message_text(
-        f"🪙 *רכישה באמצעות מטבעות*\n\nהיתרה שלך: *{balance}*\nבחר חבילה:",
+        (f"🪙 *Purchase with coins*\n\nYour balance: *{balance}*\nChoose a package:" if english
+         else f"🪙 *רכישה באמצעות מטבעות*\n\nהיתרה שלך: *{balance}*\nבחר חבילה:"),
         parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup(btns),
     )
@@ -1908,6 +2033,12 @@ SET_DAILY_GIFT:<מספר שלם אי-שלילי>, SET_REFERRAL_REWARD:<מספר 
 SET_DAILY_GIFT:3, ו"תעשה מתנות 3 והפניות 2" צריך להחזיר SET_REWARDS:3,2.
 פעולות אלו קיימות במערכת, לכן אל תסמן אותן כלא נתמכות. אם המשתמש שואל שאלה, מבקש הסבר כללי או מנהל שיחה, החזר kind="answer" ו-reply מועיל,
 קצר וישיר. אל תטען שביצעת פעולה. אם הפעולה המבוקשת אינה קיימת, החזר kind="unsupported" והסבר זאת ב-reply.
+
+לתשלום ולשליטה במטבעות, אפשר להשתמש גם ב-ADJUST_COINS:<מזהה משתמש רשום>:<מספר שלם עם פלוס או מינוס>.
+לדוגמה, "תוסיף 5 מטבעות למשתמש 123" מחזיר ADJUST_COINS:123:+5.
+להפעלת או כיבוי מצב תחזוקה השתמש ב-SET_MAINTENANCE:on או SET_MAINTENANCE:off.
+פעולת תחזוקה תבקש אישור מהמשתמש לפני ביצוע.
+לבקשה ליצור תמונה, החזר kind="rewrite" ו-GENERATE_IMAGE:<תיאור התמונה בשפת המשתמש>. אל תשתמש בזה לבקשה שאינה תמונה.
 אם חסר מידע הכרחי לביצוע פעולה, החזר kind="clarification" ושאל רק את שאלת ההבהרה הדרושה.
 אל תבצע פעולות, אל תנהל הרשאות ואל תחזיר טוקנים או מידע אישי.
 """
@@ -2021,6 +2152,156 @@ async def _assistant_apply_reward_command(
         reply_markup=_assistant_navigation_keyboard(),
     )
     return True
+
+
+async def _assistant_apply_runtime_command(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, canonical_text: str, user_id: int
+) -> bool:
+    """Execute a small allowlist of Gemini-translated operations with validation and confirmations."""
+    coin_match = re.fullmatch(r"ADJUST_COINS:(\d+):([+-]?\d+)", canonical_text)
+    if coin_match:
+        if not has_assistant_capability(user_id, "coins"):
+            await update.message.reply_text("⛔ אין לך הרשאה לעדכן יתרות מטבעות דרך העוזר.", reply_markup=_assistant_navigation_keyboard())
+            return True
+        target_id, amount_text = coin_match.groups()
+        amount = int(amount_text)
+        users = load_json(USERS_FILE)
+        if target_id not in users:
+            await update.message.reply_text("❌ מזהה המשתמש אינו תקין או שהמשתמש עדיין לא התחיל את הבוט.", reply_markup=_assistant_navigation_keyboard())
+            return True
+        if amount == 0:
+            await update.message.reply_text("❌ כמות המטבעות חייבת להיות שונה מאפס.", reply_markup=_assistant_navigation_keyboard())
+            return True
+        coins = load_json(COINS_FILE)
+        old_balance = int(coins.get(target_id, 0) or 0)
+        new_balance = max(0, old_balance + amount)
+        applied = new_balance - old_balance
+        coins[target_id] = new_balance
+        save_json(COINS_FILE, coins)
+        log_admin_action(user_id, "assistant_coin_adjustment", {"target_id": target_id, "change": applied, "new_balance": new_balance})
+        action_word = "נוספו" if applied >= 0 else "הוסרו"
+        await update.message.reply_text(
+            f"✅ הבוט עדכן את יתרת המטבעות.\n\n{abs(applied)} מטבעות {action_word}.\nיתרה חדשה: *{new_balance}*",
+            parse_mode="Markdown",
+            reply_markup=_assistant_navigation_keyboard(),
+        )
+        return True
+
+    maintenance_match = re.fullmatch(r"SET_MAINTENANCE:(on|off)", canonical_text)
+    if maintenance_match:
+        if not has_assistant_capability(user_id, "maintenance"):
+            await update.message.reply_text("⛔ אין לך הרשאה לשנות את מצב התחזוקה דרך העוזר.", reply_markup=_assistant_navigation_keyboard())
+            return True
+        enabled = maintenance_match.group(1) == "on"
+        context.user_data["assistant_pending_action"] = {"name": "maintenance", "enabled": enabled, "actor_id": user_id}
+        action_text = "להפעיל" if enabled else "לכבות"
+        await update.message.reply_text(
+            f"⚠️ הבקשה עומדת {action_text} את מצב התחזוקה. משתמשים רגילים לא יוכלו לבצע פעולות בזמן שהתחזוקה פעילה.\n\nלאשר?",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("✅ אשר", callback_data="assistant_confirm_action")],
+                [InlineKeyboardButton("❌ ביטול", callback_data="assistant_cancel_action")],
+            ]),
+        )
+        return True
+    if canonical_text.startswith("GENERATE_IMAGE:"):
+        prompt = canonical_text.removeprefix("GENERATE_IMAGE:").strip()
+        if not prompt:
+            return False
+        if not has_assistant_capability(user_id, "media"):
+            await update.message.reply_text("⛔ אין לך הרשאה ליצור תמונות דרך העוזר.", reply_markup=_assistant_navigation_keyboard())
+            return True
+        if not os.environ.get("GEMINI_API_KEY"):
+            await update.message.reply_text("❌ יצירת תמונות אינה זמינה כי מפתח Gemini לא הוגדר.", reply_markup=_assistant_navigation_keyboard())
+            return True
+        try:
+            image_bytes, mime_type = await asyncio.to_thread(_assistant_gemini_image, prompt)
+            photo = io.BytesIO(image_bytes)
+            photo.name = "gemini_image.png" if mime_type.endswith("png") else "gemini_image.jpg"
+            await update.message.reply_photo(photo=photo, caption="🎨 התמונה מוכנה.")
+            log_admin_action(user_id, "assistant_image_generated", {"mime_type": mime_type})
+        except Exception as exc:
+            logger.warning("Gemini image request failed: %s", type(exc).__name__)
+            await update.message.reply_text(
+                "❌ הבוט לא הצליח ליצור תמונה כרגע. ייתכן שמודל התמונות אינו זמין עבור מפתח Gemini הזה או שהבקשה נדחתה.",
+                reply_markup=_assistant_navigation_keyboard(),
+            )
+        return True
+    return False
+
+
+def _assistant_gemini_image(prompt: str) -> tuple[bytes, str]:
+    """Call Gemini's image endpoint without logging prompts, tokens or response bodies."""
+    api_key = os.environ.get("GEMINI_API_KEY", "").strip()
+    if not api_key:
+        raise RuntimeError("Gemini API key missing")
+    model = os.environ.get("GEMINI_IMAGE_MODEL", "gemini-2.5-flash-image").strip()
+    payload = {
+        "model": model,
+        "input": [{"type": "text", "text": prompt}],
+    }
+    request = urllib.request.Request(
+        "https://generativelanguage.googleapis.com/v1beta/interactions",
+        data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+        headers={"Content-Type": "application/json", "x-goog-api-key": api_key},
+        method="POST",
+    )
+    with urllib.request.urlopen(request, timeout=60) as response:
+        response_payload = json.loads(response.read().decode("utf-8"))
+
+    def locate_image(value):
+        if isinstance(value, dict):
+            data = value.get("data")
+            mime_type = value.get("mime_type") or value.get("mimeType") or ""
+            item_type = value.get("type", "")
+            if isinstance(data, str) and (str(item_type) == "image" or str(mime_type).startswith("image/")):
+                return data, str(mime_type or "image/png")
+            for child in value.values():
+                found = locate_image(child)
+                if found:
+                    return found
+        if isinstance(value, list):
+            for child in value:
+                found = locate_image(child)
+                if found:
+                    return found
+        return None
+
+    found = locate_image(response_payload)
+    if not found:
+        raise RuntimeError("Gemini returned no image")
+    encoded, mime_type = found
+    return base64.b64decode(encoded), mime_type
+
+
+async def assistant_confirm_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Apply a confirmed assistant plan and never trust plan data from another manager."""
+    query = update.callback_query
+    await query.answer()
+    plan = context.user_data.pop("assistant_pending_action", None)
+    if not isinstance(plan, dict) or plan.get("actor_id") != query.from_user.id:
+        await query.edit_message_text("❌ אין פעולה תקפה שממתינה לאישור.", reply_markup=_assistant_navigation_keyboard())
+        return
+    if plan.get("name") != "maintenance" or not has_assistant_capability(query.from_user.id, "maintenance"):
+        await query.edit_message_text("⛔ הפעולה אינה מורשית.", reply_markup=_assistant_navigation_keyboard())
+        return
+    settings = load_settings()
+    enabled = bool(plan.get("enabled"))
+    settings["maintenance"] = enabled
+    if enabled:
+        settings["waiting_users"] = []
+    save_settings(settings)
+    log_admin_action(query.from_user.id, "assistant_maintenance_update", {"enabled": enabled})
+    await query.edit_message_text(
+        f"✅ הבוט עדכן את מצב התחזוקה ל־{'פעיל' if enabled else 'כבוי'}.",
+        reply_markup=_assistant_navigation_keyboard(),
+    )
+
+
+async def assistant_cancel_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    context.user_data.pop("assistant_pending_action", None)
+    await query.edit_message_text("❌ הפעולה בוטלה ולא בוצע שינוי.", reply_markup=_assistant_navigation_keyboard())
 
 
 def _assistant_live_answer(text: str, user_id: int) -> str | None:
@@ -2417,6 +2698,8 @@ async def admin_assistant_command(update: Update, context: ContextTypes.DEFAULT_
         return ADMIN_ASSISTANT_COMMAND
     if ai_rewrite and ai_rewrite != text:
         if await _assistant_apply_reward_command(update, context, ai_rewrite, user_id):
+            return ADMIN_ASSISTANT_COMMAND
+        if await _assistant_apply_runtime_command(update, context, ai_rewrite, user_id):
             return ADMIN_ASSISTANT_COMMAND
         text = _assistant_normalize(ai_rewrite)
     explanation_markers = (
@@ -6002,6 +6285,8 @@ def main():
         ("^referrals$",                 referrals_menu),
         ("^wallet$",                    wallet_menu),
         ("^daily_bonus$",               daily_bonus),
+        ("^lang_menu$",                 language_menu),
+        (r"^lang_(he|en)$",             language_set),
         ("^vip_info$",                  vip_info),
         ("^back_main$",                 back_main),
         ("^admin_menu_users$",          admin_menu_users),
@@ -6019,6 +6304,8 @@ def main():
         (r"^admin_mgr_assist_toggle_.+$", admin_manager_assistant_toggle),
         (r"^admin_mgr_toggle_.+$",       admin_manager_toggle),
         ("^admin_assistant_back$",        admin_assistant_back),
+        ("^assistant_confirm_action$",    assistant_confirm_action),
+        ("^assistant_cancel_action$",     assistant_cancel_action),
         ("^admin_mgr_remove$",           admin_manager_remove),
         ("^admin_stats$",               admin_stats),
         (r"^admin_actions_page_\d+$",    admin_actions_page),
