@@ -5954,36 +5954,24 @@ def main():
                 logger.error(f"Error in notify_back_online: {e}")
 
         def handle_polling_error(error):
-            """Exit a superseded Render instance instead of leaving it alive without polling."""
+            """Stop only a superseded deployment when Telegram permits one poller."""
             if isinstance(error, Conflict):
                 logger.info(
-                    "Polling conflict: this instance was superseded by another deployment; "
-                    "exiting cleanly."
+                    "Polling conflict: another deployment owns the Telegram poller; "
+                    "stopping this superseded instance."
                 )
-                # During a Render rolling deployment Telegram terminates the previous long-poll.
-                # A hard exit is deliberate: it prevents an HTTP-only process that no longer handles updates.
-                time.sleep(10)
+                # Telegram permits one getUpdates poller per token. During a rolling deploy,
+                # the previous instance must exit rather than retry forever in parallel.
+                os._exit(0)
             logger.error("Recoverable polling error: %s", error)
 
         # הפעלת הפולינג
-
-        # Start polling in a way that handles conflict by waiting
-        while True:
-            try:
-                await app.updater.start_polling(
-                    allowed_updates=Update.ALL_TYPES,
-                    drop_pending_updates=False,
-                )
-                # Keep the async task alive
-                while app.updater.running:
-                    await asyncio.sleep(1)
-            except Conflict:
-                logger.info("Conflict detected, waiting 10s to retry...")
-                await asyncio.sleep(10)
-            except Exception as e:
-                logger.error("Fatal polling error: %s", e)
-                await asyncio.sleep(5)
-
+        await app.updater.start_polling(
+            allowed_updates=Update.ALL_TYPES,
+            drop_pending_updates=False,
+            error_callback=handle_polling_error,
+        )
+        asyncio.create_task(notify_back_online())
         while True:
             await asyncio.sleep(3600)
 
