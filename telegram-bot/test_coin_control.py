@@ -85,6 +85,17 @@ async def run():
     assert result == bot.ADMIN_COINS_AMOUNT
     assert context.user_data["coins_target_id"] == "42"
 
+    class OwnerQuery:
+        def __init__(self):
+            self.data = "admin_coin_set_daily"
+            self.from_user = SimpleNamespace(id=7706183809)
+            self.answers = []
+        async def answer(self, *args, **kwargs):
+            self.answers.append((args, kwargs))
+    owner_query = OwnerQuery()
+    await bot.admin_callback_gate(SimpleNamespace(callback_query=owner_query), SimpleNamespace())
+    assert not owner_query.answers
+
 
 if __name__ == "__main__":
     asyncio.run(run())

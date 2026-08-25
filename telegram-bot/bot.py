@@ -571,7 +571,7 @@ def callback_permission(callback_data: str) -> str | None:
         return "user_messages"
     if callback_data.startswith("admin_broadcast"):
         return "broadcast"
-    if callback_data.startswith(("admin_coins", "admin_coupons", "coupon_", "admin_vip", "admin_multiplier", "admin_coin_control")):
+    if callback_data.startswith(("admin_coins", "admin_coupons", "coupon_", "admin_vip", "admin_multiplier", "admin_coin_control", "admin_coin_set_")):
         return "coins"
     if callback_data.startswith(("admin_maintenance", "maint_")):
         return "maintenance"
@@ -595,6 +595,9 @@ async def admin_callback_gate(update: Update, context: ContextTypes.DEFAULT_TYPE
     if not query:
         return
     data = query.data or ""
+    # The owner is the final authority for every management callback.
+    if is_owner(query.from_user.id):
+        return
     permission = callback_permission(data)
     if permission == "panel":
         if is_admin(query.from_user.id):
