@@ -1904,11 +1904,13 @@ _ASSISTANT_AI_PROMPT = """אתה עוזר AI חכם, ידידותי ומדויק
 """
 
 _GEMINI_ASSISTANT_RESPONSE_SCHEMA = {
+    # models.generateContent accepts the Gemini Schema format, where an optional
+    # string uses nullable=true rather than a JSON-Schema array of types.
     "type": "object",
     "properties": {
         "kind": {"type": "string", "enum": ["rewrite", "answer", "unsupported", "clarification"]},
-        "canonical_text": {"type": ["string", "null"]},
-        "reply": {"type": ["string", "null"]},
+        "canonical_text": {"type": "string", "nullable": True},
+        "reply": {"type": "string", "nullable": True},
     },
     "required": ["kind", "canonical_text", "reply"],
 }

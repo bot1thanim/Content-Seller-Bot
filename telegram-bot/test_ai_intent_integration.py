@@ -108,9 +108,10 @@ async def run() -> None:
         assert "gemini-test-only" not in captured["url"]
         assert captured["headers"]["x-goog-api-key"] == "gemini-test-only"
         assert captured["body"]["generationConfig"]["responseMimeType"] == "application/json"
-        assert captured["body"]["generationConfig"]["responseSchema"]["required"] == [
-            "kind", "canonical_text", "reply"
-        ]
+        schema = captured["body"]["generationConfig"]["responseSchema"]
+        assert schema["required"] == ["kind", "canonical_text", "reply"]
+        assert schema["properties"]["canonical_text"] == {"type": "string", "nullable": True}
+        assert schema["properties"]["reply"] == {"type": "string", "nullable": True}
 
         rewritten, reply = await bot._assistant_ai_rewrite("ספר לי משהו כללי", 1)
         assert rewritten is None
