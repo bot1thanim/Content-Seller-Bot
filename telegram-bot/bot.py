@@ -2276,11 +2276,24 @@ def _assistant_gemini_image(prompt: str) -> tuple[bytes, str]:
         headers={"Content-Type": "application/json", "x-goog-api-key": api_key},
         method="POST",
     )
-    try:
-        with urllib.request.urlopen(request, timeout=60) as response:
-            response_payload = json.loads(response.read().decode("utf-8"))
-    except urllib.error.HTTPError as exc:
-        raise RuntimeError(f"Gemini image request was rejected (HTTP {exc.code}).") from exc
+    response_payload = None
+    for attempt in range(2):
+        try:
+            with urllib.request.urlopen(request, timeout=60) as response:
+                response_payload = json.loads(response.read().decode("utf-8"))
+            break
+        except urllib.error.HTTPError as exc:
+            if exc.code == 429 and attempt == 0:
+                retry_after = exc.headers.get("Retry-After") if exc.headers else None
+                try:
+                    delay = min(max(float(retry_after or 3), 1), 12)
+                except (TypeError, ValueError):
+                    delay = 3
+                time.sleep(delay)
+                continue
+            if exc.code == 429:
+                raise RuntimeError("מודל התמונות של Gemini אינו זמין כרגע בגלל מגבלת קצב או מכסה. נסה שוב מאוחר יותר.") from exc
+            raise RuntimeError(f"Gemini image request was rejected (HTTP {exc.code}).") from exc
 
     def locate_image(value):
         if isinstance(value, dict):
@@ -2300,7 +2313,7 @@ def _assistant_gemini_image(prompt: str) -> tuple[bytes, str]:
                     return found
         return None
 
-    found = locate_image(response_payload)
+    found = locate_image(response_payload or {})
     if not found:
         raise RuntimeError("Gemini returned no image")
     encoded, mime_type = found

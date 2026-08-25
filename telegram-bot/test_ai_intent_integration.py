@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import asyncio
 import base64
+from email.message import Message
+from urllib.error import HTTPError
 import importlib.util
 import json
 import os
@@ -150,6 +152,24 @@ async def run() -> None:
         bot.urllib.request.urlopen = fake_image_urlopen
         image, mime = bot._assistant_gemini_image("create a blue icon")
         assert image == b"image-test" and mime == "image/png"
+
+        retry_count = {"value": 0}
+        def fake_429_then_image(request, timeout):
+            if request.full_url.endswith("/v1beta/models?pageSize=100"):
+                return FakeGeminiResponse({"models": [{"name": "models/gemini-2.5-flash-image"}]})
+            retry_count["value"] += 1
+            if retry_count["value"] == 1:
+                headers = Message()
+                headers["Retry-After"] = "0"
+                raise HTTPError(request.full_url, 429, "rate limited", headers, None)
+            return FakeGeminiResponse({"outputs": [{"type": "image", "mime_type": "image/png", "data": image_bytes}]})
+
+        original_sleep = bot.time.sleep
+        bot.time.sleep = lambda _: None
+        bot.urllib.request.urlopen = fake_429_then_image
+        image, mime = bot._assistant_gemini_image("retry image")
+        assert retry_count["value"] == 2 and image == b"image-test" and mime == "image/png"
+        bot.time.sleep = original_sleep
         assert bot._assistant_explicit_coin_command("תוסיף 5 מטבעות למשתמש 123") == "ADJUST_COINS:123:+5"
         assert bot._assistant_explicit_coin_command("תוריד 4 coins למשתמש 42") == "ADJUST_COINS:42:-4"
         assert bot._assistant_explicit_image_command("צור תמונה של רובוט כחול") == "GENERATE_IMAGE:רובוט כחול"
