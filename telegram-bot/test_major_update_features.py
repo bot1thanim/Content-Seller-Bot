@@ -100,6 +100,7 @@ async def run():
         bot.SETTINGS_FILE = data / "settings.json"
         bot.TRASH_FILE = data / "trash.json"
         bot.ADMIN_ACTIONS_FILE = data / "admin_actions.json"
+        bot.COIN_TRANSACTIONS_FILE = data / "coin_transactions.json"
         bot.DUPLICATE_REVIEWS_FILE = data / "duplicate_reviews.json"
         bot.AUTO_BACKUPS_DIR = data / "auto_backups"
         owner = bot.ADMIN_ID
@@ -490,7 +491,7 @@ async def run():
         owner_system = FakeUpdate("admin_menu_system", owner)
         await bot.admin_menu_system(owner_system, SimpleNamespace())
         owner_system_buttons = button_callbacks(owner_system.callback_query.edits[-1][1]["reply_markup"])
-        assert {"admin_actions_page_0", "admin_backup", "admin_global_reset", "admin_managers"}.issubset(owner_system_buttons)
+        assert {"admin_actions_page_0", "admin_backup", "admin_global_reset", "admin_audit_center", "admin_managers"}.issubset(owner_system_buttons)
         assert await gate_allows("admin_managers", owner)
 
         # Coupon referral conditions distinguish all-time referrals from referrals after creation.
@@ -540,6 +541,31 @@ async def run():
         assert await bot.admin_coupon_get_referral_minimum(minimum_update, coupon_context) == bot.ConversationHandler.END
         saved_coupon = bot.load_json(bot.COUPONS_FILE)["TOTAL5"]
         assert saved_coupon["referral_mode"] == "total" and saved_coupon["referral_minimum"] == 5
+
+        # Audit records persist all normal history and coin entries include their full balance delta.
+        bot.save_json(bot.ADMIN_ACTIONS_FILE, [])
+        bot.log_admin_action(owner, "audit_test", {"safe": True}, source="assistant", status="blocked", target_user_id="55")
+        audit_record = bot.load_json(bot.ADMIN_ACTIONS_FILE)[-1]
+        assert audit_record["action"] == "audit_test"
+        assert audit_record["source"] == "assistant" and audit_record["status"] == "blocked"
+        assert audit_record["target_user_id"] == "55"
+
+        bot.log_admin_action(owner, "coin_reward_settings_updated", {}, source="manual")
+        audit_center = FakeUpdate("admin_audit_center", owner)
+        await bot.admin_audit_center(audit_center, SimpleNamespace(user_data={}))
+        audit_buttons = button_callbacks(audit_center.callback_query.edits[-1][1]["reply_markup"])
+        assert "admin_audit_all_0" in audit_buttons and "admin_audit_blocked_0" in audit_buttons
+        blocked_audit = FakeUpdate("admin_audit_blocked_0", owner)
+        await bot.admin_audit_filtered_page(blocked_audit, SimpleNamespace(user_data={}))
+        assert "audit_test" in blocked_audit.callback_query.edits[-1][0]
+        assert not await gate_allows("admin_audit_center", 12345)
+
+        bot.save_json(bot.COIN_TRANSACTIONS_FILE, [])
+        bot.log_coin_transaction("55", 6, -2, 4, reason="test_purchase", source="test", actor_id=owner)
+        transaction = bot.load_json(bot.COIN_TRANSACTIONS_FILE)[-1]
+        assert transaction["user_id"] == "55"
+        assert transaction["amount_before"] == 6 and transaction["change"] == -2 and transaction["amount_after"] == 4
+        assert transaction["reason"] == "test_purchase" and transaction["actor_id"] == owner
 
         # Daily-bonus data continues to maintain an accurate total balance.
         write(bot.USERS_FILE, {"55": {"last_bonus_ts": 0}})

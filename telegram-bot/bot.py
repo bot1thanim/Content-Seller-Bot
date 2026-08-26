@@ -70,9 +70,9 @@ COUPONS_FILE   = DATA_DIR / "coupons.json"
 SETTINGS_FILE  = DATA_DIR / "settings.json"
 TRASH_FILE     = DATA_DIR / "trash.json"
 ADMIN_ACTIONS_FILE = DATA_DIR / "admin_actions.json"
+COIN_TRANSACTIONS_FILE = DATA_DIR / "coin_transactions.json"
 DUPLICATE_REVIEWS_FILE = DATA_DIR / "duplicate_reviews.json"
 AUTO_BACKUPS_DIR = DATA_DIR / "auto_backups"
-MAX_ADMIN_ACTIONS = 2000
 MAX_AUTO_BACKUPS = 30
 
 # Only these JSON data files may be restored from an administrator backup.
@@ -86,6 +86,7 @@ BACKUP_ALLOWED_FILES = {
     "settings.json": dict,
     "trash.json": list,
     "admin_actions.json": list,
+    "coin_transactions.json": list,
     "duplicate_reviews.json": list,
 }
 MAX_RESTORE_ARCHIVE_BYTES = 20 * 1024 * 1024
@@ -169,6 +170,7 @@ def ensure_data_files():
         (SETTINGS_FILE,  {"referral_multiplier": 1.0, "daily_gift_amount": 1, "referral_reward_amount": 1, "maintenance": False}),
         (TRASH_FILE,     []),
         (ADMIN_ACTIONS_FILE, []),
+        (COIN_TRANSACTIONS_FILE, []),
         (DUPLICATE_REVIEWS_FILE, []),
     ]
     for filepath, default in defaults:
@@ -356,6 +358,7 @@ def restore_summary(payloads: dict) -> str:
         "settings.json": "הגדרות",
         "trash.json": "סל מיחזור",
         "admin_actions.json": "יומן פעולות מנהל",
+        "coin_transactions.json": "היסטוריית מטבעות",
         "duplicate_reviews.json": "סימוני לא־כפול",
     }
     parts = []
@@ -595,6 +598,8 @@ def callback_permission(callback_data: str) -> str | None:
         return "system"
     if callback_data.startswith("admin_actions"):
         return "audit_log"
+    if callback_data.startswith("admin_audit_"):
+        return "owner"
     if callback_data.startswith(("admin_backup", "admin_restore")):
         return "backup"
     if callback_data.startswith(("admin_delete", "admin_global_reset")):
@@ -609,40 +614,42 @@ async def admin_callback_gate(update: Update, context: ContextTypes.DEFAULT_TYPE
     if not query:
         return
     data = query.data or ""
-    # The owner is the final authority for every management callback.
-    if is_owner(query.from_user.id):
-        return
     permission = callback_permission(data)
-    if permission == "panel":
-        if is_admin(query.from_user.id):
-            return
-    elif permission == "owner":
-        if is_owner(query.from_user.id):
-            return
-    elif permission == "gallery_or_duplicates":
-        if is_admin(query.from_user.id) and (
-            has_admin_permission(query.from_user.id, "gallery")
-            or has_admin_permission(query.from_user.id, "duplicates")
-        ):
-            return
-    elif permission == "dashboard":
-        if is_admin(query.from_user.id) and bool({"gallery", "duplicates", "users"} & admin_permissions(query.from_user.id)):
-            return
-    elif permission == "system":
-        if is_admin(query.from_user.id) and (
-            is_owner(query.from_user.id)
-            or bool({"audit_log", "backup", "dangerous_delete"} & admin_permissions(query.from_user.id))
-        ):
-            return
-    elif permission:
-        if is_admin(query.from_user.id) and has_admin_permission(query.from_user.id, permission):
-            return
-    else:
-        # Callbacks not owned by this mapper are public unless they use the admin namespace.
-        if not data.startswith(("admin_", "cat_", "dup_", "vid_", "trash_", "del_", "maint_", "support_reply")):
-            return
-        if data.startswith(("admin_managers", "admin_mgr_")) and is_owner(query.from_user.id):
-            return
+    private_callback = data.startswith(("admin_", "cat_", "dup_", "vid_", "trash_", "del_", "maint_", "support_reply"))
+    allowed = is_owner(query.from_user.id)
+    if not allowed and permission == "panel":
+        allowed = is_admin(query.from_user.id)
+    elif not allowed and permission == "gallery_or_duplicates":
+        allowed = is_admin(query.from_user.id) and bool({"gallery", "duplicates"} & admin_permissions(query.from_user.id))
+    elif not allowed and permission == "dashboard":
+        allowed = is_admin(query.from_user.id) and bool({"gallery", "duplicates", "users"} & admin_permissions(query.from_user.id))
+    elif not allowed and permission == "system":
+        allowed = is_admin(query.from_user.id) and bool({"audit_log", "backup", "dangerous_delete"} & admin_permissions(query.from_user.id))
+    elif not allowed and permission:
+        allowed = is_admin(query.from_user.id) and has_admin_permission(query.from_user.id, permission)
+
+    if allowed:
+        if private_callback:
+            log_admin_action(
+                query.from_user.id,
+                "admin_callback_accessed",
+                {"callback": data, "permission": permission},
+                source="telegram_callback",
+                dangerous=permission == "dangerous_delete",
+            )
+        return
+
+    if not private_callback:
+        return
+
+    log_admin_action(
+        query.from_user.id,
+        "admin_callback_blocked",
+        {"callback": data, "permission": permission},
+        source="telegram_callback",
+        status="blocked",
+        dangerous=permission == "dangerous_delete",
+    )
     await query.answer("⛔ אין לך הרשאה לפעולה זו.", show_alert=True)
     raise ApplicationHandlerStop
 
@@ -669,18 +676,58 @@ def create_auto_backup(reason: str, actor_id: int | None = None) -> Path | None:
         return None
 
 
-def log_admin_action(actor_id: int, action: str, details: dict | None = None) -> None:
-    """Persist a bounded, non-secret audit record for admin activity."""
+def log_admin_action(
+    actor_id: int | None,
+    action: str,
+    details: dict | None = None,
+    *,
+    source: str = "manual",
+    status: str = "success",
+    target_user_id: str | None = None,
+    dangerous: bool = False,
+) -> None:
+    """Persist a non-secret audit record without discarding normal historical actions."""
     records = load_json(ADMIN_ACTIONS_FILE)
     if not isinstance(records, list):
         records = []
     records.append({
         "at": datetime.now(timezone.utc).isoformat(),
-        "admin_id": int(actor_id),
+        "admin_id": int(actor_id) if actor_id is not None else None,
         "action": str(action),
         "details": details if isinstance(details, dict) else {},
+        "source": str(source),
+        "status": str(status),
+        "target_user_id": str(target_user_id) if target_user_id is not None else None,
+        "dangerous": bool(dangerous),
     })
-    save_json(ADMIN_ACTIONS_FILE, records[-MAX_ADMIN_ACTIONS:])
+    save_json(ADMIN_ACTIONS_FILE, records)
+
+
+def log_coin_transaction(
+    user_id: int | str,
+    balance_before: int,
+    change: int,
+    balance_after: int,
+    *,
+    reason: str,
+    source: str,
+    actor_id: int | None = None,
+) -> None:
+    """Persist every balance mutation with its source and before/after values."""
+    records = load_json(COIN_TRANSACTIONS_FILE)
+    if not isinstance(records, list):
+        records = []
+    records.append({
+        "at": datetime.now(timezone.utc).isoformat(),
+        "user_id": str(user_id),
+        "amount_before": int(balance_before),
+        "change": int(change),
+        "amount_after": int(balance_after),
+        "reason": str(reason),
+        "source": str(source),
+        "actor_id": int(actor_id) if actor_id is not None else None,
+    })
+    save_json(COIN_TRANSACTIONS_FILE, records)
 
 
 DUPLICATE_REVIEWED_KEY = "reviewed_non_duplicate_groups"
@@ -820,8 +867,11 @@ def register_user(user, ref_id=None):
                 save_json(REFERRALS_FILE, referrals)
                 coins       = load_json(COINS_FILE)
                 reward = max(0, int(load_settings().get("referral_reward_amount", 1)))
-                coins[ref_key] = coins.get(ref_key, 0) + reward
+                before = int(coins.get(ref_key, 0))
+                after = before + reward
+                coins[ref_key] = after
                 save_json(COINS_FILE, coins)
+                log_coin_transaction(ref_key, before, reward, after, reason="referral_reward", source="system_referral")
     return users.get(uid, {})
 
 def count_unseen_videos(user_id: int) -> int:
@@ -1160,6 +1210,7 @@ async def admin_menu_system(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if has_admin_permission(user_id, "dangerous_delete"):
         rows.append([InlineKeyboardButton("🔄 איפוס נתונים", callback_data="admin_global_reset"), InlineKeyboardButton("🧹 מחק סרטונים", callback_data="admin_delete")])
     if is_owner(user_id):
+        rows.append([InlineKeyboardButton("📜 מרכז Audit", callback_data="admin_audit_center")])
         rows.append([InlineKeyboardButton("👑 ניהול מנהלים", callback_data="admin_managers")])
     rows.append(_back_to_admin_row())
     await query.edit_message_text("⚙️ *מערכת, גיבויים וכלים מתקדמים*\n\nבחר פעולה:", parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(rows))
@@ -1320,6 +1371,7 @@ async def daily_bonus(update: Update, context: ContextTypes.DEFAULT_TYPE):
     new_balance = old_balance + bonus_amount
     coins[uid] = new_balance
     save_json(COINS_FILE, coins)
+    log_coin_transaction(uid, old_balance, bonus_amount, new_balance, reason="daily_gift", source="system_daily_gift")
     
     await query.answer(
         f"🎁 You received {bonus_amount} coins. Your total is now {new_balance}." if english
@@ -1523,6 +1575,7 @@ async def coin_package_buy(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
     coins[uid] = bal - cost
     save_json(COINS_FILE, coins)
+    log_coin_transaction(uid, bal, -cost, bal - cost, reason="video_purchase", source="user_coin_purchase")
     
     sent = await send_videos_to_user(context, query.from_user.id, pkg["videos"])
     if sent > 0:
@@ -1532,6 +1585,7 @@ async def coin_package_buy(update: Update, context: ContextTypes.DEFAULT_TYPE):
     else:
         coins[uid] = bal # Refund
         save_json(COINS_FILE, coins)
+        log_coin_transaction(uid, bal - cost, cost, bal, reason="purchase_refund_no_delivery", source="system_refund")
         await query.message.reply_text("❌ There are not enough videos in the library right now. Your coins were refunded." if english else "❌ מצטערים, אין מספיק סרטונים במאגר כרגע. המטבעות הוחזרו.")
     
     await back_main(update, context)
@@ -1643,8 +1697,11 @@ async def coupon_redeem_input(update: Update, context: ContextTypes.DEFAULT_TYPE
     save_json(COUPONS_FILE, coupons)
 
     coins          = load_json(COINS_FILE)
-    coins[user_id] = coins.get(user_id, 0) + reward
+    before = int(coins.get(user_id, 0))
+    after = before + reward
+    coins[user_id] = after
     save_json(COINS_FILE, coins)
+    log_coin_transaction(user_id, before, reward, after, reason="coupon_redeemed", source="user_coupon")
 
     await update.message.reply_text(
         (f"✅ *Coupon redeemed!*\n\n🪙 You received *{reward} coins*\n💰 Current balance: *{coins[user_id]}*" if english else f"✅ *קופון מומש!*\n\n🪙 קיבלת *{reward} מטבעות*\n💰 יתרה כעת: *{coins[user_id]}*"),
@@ -2365,6 +2422,7 @@ async def _assistant_apply_runtime_command(
         applied = new_balance - old_balance
         coins[target_id] = new_balance
         save_json(COINS_FILE, coins)
+        log_coin_transaction(target_id, old_balance, applied, new_balance, reason="assistant_coin_adjustment", source="assistant", actor_id=user_id)
         log_admin_action(user_id, "assistant_coin_adjustment", {"target_id": target_id, "change": applied, "new_balance": new_balance})
         action_word = "נוספו" if applied >= 0 else "הוסרו"
         await update.message.reply_text(
@@ -3401,6 +3459,107 @@ async def admin_check_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ConversationHandler.END
 
 # ─── Admin: activity log ─────────────────────────────────────────────────────
+
+AUDIT_FILTER_LABELS = {
+    "all": "📋 כל הפעולות",
+    "ai": "🤖 פעילות AI",
+    "blocked": "🚫 פעולות שנחסמו",
+    "dangerous": "⚠️ פעולות מסוכנות",
+    "coins": "🪙 פעולות מטבעות",
+    "messages": "📢 הודעות",
+}
+
+
+def _filtered_audit_records(filter_key: str) -> list[dict]:
+    records = load_json(ADMIN_ACTIONS_FILE)
+    if not isinstance(records, list):
+        return []
+    if filter_key == "ai":
+        return [record for record in records if record.get("source") == "assistant" or str(record.get("action", "")).startswith("assistant_")]
+    if filter_key == "blocked":
+        return [record for record in records if record.get("status") in {"blocked", "failed", "cancelled"}]
+    if filter_key == "dangerous":
+        return [record for record in records if record.get("dangerous")]
+    if filter_key == "coins":
+        return [record for record in records if "coin" in str(record.get("action", "")).casefold() or "coins" in str(record.get("action", "")).casefold()]
+    if filter_key == "messages":
+        return [record for record in records if any(word in str(record.get("action", "")).casefold() for word in ("broadcast", "message", "support"))]
+    return records
+
+
+async def admin_audit_center(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if not is_owner(query.from_user.id):
+        return
+    records = _filtered_audit_records("all")
+    counts = {
+        "all": len(records),
+        "ai": len(_filtered_audit_records("ai")),
+        "blocked": len(_filtered_audit_records("blocked")),
+        "dangerous": len(_filtered_audit_records("dangerous")),
+        "coins": len(_filtered_audit_records("coins")),
+        "messages": len(_filtered_audit_records("messages")),
+    }
+    rows = [
+        [InlineKeyboardButton(f"{AUDIT_FILTER_LABELS['all']} ({counts['all']})", callback_data="admin_audit_all_0")],
+        [InlineKeyboardButton(f"{AUDIT_FILTER_LABELS['ai']} ({counts['ai']})", callback_data="admin_audit_ai_0")],
+        [InlineKeyboardButton(f"{AUDIT_FILTER_LABELS['blocked']} ({counts['blocked']})", callback_data="admin_audit_blocked_0")],
+        [InlineKeyboardButton(f"{AUDIT_FILTER_LABELS['dangerous']} ({counts['dangerous']})", callback_data="admin_audit_dangerous_0")],
+        [InlineKeyboardButton(f"{AUDIT_FILTER_LABELS['coins']} ({counts['coins']})", callback_data="admin_audit_coins_0"), InlineKeyboardButton(f"{AUDIT_FILTER_LABELS['messages']} ({counts['messages']})", callback_data="admin_audit_messages_0")],
+        [_back_to_admin_row()[0]],
+    ]
+    await query.edit_message_text(
+        "📜 *מרכז Audit*\n\nבחר סוג פעילות להצגה. הרשומות נשמרות בנתוני הבוט ואינן נמחקות בניקוי רגיל.",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(rows),
+    )
+
+
+async def admin_audit_filtered_page(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if not is_owner(query.from_user.id):
+        return
+    match = re.fullmatch(r"admin_audit_(all|ai|blocked|dangerous|coins|messages)_(\d+)", query.data or "")
+    if not match:
+        await admin_audit_center(update, context)
+        return
+    filter_key, raw_page = match.groups()
+    records = list(reversed(_filtered_audit_records(filter_key)))
+    if not records:
+        await query.edit_message_text(
+            f"{AUDIT_FILTER_LABELS[filter_key]}\n\nאין רשומות מתאימות כרגע.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 חזרה למרכז Audit", callback_data="admin_audit_center")]]),
+        )
+        return
+    per_page = 6
+    pages = max(1, (len(records) + per_page - 1) // per_page)
+    page = max(0, min(int(raw_page), pages - 1))
+    batch = records[page * per_page:(page + 1) * per_page]
+    lines = [f"{AUDIT_FILTER_LABELS[filter_key]}\n"]
+    for record in batch:
+        when = str(record.get("at", ""))[:19].replace("T", " ")
+        action = str(record.get("action", "לא ידוע"))
+        actor = record.get("admin_id") or "מערכת"
+        status = str(record.get("status", "success"))
+        source = str(record.get("source", "manual"))
+        target = record.get("target_user_id")
+        line = f"• `{when}` — *{action}*\n  מבצע: `{actor}` | מקור: {source} | מצב: {status}"
+        if target:
+            line += f" | יעד: `{target}`"
+        lines.append(line)
+    navigation = []
+    if page > 0:
+        navigation.append(InlineKeyboardButton("⬅️ קודם", callback_data=f"admin_audit_{filter_key}_{page - 1}"))
+    navigation.append(InlineKeyboardButton(f"{page + 1}/{pages}", callback_data="noop"))
+    if page < pages - 1:
+        navigation.append(InlineKeyboardButton("הבא ➡️", callback_data=f"admin_audit_{filter_key}_{page + 1}"))
+    await query.edit_message_text(
+        "\n".join(lines),
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup([navigation, [InlineKeyboardButton("🔙 חזרה למרכז Audit", callback_data="admin_audit_center")]]),
+    )
 
 async def admin_actions_page(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -5837,6 +5996,7 @@ async def admin_coins_amount(update: Update, context: ContextTypes.DEFAULT_TYPE)
     new_bal = max(0, current + amount)
     coins[uid] = new_bal
     save_json(COINS_FILE, coins)
+    log_coin_transaction(uid, current, new_bal - current, new_bal, reason="admin_balance_adjustment", source="manual_admin", actor_id=user_id)
     context.user_data.pop("coins_target_id", None)
     log_admin_action(user_id, "coins_balance_changed", {"target_user_id": uid, "amount": amount, "new_balance": new_bal})
     await update.message.reply_text(
@@ -6928,6 +7088,8 @@ def main():
         ("^admin_stats$",               admin_stats),
         ("^admin_daily_report$",        send_owner_daily_report),
         ("^admin_ops_dashboard$",       admin_ops_dashboard),
+        ("^admin_audit_center$",        admin_audit_center),
+        (r"^admin_audit_(all|ai|blocked|dangerous|coins|messages)_\d+$", admin_audit_filtered_page),
         (r"^admin_actions_page_\d+$",    admin_actions_page),
         (r"^admin_orders_page_\d+$",    admin_orders_page),
         (r"^users_page_\d+$",           users_page),
