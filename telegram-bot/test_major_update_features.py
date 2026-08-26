@@ -621,13 +621,40 @@ async def run():
         assert audit_record["target_user_id"] == "55"
 
         bot.log_admin_action(owner, "coin_reward_settings_updated", {}, source="manual")
+        human_callback = bot._format_admin_action_record({
+            "at": "2026-08-26T17:35:00+00:00", "admin_id": owner,
+            "action": "admin_callback_accessed", "details": {"callback": "admin_problem_center", "permission": "dashboard"},
+            "source": "telegram_callback", "status": "success",
+        })
+        assert "מרכז הבעיות" in human_callback and "admin_problem_center" not in human_callback
+        human_ai = bot._format_ai_audit_record({
+            "at": "2026-08-26T18:02:00+00:00", "admin_id": owner, "request": "תן למשתמש 77 עוד 2 מטבעות",
+            "event": "tool_execution", "canonical_text": "ADJUST_COINS:77:+2", "status": "success",
+            "details": {"tool": "ADJUST_COINS", "required_permission": "coins", "risk": "normal", "arguments": {"target_user_id": "77", "change": 2}, "amount_before": 40, "change": 2, "amount_after": 42, "result": "יתרת המטבעות עודכנה"},
+        })
+        assert "שינוי יתרת מטבעות" in human_ai and "40 → 42" in human_ai and "שינוי רגיל" in human_ai and "ADJUST_COINS" not in human_ai
         audit_center = FakeUpdate("admin_audit_center", owner)
         await bot.admin_audit_center(audit_center, SimpleNamespace(user_data={}))
         audit_buttons = button_callbacks(audit_center.callback_query.edits[-1][1]["reply_markup"])
         assert "admin_audit_all_0" in audit_buttons and "admin_audit_blocked_0" in audit_buttons
         blocked_audit = FakeUpdate("admin_audit_blocked_0", owner)
         await bot.admin_audit_filtered_page(blocked_audit, SimpleNamespace(user_data={}))
-        assert "audit_test" in blocked_audit.callback_query.edits[-1][0]
+        assert "נחסמה" in blocked_audit.callback_query.edits[-1][0]
+        assert "audit_test" not in blocked_audit.callback_query.edits[-1][0]
+        search_records, search_error = bot._audit_search_records(f"מנהל={owner};מצב=נחסמה")
+        assert search_error is None and search_records
+        audit_search_message = FakeMessage(f"מנהל={owner};פעולה=מטבעות")
+        audit_search_update = SimpleNamespace(effective_user=SimpleNamespace(id=owner), message=audit_search_message)
+        assert await bot.admin_audit_search_input(audit_search_update, SimpleNamespace()) == bot.ConversationHandler.END
+        assert "נמצאו" in audit_search_message.replies[-1][0]
+        write(bot.USERS_FILE, {"77": {"first_name": "Dana"}})
+        write(bot.COINS_FILE, {"77": 42})
+        bot.log_ai_audit(owner, "בדוק יתרה", "tool_execution", canonical_text="GET_USER_BALANCE:77", status="success", details={"tool": "GET_USER_BALANCE", "required_permission": "users", "risk": "info"})
+        replay_id = bot.load_json(bot.AI_AUDIT_FILE)[-1]["id"]
+        replay_update = FakeUpdate(f"admin_audit_replay_{replay_id}", owner)
+        await bot.admin_audit_replay(replay_update, SimpleNamespace())
+        assert "Replay" in replay_update.callback_query.edits[-1][0] and "42" in replay_update.callback_query.edits[-1][0]
+        assert bot._safe_audit_replay_command("ADJUST_COINS:77:+2") is None
         assert not await gate_allows("admin_audit_center", 12345)
 
         bot.save_json(bot.COIN_TRANSACTIONS_FILE, [])

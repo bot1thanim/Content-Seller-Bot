@@ -129,6 +129,15 @@ async def run() -> None:
         bot.urllib.request.urlopen = fake_function_call_urlopen
         assert bot._assistant_gemini_payload("מה היתרה של משתמש 55") == {"kind": "rewrite", "canonical_text": "GET_USER_BALANCE:55"}
 
+        def fake_multi_function_call_urlopen(request, timeout):
+            return FakeGeminiResponse({"candidates": [{"content": {"parts": [
+                {"functionCall": {"name": "get_user", "args": {"user_id": "55"}}},
+                {"functionCall": {"name": "get_user_coin_history", "args": {"user_id": "55"}}},
+            ]}}]})
+
+        bot.urllib.request.urlopen = fake_multi_function_call_urlopen
+        assert bot._assistant_gemini_payload("בדוק משתמש 55 והיסטוריה") == {"kind": "rewrite", "canonical_text": "GET_USER:55;;GET_USER_COIN_HISTORY:55"}
+
         image_bytes = base64.b64encode(b"image-test").decode("ascii")
         def fake_image_urlopen(request, timeout):
             if request.full_url.endswith("/v1beta/models?pageSize=100"):

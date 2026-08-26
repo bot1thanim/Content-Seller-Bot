@@ -19,6 +19,7 @@ import urllib.request
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from datetime import datetime, date, timezone, timedelta
 from pathlib import Path
+from zoneinfo import ZoneInfo
 from telegram import (
     Update,
     InlineKeyboardButton,
@@ -159,6 +160,7 @@ VIP_LEVELS = [
     ADMIN_COUPON_REFERRAL_MINIMUM, # 36
 ) = range(37)
 ADMIN_VIDEO_COMBINED_SEARCH = 37
+ADMIN_AUDIT_SEARCH = 38
 
 
 # ─── Data helpers ─────────────────────────────────────────────────────────────
@@ -771,6 +773,7 @@ def log_ai_audit(
     if not isinstance(records, list):
         records = []
     records.append({
+        "id": uuid.uuid4().hex,
         "at": datetime.now(timezone.utc).isoformat(),
         "admin_id": int(actor_id),
         "request": _redact_sensitive_audit_text(request_text)[:4000],
@@ -781,6 +784,212 @@ def log_ai_audit(
         "details": details if isinstance(details, dict) else {},
     })
     save_json(AI_AUDIT_FILE, records)
+
+
+ISRAEL_TZ = ZoneInfo("Asia/Jerusalem")
+
+_ACTION_LABELS_HE = {
+    "all_videos_deleted": "מחיקת כל הסרטונים",
+    "assistant_access_blocked": "גישה לעוזר נחסמה",
+    "assistant_coin_adjustment": "שינוי יתרת מטבעות באמצעות העוזר",
+    "assistant_image_generated": "יצירת תמונה באמצעות העוזר",
+    "assistant_maintenance_update": "עדכון מצב תחזוקה באמצעות העוזר",
+    "assistant_reward_update": "עדכון תגמולים באמצעות העוזר",
+    "assistant_user_coin_history_viewed": "צפייה בהיסטוריית מטבעות משתמש",
+    "assistant_user_message_sent": "שליחת הודעה למשתמש באמצעות העוזר",
+    "assistant_user_viewed": "צפייה בפרטי משתמש באמצעות העוזר",
+    "backup_restored": "שחזור גיבוי",
+    "categories_merged": "מיזוג קטגוריות",
+    "category_cloned": "שכפול קטגוריה",
+    "category_deleted": "מחיקת קטגוריה",
+    "category_sort_rescan": "מיון קטגוריות מחדש",
+    "coin_reward_settings_updated": "עדכון הגדרות תגמול מטבעות",
+    "coins_balance_changed": "שינוי יתרת מטבעות",
+    "favorite_video_toggled": "עדכון מועדף סרטון",
+    "global_data_reset": "איפוס נתוני הבוט",
+    "manager_added": "הוספת מנהל",
+    "manager_assistant_capability_changed": "עדכון יכולת עוזר למנהל",
+    "manager_permission_changed": "עדכון הרשאת מנהל",
+    "manager_removed": "הסרת מנהל",
+    "manual_backup_created": "יצירת גיבוי ידני",
+    "trash_emptied": "ריקון סל המיחזור",
+    "video_permanently_deleted": "מחיקת סרטון לצמיתות",
+    "admin_callback_accessed": "לחיצה על כפתור ניהול",
+    "admin_callback_blocked": "ניסיון לחיצה על כפתור ניהול ללא הרשאה",
+    "request_received": "בקשת עוזר התקבלה",
+    "ai_action_plan": "העוזר בחר תכנית פעולה",
+    "ai_reply": "תשובת העוזר",
+    "assistant_access_denied": "גישה לעוזר נחסמה",
+    "deterministic_tool_selected": "נבחר כלי בטוח לביצוע",
+    "live_data_answer": "הוצגה תשובת נתונים חיים",
+    "provider_error": "שגיאה בשירות העוזר",
+    "provider_unavailable": "שירות העוזר אינו זמין",
+    "tool_execution": "ביצוע פעולה באמצעות העוזר",
+}
+
+_CALLBACK_LABELS_HE = {
+    "admin_stats": "סטטיסטיקה ו־Dashboard",
+    "admin_gallery": "גלריית סרטונים",
+    "admin_problem_center": "מרכז הבעיות",
+    "admin_actions_page_0": "יומן פעולות מנהל",
+    "admin_audit_center": "מרכז Audit",
+    "admin_broadcast": "הודעה לכולם",
+    "admin_coins": "ניהול מטבעות",
+    "admin_coupons": "ניהול קופונים",
+    "admin_vip": "ניהול דרגות VIP",
+    "admin_backup": "יצירת גיבוי",
+    "admin_restore": "שחזור גיבוי",
+    "admin_maintenance": "מצב תחזוקה",
+    "admin_managers": "ניהול מנהלים",
+    "admin_send": "שליחה למשתמש",
+    "admin_orders_page_0": "הזמנות",
+    "admin_trash_page_0": "סל המיחזור",
+}
+
+
+def _hebrew_timestamp(value: object) -> str:
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(ISRAEL_TZ).strftime("%d/%m/%Y %H:%M")
+    except (TypeError, ValueError):
+        return "זמן לא זמין"
+
+
+def _human_callback_label(callback_data: object) -> str:
+    callback = str(callback_data or "")
+    if callback in _CALLBACK_LABELS_HE:
+        return _CALLBACK_LABELS_HE[callback]
+    prefixes = (
+        ("admin_audit_", "סינון מרכז Audit"), ("admin_problem_", "עיון במרכז הבעיות"),
+        ("admin_gallery_", "עיון בגלריית סרטונים"), ("vid_", "עיון בסרטון בגלריה"),
+        ("admin_dup_", "בדיקת כפילויות"), ("dup_", "ניהול קבוצת כפילויות"),
+        ("admin_category", "ניהול קטגוריות"), ("cat_", "ניהול קטגוריה"),
+        ("coin_", "רכישה במטבעות"), ("coupon_", "ניהול או מימוש קופון"),
+        ("admin_mgr_", "ניהול הרשאות מנהל"), ("admin_users", "ניהול משתמשים"),
+        ("admin_send", "שליחה למשתמש"), ("maint_", "עדכון מצב תחזוקה"),
+        ("assistant_", "אישור או ביטול פעולת עוזר"), ("back_", "חזרה לתפריט"),
+    )
+    for prefix, label in prefixes:
+        if callback.startswith(prefix):
+            return label
+    return "פעולה ניהולית"
+
+
+def _human_action_label(action: object, details: dict | None = None) -> str:
+    key = str(action or "")
+    details = details if isinstance(details, dict) else {}
+    if key in {"admin_callback_accessed", "admin_callback_blocked"}:
+        return _human_callback_label(details.get("callback"))
+    if key.startswith("ai_"):
+        key = key.removeprefix("ai_")
+    return _ACTION_LABELS_HE.get(key, "פעולה ניהולית")
+
+
+def _hebrew_status(status: object) -> str:
+    return {
+        "success": "✅ הצליחה", "approved": "✅ אושרה", "answered": "✅ נענתה",
+        "received": "ℹ️ התקבלה", "recorded": "ℹ️ תועדה", "planned": "🟡 ממתינה לביצוע",
+        "blocked": "❌ נחסמה", "failed": "❌ נכשלה", "cancelled": "❌ בוטלה",
+        "unavailable": "⚠️ אינה זמינה",
+    }.get(str(status), "ℹ️ תועדה")
+
+
+def _hebrew_source(source: object) -> str:
+    return {"assistant": "עוזר AI", "telegram_callback": "לחיצה ב־Telegram", "manual": "מנהל", "system": "מערכת"}.get(str(source), "מערכת")
+
+
+def _format_change_lines(details: dict) -> list[str]:
+    lines = []
+    before, change, after = details.get("amount_before"), details.get("change"), details.get("amount_after")
+    if all(value is not None for value in (before, change, after)):
+        lines.append(f"💰 יתרה: {before} → {after} ({int(change):+d})")
+    if "daily_gift_before" in details or "daily_gift_amount" in details:
+        before_value = details.get("daily_gift_before", "לא צוין")
+        after_value = details.get("daily_gift_after", details.get("daily_gift_amount", "לא צוין"))
+        lines.append(f"🎁 מתנה יומית: {before_value} → {after_value}")
+    if "referral_reward_before" in details or "referral_reward_amount" in details:
+        before_value = details.get("referral_reward_before", "לא צוין")
+        after_value = details.get("referral_reward_after", details.get("referral_reward_amount", "לא צוין"))
+        lines.append(f"👥 תגמול הפניה: {before_value} → {after_value}")
+    return lines
+
+
+def _format_admin_action_record(record: dict) -> str:
+    details = record.get("details") if isinstance(record.get("details"), dict) else {}
+    action = str(record.get("action") or "")
+    label = _human_action_label(action, details)
+    verb = "ניסה" if str(record.get("status")) in {"blocked", "failed", "cancelled"} else "ביצע"
+    actor = record.get("admin_id") or "מערכת"
+    lines = [f"👤 {'מנהל' if actor != 'מערכת' else 'מערכת'}: `{actor}`", f"🕐 {_hebrew_timestamp(record.get('at'))}", f"🖱️ {verb}: {label}", _hebrew_status(record.get("status"))]
+    if record.get("target_user_id"):
+        lines.append(f"🎯 משתמש יעד: `{record['target_user_id']}`")
+    permission = details.get("permission")
+    if permission:
+        lines.append(f"🔐 הרשאה: {PERMISSION_LABELS.get(str(permission), 'גישה ניהולית')}")
+    lines.extend(_format_change_lines(details))
+    result = str(details.get("result") or "").strip()
+    if result:
+        lines.append(f"📝 תוצאה: {result[:500]}")
+    return "\n".join(lines)
+
+
+def _human_tool_label(canonical_text: object) -> str:
+    command = str(canonical_text or "").split(":", 1)[0]
+    return {
+        "SET_DAILY_GIFT": "עדכון מתנה יומית",
+        "SET_REFERRAL_REWARD": "עדכון תגמול הפניות",
+        "SET_REWARDS": "עדכון מתנה יומית ותגמול הפניות",
+        "GET_USER": "בדיקת פרטי משתמש",
+        "GET_USER_BALANCE": "בדיקת יתרת מטבעות",
+        "GET_USER_COIN_HISTORY": "בדיקת היסטוריית מטבעות",
+        "GET_USER_ORDERS": "בדיקת הזמנות משתמש",
+        "GET_SYSTEM_STATUS": "בדיקת נתוני מערכת",
+        "GET_PROBLEMS": "הצגת מרכז בעיות",
+        "ADJUST_COINS": "שינוי יתרת מטבעות",
+        "SEND_USER_MESSAGE": "שליחת הודעה למשתמש",
+        "SET_MAINTENANCE": "עדכון מצב תחזוקה",
+        "GENERATE_IMAGE": "יצירת תמונה",
+    }.get(command, _human_action_label(command))
+
+
+def _format_ai_audit_record(record: dict) -> str:
+    details = record.get("details") if isinstance(record.get("details"), dict) else {}
+    actor = record.get("admin_id") or "מערכת"
+    action = _human_action_label(record.get("event"), details)
+    tool = details.get("tool") or record.get("canonical_text") or details.get("canonical_text")
+    lines = ["🤖 *פעולת עוזר AI*", f"👤 מנהל: `{actor}`", f"🕐 {_hebrew_timestamp(record.get('at'))}", f"🧠 הבנת המערכת: {action}"]
+    request = str(record.get("request") or details.get("request") or "").strip()
+    if request:
+        lines.extend(["", "💬 בקשת המנהל:", request[:700]])
+    if tool:
+        lines.append(f"🔧 פעולה שנבחרה: {_human_tool_label(tool)}")
+    required = details.get("required_permission")
+    if required:
+        lines.append(f"🔐 הרשאה נדרשת: {PERMISSION_LABELS.get(str(required), 'גישה ניהולית')}")
+    risk = str(details.get("risk") or "")
+    if risk:
+        risk_label = {"info": "🟢 מידע", "normal": "🟡 שינוי רגיל", "dangerous": "🔴 פעולה מסוכנת"}.get(risk, "🟡 פעולה")
+        lines.append(f"⚖️ רמת סיכון: {risk_label}")
+    if str(record.get("status")) == "planned":
+        lines.append("🟡 נדרש אישור לפני ביצוע.")
+    elif str(record.get("status")) == "blocked":
+        lines.append("❌ ההרשאה לא אושרה או שהפעולה נחסמה.")
+    lines.append(_hebrew_status(record.get("status")))
+    arguments = details.get("arguments") if isinstance(details.get("arguments"), dict) else {}
+    if arguments:
+        safe_items = ", ".join(f"{key}: {value}" for key, value in arguments.items() if key not in {"text", "message"})
+        if safe_items:
+            lines.append(f"📎 פרמטרים: {safe_items[:400]}")
+    lines.extend(_format_change_lines(details))
+    result = str(details.get("result") or "").strip()
+    if result:
+        lines.append(f"📝 תוצאה: {result[:500]}")
+    response = str(record.get("response") or details.get("response") or "").strip()
+    if response and str(record.get("event")) in {"ai_reply", "provider_error", "provider_unavailable"}:
+        lines.append(f"💬 תשובת העוזר: {response[:700]}")
+    return "\n".join(lines)
 
 
 def record_system_alert(kind: str, message: str, *, level: str = "warning", details: dict | None = None) -> None:
@@ -2313,7 +2522,8 @@ SET_DAILY_GIFT:3, ו"תעשה מתנות 3 והפניות 2" צריך להחזי
 להפעלת או כיבוי מצב תחזוקה השתמש ב-SET_MAINTENANCE:on או SET_MAINTENANCE:off.
 פעולת תחזוקה תבקש אישור מהמשתמש לפני ביצוע.
 לבקשה ליצור תמונה, החזר kind="rewrite" ו-GENERATE_IMAGE:<תיאור התמונה בשפת המשתמש>. אל תשתמש בזה לבקשה שאינה תמונה.
-אם המשתמש מבקש כמה פעולות בלתי תלויות ומלאות, החזר אותן ב-canonical_text כשהן מופרדות בדיוק ב-;;.
+אם המשתמש מבקש כמה פעולות בלתי תלויות ומלאות, בצע Function Call נפרד לכל פעולה זמינה.
+אם אין Function Call מתאים, החזר אותן ב־canonical_text כשהן מופרדות בדיוק ב־;;.
 אם חסר מידע הכרחי לביצוע פעולה, החזר kind="clarification" ושאל רק את שאלת ההבהרה הדרושה.
 אל תבצע פעולות, אל תנהל הרשאות ואל תחזיר טוקנים או מידע אישי.
 """
@@ -2580,6 +2790,8 @@ async def _assistant_apply_reward_command(
         )
         return True
     settings = load_settings()
+    old_daily_gift = int(settings.get("daily_gift_amount", 1) or 0)
+    old_referral_reward = int(settings.get("referral_reward_amount", 1) or 0)
     if reward_kind in {"daily", "both"}:
         settings["daily_gift_amount"] = values[0]
     if reward_kind == "referral":
@@ -2587,10 +2799,17 @@ async def _assistant_apply_reward_command(
     elif reward_kind == "both":
         settings["referral_reward_amount"] = values[1]
     save_settings(settings)
-    _assistant_log_tool(context, user_id, canonical_text, "coins", "success", "תגמולי העתיד עודכנו", {"daily_gift_amount": settings["daily_gift_amount"], "referral_reward_amount": settings["referral_reward_amount"]})
+    _assistant_log_tool(context, user_id, canonical_text, "coins", "success", "תגמולי העתיד עודכנו", {
+        "daily_gift_before": old_daily_gift, "daily_gift_after": settings["daily_gift_amount"],
+        "referral_reward_before": old_referral_reward, "referral_reward_after": settings["referral_reward_amount"],
+    })
     log_admin_action(user_id, "assistant_reward_update", {
+        "daily_gift_before": old_daily_gift,
         "daily_gift_amount": settings["daily_gift_amount"],
+        "daily_gift_after": settings["daily_gift_amount"],
+        "referral_reward_before": old_referral_reward,
         "referral_reward_amount": settings["referral_reward_amount"],
+        "referral_reward_after": settings["referral_reward_amount"],
     }, source="assistant")
     _assistant_append_history(
         context,
@@ -2616,6 +2835,7 @@ def _assistant_log_tool(
     current = context.user_data.get("assistant_audit_request", {})
     raw_request = str(current.get("request") or "") if isinstance(current, dict) else ""
     request_id = str(current.get("request_id") or "") if isinstance(current, dict) else ""
+    risk = _assistant_risk_level(canonical_text)
     log_ai_audit(
         actor_id, raw_request, "tool_execution", canonical_text=canonical_text,
         response_text=result, status=status,
@@ -2624,9 +2844,21 @@ def _assistant_log_tool(
             "tool": canonical_text.split(":", 1)[0],
             "required_permission": required_permission,
             "arguments": safe_arguments if isinstance(safe_arguments, dict) else {},
+            "risk": risk,
+            "confirmation_required": risk == "dangerous",
             "result": result[:800],
         },
     )
+
+
+def _assistant_risk_level(canonical_text: str) -> str:
+    """Classify execution risk; the classification never bypasses permissions."""
+    command = str(canonical_text or "").split(":", 1)[0]
+    if command.startswith("GET_"):
+        return "info"
+    if command in {"SEND_USER_MESSAGE", "SET_MAINTENANCE", "BROADCAST", "DELETE", "RESTORE", "RESET"}:
+        return "dangerous"
+    return "normal"
 
 
 async def _assistant_apply_runtime_command(
@@ -3065,12 +3297,17 @@ def _assistant_gemini_payload(text: str) -> dict:
 
     candidates = raw.get("candidates") or []
     parts = ((candidates[0].get("content") or {}).get("parts") or []) if candidates else []
+    function_steps = []
     for part in parts:
         if isinstance(part, dict) and isinstance(part.get("functionCall"), dict):
             payload = _assistant_function_call_payload(part["functionCall"])
-            if payload:
-                return payload
-            raise RuntimeError("Gemini returned an unsupported function call")
+            if not payload or payload.get("kind") != "rewrite":
+                raise RuntimeError("Gemini returned an unsupported function call")
+            canonical = str(payload.get("canonical_text") or "")
+            if canonical and canonical not in function_steps:
+                function_steps.append(canonical)
+    if function_steps:
+        return {"kind": "rewrite", "canonical_text": ";;".join(function_steps[:4])}
     content = "".join(str(part.get("text", "")) for part in parts if isinstance(part, dict)).strip()
     if not content:
         raise RuntimeError("Gemini returned no usable text content")
@@ -3327,17 +3564,17 @@ async def admin_assistant_command(update: Update, context: ContextTypes.DEFAULT_
     _assistant_append_history(context, "user", update.message.text)
     explicit_image_command = _assistant_explicit_image_command(text)
     if explicit_image_command:
-        log_ai_audit(user_id, raw_request, "deterministic_tool_selected", canonical_text=explicit_image_command, status="planned")
+        log_ai_audit(user_id, raw_request, "deterministic_tool_selected", canonical_text=explicit_image_command, status="planned", details={"request_id": request_id})
         if await _assistant_apply_runtime_command(update, context, explicit_image_command, user_id):
             return ADMIN_ASSISTANT_COMMAND
     explicit_user_command = _assistant_explicit_user_lookup_command(text)
     if explicit_user_command:
-        log_ai_audit(user_id, raw_request, "deterministic_tool_selected", canonical_text=explicit_user_command, status="planned")
+        log_ai_audit(user_id, raw_request, "deterministic_tool_selected", canonical_text=explicit_user_command, status="planned", details={"request_id": request_id})
         if await _assistant_apply_runtime_command(update, context, explicit_user_command, user_id):
             return ADMIN_ASSISTANT_COMMAND
     live_answer = _assistant_live_answer(text, user_id)
     if live_answer:
-        log_ai_audit(user_id, raw_request, "live_data_answer", response_text=live_answer, status="answered")
+        log_ai_audit(user_id, raw_request, "live_data_answer", response_text=live_answer, status="answered", details={"request_id": request_id})
         _assistant_append_history(context, "assistant", live_answer)
         await update.message.reply_text(
             live_answer,
@@ -3364,12 +3601,12 @@ async def admin_assistant_command(update: Update, context: ContextTypes.DEFAULT_
         ])),
     )
     if ai_reply:
-        log_ai_audit(user_id, raw_request, "ai_reply", response_text=ai_reply, status="answered")
+        log_ai_audit(user_id, raw_request, "ai_reply", response_text=ai_reply, status="answered", details={"request_id": request_id})
         _assistant_append_history(context, "assistant", ai_reply)
         await update.message.reply_text(ai_reply, reply_markup=_assistant_navigation_keyboard())
         return ADMIN_ASSISTANT_COMMAND
     if ai_rewrite and ai_rewrite != text:
-        log_ai_audit(user_id, raw_request, "ai_action_plan", canonical_text=ai_rewrite, status="planned")
+        log_ai_audit(user_id, raw_request, "ai_action_plan", canonical_text=ai_rewrite, status="planned", details={"request_id": request_id})
         action_steps = _assistant_action_steps(ai_rewrite)
         handled_actions = 0
         for action in action_steps:
@@ -3991,41 +4228,146 @@ AUDIT_FILTER_LABELS = {
 }
 
 
+def _ai_audit_as_records() -> list[dict]:
+    ai_records = load_json(AI_AUDIT_FILE)
+    if not isinstance(ai_records, list):
+        return []
+    return [
+        {
+            "at": record.get("at"), "admin_id": record.get("admin_id"), "audit_id": record.get("id"),
+            "action": f"ai_{record.get('event', 'event')}",
+            "details": {"request": record.get("request"), "canonical_text": record.get("canonical_text"), "response": record.get("response"), **(record.get("details") if isinstance(record.get("details"), dict) else {})},
+            "source": "assistant", "status": record.get("status", "recorded"),
+            "target_user_id": None, "dangerous": False, "_ai_record": True,
+        }
+        for record in ai_records if isinstance(record, dict)
+    ]
+
+
 def _filtered_audit_records(filter_key: str) -> list[dict]:
     records = load_json(ADMIN_ACTIONS_FILE)
     if not isinstance(records, list):
         return []
+    ai_records = _ai_audit_as_records()
     if filter_key == "ai":
-        ai_records = load_json(AI_AUDIT_FILE)
-        if not isinstance(ai_records, list):
-            ai_records = []
-        return [
-            {
-                "at": record.get("at"),
-                "admin_id": record.get("admin_id"),
-                "action": f"ai_{record.get('event', 'event')}",
-                "details": {
-                    "request": record.get("request"),
-                    "canonical_text": record.get("canonical_text"),
-                    "response": record.get("response"),
-                    **(record.get("details") if isinstance(record.get("details"), dict) else {}),
-                },
-                "source": "assistant",
-                "status": record.get("status", "recorded"),
-                "target_user_id": None,
-                "dangerous": False,
-            }
-            for record in ai_records if isinstance(record, dict)
-        ]
+        return ai_records
+    combined = records + ai_records
     if filter_key == "blocked":
-        return [record for record in records if record.get("status") in {"blocked", "failed", "cancelled"}]
+        return [record for record in combined if record.get("status") in {"blocked", "failed", "cancelled"}]
     if filter_key == "dangerous":
-        return [record for record in records if record.get("dangerous")]
+        return [record for record in combined if record.get("dangerous")]
     if filter_key == "coins":
-        return [record for record in records if "coin" in str(record.get("action", "")).casefold() or "coins" in str(record.get("action", "")).casefold()]
+        return [record for record in combined if "coin" in str(record.get("action", "")).casefold() or "coins" in str(record.get("action", "")).casefold()]
     if filter_key == "messages":
-        return [record for record in records if any(word in str(record.get("action", "")).casefold() for word in ("broadcast", "message", "support"))]
-    return records
+        return [record for record in combined if any(word in str(record.get("action", "")).casefold() for word in ("broadcast", "message", "support"))]
+    return combined
+
+
+def _audit_search_records(raw_query: str) -> tuple[list[dict], str | None]:
+    """Filter stored Audit records by semicolon-separated Hebrew field=value terms."""
+    aliases = {"מנהל": "admin", "admin": "admin", "משתמש": "target", "יעד": "target", "תאריך": "date", "date": "date", "סוג": "source", "מקור": "source", "status": "status", "מצב": "status", "פעולה": "action", "ai": "source"}
+    filters = {}
+    for piece in str(raw_query or "").split(";"):
+        if "=" not in piece:
+            return [], "יש להשתמש בצורה `שדה=ערך` ולהפריד תנאים באמצעות `;`."
+        key, value = (part.strip() for part in piece.split("=", 1))
+        normalized = aliases.get(key.casefold())
+        if not normalized or not value:
+            return [], f"שדה חיפוש לא תקין: {key}."
+        filters[normalized] = value.casefold()
+    records = _filtered_audit_records("all")
+    def matches(record: dict) -> bool:
+        details = record.get("details") if isinstance(record.get("details"), dict) else {}
+        if "admin" in filters and filters["admin"] not in str(record.get("admin_id") or "").casefold():
+            return False
+        if "target" in filters and filters["target"] not in str(record.get("target_user_id") or details.get("target_user_id") or "").casefold():
+            return False
+        if "date" in filters and filters["date"] not in _hebrew_timestamp(record.get("at")).casefold() and filters["date"] not in str(record.get("at") or "").casefold():
+            return False
+        if "source" in filters and filters["source"] not in _hebrew_source(record.get("source")).casefold() and filters["source"] not in str(record.get("source") or "").casefold():
+            return False
+        if "status" in filters and filters["status"] not in _hebrew_status(record.get("status")).casefold() and filters["status"] not in str(record.get("status") or "").casefold():
+            return False
+        if "action" in filters and filters["action"] not in _human_action_label(record.get("action"), details).casefold():
+            return False
+        return True
+    return [record for record in records if matches(record)], None
+
+
+async def admin_audit_search_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if not is_owner(query.from_user.id):
+        return ConversationHandler.END
+    await query.edit_message_text(
+        "🔎 *חיפוש ב־Audit*\n\nכתוב תנאי אחד או יותר, מופרדים ב־`;`:\n"
+        "`מנהל=123;משתמש=456;תאריך=26/08/2026;סוג=עוזר;מצב=נחסמה;פעולה=מטבעות`\n\n"
+        "אפשר להשאיר רק תנאי אחד, למשל `מנהל=123`.\nליציאה: /cancel או כפתור חזרה.",
+        parse_mode="Markdown", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 חזרה למרכז Audit", callback_data="admin_audit_center")]]),
+    )
+    return ADMIN_AUDIT_SEARCH
+
+
+async def admin_audit_search_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_owner(update.effective_user.id):
+        return ConversationHandler.END
+    records, error = _audit_search_records(update.message.text)
+    if error:
+        await update.message.reply_text(f"❌ {error}", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 חזרה למרכז Audit", callback_data="admin_audit_center")]]))
+        return ADMIN_AUDIT_SEARCH
+    if not records:
+        await update.message.reply_text("🔎 לא נמצאו רשומות מתאימות.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 חזרה למרכז Audit", callback_data="admin_audit_center")]]))
+        return ConversationHandler.END
+    newest = sorted(records, key=lambda row: str(row.get("at") or ""), reverse=True)[:6]
+    lines = [f"🔎 *נמצאו {len(records)} רשומות*\n"]
+    for record in newest:
+        lines.append(_format_ai_audit_record(record) if record.get("_ai_record") else _format_admin_action_record(record))
+    await update.message.reply_text("\n\n".join(lines), parse_mode="Markdown", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 חזרה למרכז Audit", callback_data="admin_audit_center")]]))
+    return ConversationHandler.END
+
+
+def _safe_audit_replay_command(canonical_text: object) -> str | None:
+    command = str(canonical_text or "")
+    return command if command.split(":", 1)[0] in {"GET_USER", "GET_USER_BALANCE", "GET_USER_COIN_HISTORY", "GET_USER_ORDERS", "GET_SYSTEM_STATUS", "GET_PROBLEMS"} else None
+
+
+async def admin_audit_replay(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Replay only a read-only AI tool after checking the current owner permission again."""
+    query = update.callback_query
+    await query.answer()
+    if not is_owner(query.from_user.id):
+        return
+    audit_id = (query.data or "").removeprefix("admin_audit_replay_")
+    original = next((row for row in load_json(AI_AUDIT_FILE) if isinstance(row, dict) and str(row.get("id")) == audit_id), None)
+    command = _safe_audit_replay_command((original or {}).get("canonical_text"))
+    if not command:
+        await query.edit_message_text("❌ לא ניתן לבצע שוב פעולה זו. רק פעולות מידע ניתנות ל־Replay.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 חזרה למרכז Audit", callback_data="admin_audit_center")]]))
+        return
+    if command == "GET_SYSTEM_STATUS":
+        metrics = _dashboard_metrics()
+        text = f"🔄 *Replay — מצב מערכת*\n\n👥 משתמשים: {metrics['users']}\n🧾 הזמנות: {metrics['orders']}\n🎬 סרטונים: {metrics['inventory']['videos']}\n🪙 מטבעות: {metrics['coins_total']}"
+    elif command == "GET_PROBLEMS":
+        report = _system_problem_report()
+        text = "🔄 *Replay — מרכז בעיות*\n\n" + "\n".join(f"• {key}: {len(value)}" for key, value in report.items())
+    else:
+        target = command.split(":", 1)[1] if ":" in command else ""
+        if target not in load_json(USERS_FILE):
+            await query.edit_message_text("❌ המשתמש המקורי אינו קיים עוד בבוט ולכן הפעולה לא בוצעה.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 חזרה למרכז Audit", callback_data="admin_audit_center")]]))
+            return
+        coins = int(load_json(COINS_FILE).get(target, 0) or 0)
+        orders = [row for row in load_json(ORDERS_FILE) if isinstance(row, dict) and str(row.get("user_id")) == target]
+        if command.startswith("GET_USER_BALANCE"):
+            text = f"🔄 *Replay — יתרת משתמש*\n\n🆔 `{target}`\n🪙 יתרה: {coins}"
+        elif command.startswith("GET_USER_ORDERS"):
+            text = f"🔄 *Replay — הזמנות משתמש*\n\n🆔 `{target}`\n🧾 הזמנות: {len(orders)}"
+        elif command.startswith("GET_USER_COIN_HISTORY"):
+            transactions = [row for row in load_json(COIN_TRANSACTIONS_FILE) if isinstance(row, dict) and str(row.get("user_id")) == target][-5:]
+            text = f"🔄 *Replay — היסטוריית מטבעות*\n\n🆔 `{target}`\n" + ("\n".join(f"• {int(row.get('change', 0)):+d} | יתרה: {row.get('amount_after', 0)}" for row in transactions) or "אין תנועות מתועדות.")
+        else:
+            user = load_json(USERS_FILE).get(target, {})
+            text = f"🔄 *Replay — פרטי משתמש*\n\n🆔 `{target}`\nשם: {str(user.get('first_name') or 'לא צוין')[:80]}\n🪙 מטבעות: {coins}\n🧾 הזמנות: {len(orders)}"
+    log_ai_audit(query.from_user.id, f"Replay של Audit {audit_id}", "tool_execution", canonical_text=command, response_text="בוצע Replay של פעולת מידע", status="success", details={"request_id": uuid.uuid4().hex, "tool": command.split(":", 1)[0], "required_permission": "owner", "risk": "info", "replay": True, "result": "פעולת מידע בוצעה מחדש"})
+    await query.edit_message_text(text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 חזרה למרכז Audit", callback_data="admin_audit_center")]]))
 
 
 async def admin_audit_center(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -4048,6 +4390,7 @@ async def admin_audit_center(update: Update, context: ContextTypes.DEFAULT_TYPE)
         [InlineKeyboardButton(f"{AUDIT_FILTER_LABELS['blocked']} ({counts['blocked']})", callback_data="admin_audit_blocked_0")],
         [InlineKeyboardButton(f"{AUDIT_FILTER_LABELS['dangerous']} ({counts['dangerous']})", callback_data="admin_audit_dangerous_0")],
         [InlineKeyboardButton(f"{AUDIT_FILTER_LABELS['coins']} ({counts['coins']})", callback_data="admin_audit_coins_0"), InlineKeyboardButton(f"{AUDIT_FILTER_LABELS['messages']} ({counts['messages']})", callback_data="admin_audit_messages_0")],
+        [InlineKeyboardButton("🔎 חיפוש וסינון מתקדם", callback_data="admin_audit_search")],
         [_back_to_admin_row()[0]],
     ]
     await query.edit_message_text(
@@ -4080,37 +4423,21 @@ async def admin_audit_filtered_page(update: Update, context: ContextTypes.DEFAUL
     batch = records[page * per_page:(page + 1) * per_page]
     lines = [f"{AUDIT_FILTER_LABELS[filter_key]}\n"]
     for record in batch:
-        when = str(record.get("at", ""))[:19].replace("T", " ")
-        action = str(record.get("action", "לא ידוע"))
-        actor = record.get("admin_id") or "מערכת"
-        status = str(record.get("status", "success"))
-        source = str(record.get("source", "manual"))
-        target = record.get("target_user_id")
-        line = f"• `{when}` — *{action}*\n  מבצע: `{actor}` | מקור: {source} | מצב: {status}"
-        if target:
-            line += f" | יעד: `{target}`"
-        if filter_key == "ai":
-            details = record.get("details") if isinstance(record.get("details"), dict) else {}
-            request = str(details.get("request") or "").strip()[:240]
-            canonical = str(details.get("canonical_text") or "").strip()[:160]
-            response = str(details.get("response") or "").strip()[:240]
-            if request:
-                line += f"\n  בקשה: {request}"
-            if canonical:
-                line += f"\n  תכנית: {canonical}"
-            if response:
-                line += f"\n  תשובה: {response}"
-        lines.append(line)
+        lines.append(_format_ai_audit_record(record) if filter_key == "ai" else _format_admin_action_record(record))
     navigation = []
     if page > 0:
         navigation.append(InlineKeyboardButton("⬅️ קודם", callback_data=f"admin_audit_{filter_key}_{page - 1}"))
     navigation.append(InlineKeyboardButton(f"{page + 1}/{pages}", callback_data="noop"))
     if page < pages - 1:
         navigation.append(InlineKeyboardButton("הבא ➡️", callback_data=f"admin_audit_{filter_key}_{page + 1}"))
+    replay_rows = []
+    replay_record = next((record for record in batch if record.get("_ai_record") and _safe_audit_replay_command((record.get("details") or {}).get("canonical_text"))), None)
+    if replay_record and replay_record.get("audit_id"):
+        replay_rows.append([InlineKeyboardButton("🔄 בצע שוב פעולה בטוחה", callback_data=f"admin_audit_replay_{replay_record['audit_id']}")])
     await query.edit_message_text(
         "\n".join(lines),
         parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup([navigation, [InlineKeyboardButton("🔙 חזרה למרכז Audit", callback_data="admin_audit_center")]]),
+        reply_markup=InlineKeyboardMarkup([navigation, *replay_rows, [InlineKeyboardButton("🔙 חזרה למרכז Audit", callback_data="admin_audit_center")]]),
     )
 
 async def admin_actions_page(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -4137,10 +4464,7 @@ async def admin_actions_page(update: Update, context: ContextTypes.DEFAULT_TYPE)
     batch = newest_first[slice_start:slice_start + per_page]
     lines = ["📜 *יומן פעולות מנהל*\n"]
     for record in batch:
-        when = str(record.get("at", ""))[:19].replace("T", " ")
-        action = record.get("action", "לא ידוע")
-        actor = record.get("admin_id", "?")
-        lines.append(f"• `{when}` — *{action}*\n  מנהל: `{actor}`")
+        lines.append(_format_admin_action_record(record))
     navigation = []
     if page > 0:
         navigation.append(InlineKeyboardButton("⬅️ קודם", callback_data=f"admin_actions_page_{page - 1}"))
@@ -6663,7 +6987,10 @@ async def admin_coins_amount(update: Update, context: ContextTypes.DEFAULT_TYPE)
     save_json(COINS_FILE, coins)
     log_coin_transaction(uid, current, new_bal - current, new_bal, reason="admin_balance_adjustment", source="manual_admin", actor_id=user_id)
     context.user_data.pop("coins_target_id", None)
-    log_admin_action(user_id, "coins_balance_changed", {"target_user_id": uid, "amount": amount, "new_balance": new_bal})
+    log_admin_action(user_id, "coins_balance_changed", {
+        "target_user_id": uid, "amount": amount, "new_balance": new_bal,
+        "amount_before": current, "change": new_bal - current, "amount_after": new_bal,
+    }, target_user_id=uid)
     await update.message.reply_text(
         f"✅ יתרת המשתמש {uid} עודכנה.\n🪙 שינוי: {amount:+d}\n💰 יתרה חדשה: {new_bal}",
         reply_markup=get_admin_inline_keyboard(user_id),
@@ -7691,6 +8018,17 @@ def main():
         per_message=False,
         per_chat=True,
     )
+    audit_search_conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(admin_audit_search_start, pattern="^admin_audit_search$")],
+        states={ADMIN_AUDIT_SEARCH: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_audit_search_input)]},
+        fallbacks=[
+            CommandHandler("cancel", cancel),
+            CallbackQueryHandler(admin_audit_center, pattern="^admin_audit_center$"),
+            CallbackQueryHandler(back_admin, pattern="^back_admin$"),
+        ],
+        per_message=False,
+        per_chat=True,
+    )
     cat_rename_conv = ConversationHandler(
         entry_points=[CallbackQueryHandler(admin_cat_rename_pick, pattern=r"^cat_rename_pick_\d+$")],
         states={ADMIN_CATEGORY_RENAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_cat_rename_input)]},
@@ -7715,7 +8053,7 @@ def main():
         check_conv, send_conv, approve_conv, broadcast_conv, coins_conv, vip_conv,
         coupon_new_conv, coin_control_conv, restore_conv, global_reset_conv,
         video_search_conv, video_search_sec_conv, video_combined_search_conv, repair_conv, support_conv, coupon_redeem_conv, support_reply_conv,
-        cat_add_conv, cat_rename_conv, manager_add_conv, assistant_conv, video_upload_conv
+        cat_add_conv, cat_rename_conv, manager_add_conv, assistant_conv, audit_search_conv, video_upload_conv
     ]:
         app.add_handler(conv)
 
@@ -7768,6 +8106,7 @@ def main():
         ("^admin_problem_center$",      admin_problem_center),
         (r"^admin_problem_show_(videos|categories|duplicates|coupons|data|trash)_\d+$", admin_problem_show),
         ("^admin_audit_center$",        admin_audit_center),
+        (r"^admin_audit_replay_[a-f0-9]{32}$", admin_audit_replay),
         (r"^admin_audit_(all|ai|blocked|dangerous|coins|messages)_\d+$", admin_audit_filtered_page),
         (r"^admin_actions_page_\d+$",    admin_actions_page),
         (r"^admin_orders_page_\d+$",    admin_orders_page),
