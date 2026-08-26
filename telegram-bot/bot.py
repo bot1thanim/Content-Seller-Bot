@@ -150,7 +150,9 @@ VIP_LEVELS = [
     ADMIN_MANAGER_ADD_ID,    # 32
     ADMIN_ASSISTANT_COMMAND, # 33
     ADMIN_BROADCAST_PREVIEW, # 34
-) = range(35)
+    ADMIN_COUPON_REFERRAL_MODE, # 35
+    ADMIN_COUPON_REFERRAL_MINIMUM, # 36
+) = range(37)
 
 
 # ─── Data helpers ─────────────────────────────────────────────────────────────
@@ -808,10 +810,13 @@ def register_user(user, ref_id=None):
             referrals = load_json(REFERRALS_FILE)
             ref_key = str(ref_id)
             if ref_key not in referrals:
-                referrals[ref_key] = {"count": 0, "referred_ids": []}
+                referrals[ref_key] = {"count": 0, "referred_ids": [], "referred_at": {}}
             if uid not in referrals[ref_key]["referred_ids"]:
                 referrals[ref_key]["count"] += 1
                 referrals[ref_key]["referred_ids"].append(uid)
+                timestamps = referrals[ref_key].setdefault("referred_at", {})
+                if isinstance(timestamps, dict):
+                    timestamps[uid] = datetime.now(timezone.utc).isoformat()
                 save_json(REFERRALS_FILE, referrals)
                 coins       = load_json(COINS_FILE)
                 reward = max(0, int(load_settings().get("referral_reward_amount", 1)))
@@ -1069,6 +1074,50 @@ def _flow_back_markup(callback_data: str = "back_admin", label: str = "🔙 חז
     return InlineKeyboardMarkup([[InlineKeyboardButton(label, callback_data=callback_data)]])
 
 
+def _clear_transient_flow_state(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Clear incomplete input-flow data so an exit can never poison the next flow."""
+    for key in (
+        "admin_msg_text", "approve_v_count", "coins_target_id", "vip_target_id",
+        "new_coupon_code", "new_coupon_coins", "new_coupon_expiry", "new_coupon_max_uses",
+        "new_coupon_referral_mode", "new_coupon_referral_minimum",
+        "pending_restore", "support_reply_target", "category_rename_old",
+        "broadcast_msg", "broadcast_media", "broadcast_markup", "broadcast_delay",
+        "broadcast_edit_mode", "repair_list", "repair_index", "repair_scan_summary",
+        "assistant_pending_action",
+    ):
+        context.user_data.pop(key, None)
+
+
+async def exit_to_admin_panel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    _clear_transient_flow_state(context)
+    await back_admin(update, context)
+    return ConversationHandler.END
+
+
+async def exit_to_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    _clear_transient_flow_state(context)
+    await back_main(update, context)
+    return ConversationHandler.END
+
+
+async def exit_to_gallery(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    _clear_transient_flow_state(context)
+    await admin_gallery(update, context)
+    return ConversationHandler.END
+
+
+async def exit_to_categories_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    _clear_transient_flow_state(context)
+    await admin_categories_menu(update, context)
+    return ConversationHandler.END
+
+
+async def exit_to_category_editor(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    _clear_transient_flow_state(context)
+    await admin_cat_edit_menu(update, context)
+    return ConversationHandler.END
+
+
 async def admin_menu_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -1192,12 +1241,14 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def back_main(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
+    _clear_transient_flow_state(context)
     user  = query.from_user
     await query.edit_message_text(
         _main_welcome(user.id, user.first_name),
         parse_mode="Markdown",
         reply_markup=get_main_keyboard(user.id),
     )
+    return ConversationHandler.END
 
 
 async def language_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1565,6 +1616,26 @@ async def coupon_redeem_input(update: Update, context: ContextTypes.DEFAULT_TYPE
         await update.message.reply_text("🔄 You have already used this coupon." if english else "🔄 כבר השתמשת בקופון הזה.", reply_markup=back_btn)
         return ConversationHandler.END
 
+    required_referrals = max(0, int(coupon.get("referral_minimum", 0) or 0))
+    referral_mode = coupon.get("referral_mode", "none")
+    if required_referrals and referral_mode in {"total", "since_created"}:
+        referral_count = _coupon_eligible_referral_count(coupon, user_id)
+        if referral_count < required_referrals:
+            remaining = required_referrals - referral_count
+            scope = (
+                "since this coupon was created" if referral_mode == "since_created" else "in total"
+            ) if english else (
+                "מאז יצירת הקופון" if referral_mode == "since_created" else "בסך הכול"
+            )
+            await update.message.reply_text(
+                (f"👥 This coupon requires {required_referrals} successful referrals {scope}. "
+                 f"You currently have {referral_count}; invite {remaining} more people first.") if english else
+                (f"👥 הקופון דורש {required_referrals} הפניות מוצלחות {scope}. "
+                 f"יש לך כרגע {referral_count}; הזמן עוד {remaining} אנשים לפני המימוש."),
+                reply_markup=back_btn,
+            )
+            return ConversationHandler.END
+
     reward = coupon["coins"]
     used_by.append(user_id)
     coupon["used_by"] = used_by
@@ -1931,7 +2002,8 @@ async def back_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     if not is_admin(query.from_user.id):
-        return
+        return ConversationHandler.END
+    _clear_transient_flow_state(context)
     settings = load_settings()
     maint_status = "🟠 *מצב תחזוקה פעיל*" if settings.get("maintenance") else "🟢 *הבוט פעיל כרגיל*"
     title = "👑 *פאנל בעלים*" if is_owner(query.from_user.id) else "🛠 *פאנל מנהל*"
@@ -1940,6 +2012,7 @@ async def back_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode="Markdown",
         reply_markup=get_admin_inline_keyboard(query.from_user.id),
     )
+    return ConversationHandler.END
 
 # ─── Admin: free command assistant ────────────────────────────────────────────
 
@@ -5780,6 +5853,50 @@ async def admin_coins_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE)
 
 # ─── Admin: coupon management ─────────────────────────────────────────────────
 
+def _coupon_eligible_referral_count(coupon: dict, user_id: str) -> int:
+    """Count unique referrals that meet the coupon's explicit, persisted condition."""
+    referral = load_json(REFERRALS_FILE).get(str(user_id), {})
+    ids = referral.get("referred_ids", [])
+    if not isinstance(ids, list):
+        return 0
+    unique_ids = {str(value) for value in ids}
+    if coupon.get("referral_mode") != "since_created":
+        return len(unique_ids)
+    created_at = coupon.get("created_at")
+    if not created_at:
+        return 0
+    try:
+        created = datetime.fromisoformat(str(created_at).replace("Z", "+00:00"))
+        if created.tzinfo is None:
+            created = created.replace(tzinfo=timezone.utc)
+    except (TypeError, ValueError):
+        return 0
+    timestamps = referral.get("referred_at", {})
+    if not isinstance(timestamps, dict):
+        return 0
+    total = 0
+    for referred_id in unique_ids:
+        try:
+            joined_at = datetime.fromisoformat(str(timestamps.get(referred_id, "")).replace("Z", "+00:00"))
+            if joined_at.tzinfo is None:
+                joined_at = joined_at.replace(tzinfo=timezone.utc)
+            if joined_at >= created:
+                total += 1
+        except (TypeError, ValueError):
+            continue
+    return total
+
+
+def _coupon_referral_requirement_text(coupon: dict) -> str:
+    minimum = max(0, int(coupon.get("referral_minimum", 0) or 0))
+    mode = coupon.get("referral_mode", "none")
+    if not minimum or mode == "none":
+        return "ללא תנאי הפניות"
+    return (
+        f"{minimum} הפניות מאז יצירת הקופון" if mode == "since_created"
+        else f"{minimum} הפניות בסך הכול"
+    )
+
 async def admin_coupons_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query   = update.callback_query
     await query.answer()
@@ -5792,7 +5909,7 @@ async def admin_coupons_menu(update: Update, context: ContextTypes.DEFAULT_TYPE)
             uses  = len(c.get("used_by", []))
             max_u = c.get("max_uses", "∞")
             exp   = c.get("expires", "ללא הגבלה")
-            lines.append(f"• `{code}` — 🪙{c['coins']} | {uses}/{max_u} | תפוגה: {exp}")
+            lines.append(f"• `{code}` — 🪙{c['coins']} | {uses}/{max_u} | תפוגה: {exp} | 👥 {_coupon_referral_requirement_text(c)}")
     else:
         lines.append("אין קופונים עדיין.")
     btns = [[InlineKeyboardButton("➕ צור קופון חדש", callback_data="admin_coupon_new")]]
@@ -5879,16 +5996,79 @@ async def admin_coupon_get_limit(update: Update, context: ContextTypes.DEFAULT_T
         except ValueError:
             await update.message.reply_text("❌ מספר לא תקין.", reply_markup=_flow_back_markup())
             return ADMIN_COUPON_LIMIT
-    code  = context.user_data["new_coupon_code"]
-    coins_val = context.user_data["new_coupon_coins"]
-    expiry    = context.user_data.get("new_coupon_expiry")
-    coupons   = load_json(COUPONS_FILE)
-    coupons[code] = {"coins": coins_val, "expires": expiry, "max_uses": max_uses, "used_by": []}
-    save_json(COUPONS_FILE, coupons)
+    context.user_data["new_coupon_max_uses"] = max_uses
     await update.message.reply_text(
-        f"✅ *קופון נוצר!*\n\n🎟 `{code}`\n🪙 {coins_val} מטבעות\n📅 תפוגה: {expiry or 'ללא'}\n👥 מגבלה: {max_uses or 'ללא'}",
+        "👥 תנאי הפניות למימוש?\n\n"
+        "שלח `skip` ללא תנאי, `total` כדי לדרוש סך הפניות בכל הזמנים, או `since` כדי לדרוש הפניות חדשות בלבד מרגע יצירת הקופון.",
         parse_mode="Markdown",
-        reply_markup=get_admin_inline_keyboard(),
+        reply_markup=_flow_back_markup(),
+    )
+    return ADMIN_COUPON_REFERRAL_MODE
+
+
+async def admin_coupon_get_referral_mode(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        return ConversationHandler.END
+    raw = (update.message.text or "").strip().casefold()
+    aliases = {
+        "skip": "none", "none": "none", "0": "none", "ללא": "none",
+        "total": "total", "all": "total", "סהכ": "total", "סך הכל": "total",
+        "since": "since_created", "new": "since_created", "מאז": "since_created", "חדש": "since_created",
+    }
+    mode = aliases.get(raw)
+    if mode is None:
+        await update.message.reply_text("❌ בחר `skip`, `total` או `since`.", parse_mode="Markdown", reply_markup=_flow_back_markup())
+        return ADMIN_COUPON_REFERRAL_MODE
+    context.user_data["new_coupon_referral_mode"] = mode
+    if mode == "none":
+        context.user_data["new_coupon_referral_minimum"] = 0
+        return await admin_coupon_save(update, context)
+    label = "מאז יצירת הקופון" if mode == "since_created" else "בסך הכול"
+    await update.message.reply_text(
+        f"כמה הפניות מוצלחות נדרשות {label}? שלח מספר שלם חיובי.",
+        reply_markup=_flow_back_markup(),
+    )
+    return ADMIN_COUPON_REFERRAL_MINIMUM
+
+
+async def admin_coupon_get_referral_minimum(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not is_admin(update.effective_user.id):
+        return ConversationHandler.END
+    try:
+        minimum = int((update.message.text or "").strip())
+        if minimum <= 0:
+            raise ValueError
+    except ValueError:
+        await update.message.reply_text("❌ שלח מספר שלם חיובי של הפניות נדרשות.", reply_markup=_flow_back_markup())
+        return ADMIN_COUPON_REFERRAL_MINIMUM
+    context.user_data["new_coupon_referral_minimum"] = minimum
+    return await admin_coupon_save(update, context)
+
+
+async def admin_coupon_save(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    code = context.user_data.get("new_coupon_code")
+    coins_val = context.user_data.get("new_coupon_coins")
+    if not code or not isinstance(coins_val, int):
+        _clear_transient_flow_state(context)
+        await update.message.reply_text("❌ חסרים פרטי קופון. הפעולה בוטלה.", reply_markup=get_admin_inline_keyboard(update.effective_user.id))
+        return ConversationHandler.END
+    expiry = context.user_data.get("new_coupon_expiry")
+    max_uses = context.user_data.get("new_coupon_max_uses")
+    referral_mode = context.user_data.get("new_coupon_referral_mode", "none")
+    referral_minimum = max(0, int(context.user_data.get("new_coupon_referral_minimum", 0) or 0))
+    coupons = load_json(COUPONS_FILE)
+    coupons[code] = {
+        "coins": coins_val, "expires": expiry, "max_uses": max_uses, "used_by": [],
+        "referral_mode": referral_mode, "referral_minimum": referral_minimum,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+    save_json(COUPONS_FILE, coupons)
+    coupon = coupons[code]
+    _clear_transient_flow_state(context)
+    await update.message.reply_text(
+        f"✅ *קופון נוצר!*\n\n🎟 `{code}`\n🪙 {coins_val} מטבעות\n📅 תפוגה: {expiry or 'ללא'}\n👥 מגבלת שימושים: {max_uses or 'ללא'}\n🤝 תנאי מימוש: {_coupon_referral_requirement_text(coupon)}",
+        parse_mode="Markdown",
+        reply_markup=get_admin_inline_keyboard(update.effective_user.id),
     )
     return ConversationHandler.END
 
@@ -6392,6 +6572,7 @@ async def telegram_error_handler(update: object, context: ContextTypes.DEFAULT_T
 
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    _clear_transient_flow_state(context)
     await update.message.reply_text("❌ בוטל.", reply_markup=get_admin_inline_keyboard())
     return ConversationHandler.END
 
@@ -6492,7 +6673,7 @@ def main():
             ],
             ADMIN_BROADCAST_BTN:   [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_broadcast_get_btn)],
             ADMIN_BROADCAST_DELAY: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_broadcast_get_delay)],
-            ADMIN_BROADCAST_PREVIEW: [CallbackQueryHandler(admin_broadcast_preview_action, pattern=r"^broadcast_(?:edit_|confirm_send|cancel_draft)")],
+            ADMIN_BROADCAST_PREVIEW: [CallbackQueryHandler(admin_broadcast_preview_action, pattern=r"^broadcast_(?:edit_(?:text|media|link|delay)|confirm_send|cancel_draft)$")],
         },
         fallbacks=[
             CommandHandler("cancel", cancel),
@@ -6533,6 +6714,8 @@ def main():
             ADMIN_COUPON_COINS:  [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_coupon_get_coins)],
             ADMIN_COUPON_EXPIRY: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_coupon_get_expiry)],
             ADMIN_COUPON_LIMIT:  [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_coupon_get_limit)],
+            ADMIN_COUPON_REFERRAL_MODE: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_coupon_get_referral_mode)],
+            ADMIN_COUPON_REFERRAL_MINIMUM: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_coupon_get_referral_minimum)],
         },
         fallbacks=[CommandHandler("cancel", cancel), CallbackQueryHandler(back_admin, pattern="^back_admin$")],
         per_message=False, per_chat=True,
@@ -6552,12 +6735,12 @@ def main():
             ADMIN_RESTORE: [MessageHandler(filters.Document.ALL, admin_restore_receive)],
             ADMIN_RESTORE_CONFIRM: [
                 CallbackQueryHandler(admin_restore_apply, pattern="^admin_restore_apply$"),
-                CallbackQueryHandler(back_admin, pattern="^back_admin$"),
+                CallbackQueryHandler(exit_to_admin_panel, pattern="^back_admin$"),
             ],
         },
         fallbacks=[
             CommandHandler("cancel", cancel),
-            CallbackQueryHandler(back_admin, pattern="^back_admin$"),
+            CallbackQueryHandler(exit_to_admin_panel, pattern="^back_admin$"),
         ],
         per_message=False, per_chat=True,
     )
@@ -6575,8 +6758,8 @@ def main():
         states={ADMIN_VIDEO_SEARCH: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_video_search_input)]},
         fallbacks=[
             CommandHandler("cancel", cancel),
-            CallbackQueryHandler(admin_gallery, pattern="^admin_gallery$"),
-            CallbackQueryHandler(back_admin, pattern="^back_admin$"),
+            CallbackQueryHandler(exit_to_gallery, pattern="^admin_gallery$"),
+            CallbackQueryHandler(exit_to_admin_panel, pattern="^back_admin$"),
         ],
         per_message=False, per_chat=True,
     )
@@ -6585,8 +6768,8 @@ def main():
         states={ADMIN_VIDEO_SEARCH_SECONDS: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_search_sec_input)]},
         fallbacks=[
             CommandHandler("cancel", cancel),
-            CallbackQueryHandler(admin_gallery, pattern="^admin_gallery$"),
-            CallbackQueryHandler(back_admin, pattern="^back_admin$"),
+            CallbackQueryHandler(exit_to_gallery, pattern="^admin_gallery$"),
+            CallbackQueryHandler(exit_to_admin_panel, pattern="^back_admin$"),
         ],
         per_message=False, per_chat=True,
     )
@@ -6615,12 +6798,12 @@ def main():
         states={
             SUPPORT_WAITING_MSG: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, support_receive_msg),
-                CallbackQueryHandler(back_main, pattern="^back_main$"),
+                CallbackQueryHandler(exit_to_main_menu, pattern="^back_main$"),
             ],
         },
         fallbacks=[
             CommandHandler("cancel", cancel),
-            CallbackQueryHandler(back_main, pattern="^back_main$"),
+            CallbackQueryHandler(exit_to_main_menu, pattern="^back_main$"),
         ],
         per_message=False, per_chat=True,
     )
@@ -6645,9 +6828,9 @@ def main():
         states={ADMIN_VIDEO_CAT_ADD: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_cat_add_input)]},
         fallbacks=[
             CommandHandler("cancel", cancel),
-            CallbackQueryHandler(admin_cat_edit_menu, pattern="^admin_cat_edit$"),
-            CallbackQueryHandler(admin_categories_menu, pattern="^admin_categories$"),
-            CallbackQueryHandler(back_admin, pattern="^back_admin$"),
+            CallbackQueryHandler(exit_to_category_editor, pattern="^admin_cat_edit$"),
+            CallbackQueryHandler(exit_to_categories_menu, pattern="^admin_categories$"),
+            CallbackQueryHandler(exit_to_admin_panel, pattern="^back_admin$"),
         ],
         per_message=False, per_chat=True,
     )
@@ -6677,9 +6860,9 @@ def main():
         states={ADMIN_CATEGORY_RENAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_cat_rename_input)]},
         fallbacks=[
             CommandHandler("cancel", cancel),
-            CallbackQueryHandler(admin_cat_edit_menu, pattern="^admin_cat_edit$"),
-            CallbackQueryHandler(admin_categories_menu, pattern="^admin_categories$"),
-            CallbackQueryHandler(back_admin, pattern="^back_admin$"),
+            CallbackQueryHandler(exit_to_category_editor, pattern="^admin_cat_edit$"),
+            CallbackQueryHandler(exit_to_categories_menu, pattern="^admin_categories$"),
+            CallbackQueryHandler(exit_to_admin_panel, pattern="^back_admin$"),
         ],
         per_message=False,
         per_chat=True,

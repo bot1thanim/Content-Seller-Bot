@@ -16,7 +16,7 @@ SPEC.loader.exec_module(bot)
 
 class FakeQuery:
     def __init__(self, user_id=7706183809, data=""):
-        self.from_user = SimpleNamespace(id=user_id)
+        self.from_user = SimpleNamespace(id=user_id, first_name="בודק")
         self.data = data
         self.edits = []
         self.message = SimpleNamespace(reply_text=self.reply_text)
@@ -58,6 +58,16 @@ async def run():
     await assert_back(bot.admin_coins_start)
     await assert_back(bot.admin_coupon_new_start)
     await assert_back(bot.admin_coin_control_menu, "admin_coin_control")
+
+    # Returning from any flow clears its draft state and explicitly ends the conversation.
+    dirty_context = SimpleNamespace(user_data={
+        "broadcast_msg": "טיוטה", "new_coupon_code": "OLD", "coins_target_id": "55",
+        "pending_restore": {"data": "old"}, "category_rename_old": "ישן",
+    })
+    exit_query = FakeQuery(data="back_main")
+    result = await bot.back_main(SimpleNamespace(callback_query=exit_query), dirty_context)
+    assert result == bot.ConversationHandler.END
+    assert dirty_context.user_data == {}
 
     source = (ROOT / "bot.py").read_text(encoding="utf-8")
     for name in ("check_conv", "send_conv", "approve_conv", "broadcast_conv", "coins_conv", "vip_conv", "coupon_new_conv", "support_reply_conv"):

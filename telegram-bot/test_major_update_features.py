@@ -493,6 +493,54 @@ async def run():
         assert {"admin_actions_page_0", "admin_backup", "admin_global_reset", "admin_managers"}.issubset(owner_system_buttons)
         assert await gate_allows("admin_managers", owner)
 
+        # Coupon referral conditions distinguish all-time referrals from referrals after creation.
+        created_at = "2026-08-26T10:00:00+00:00"
+        write(bot.USERS_FILE, {"55": {"language": "he"}})
+        write(bot.REFERRALS_FILE, {
+            "55": {
+                "count": 2,
+                "referred_ids": ["a", "b"],
+                "referred_at": {
+                    "a": "2026-08-26T09:00:00+00:00",
+                    "b": "2026-08-26T11:00:00+00:00",
+                },
+            },
+        })
+        all_time_coupon = {"referral_mode": "total", "referral_minimum": 2, "created_at": created_at}
+        since_coupon = {"referral_mode": "since_created", "referral_minimum": 1, "created_at": created_at}
+        assert bot._coupon_eligible_referral_count(all_time_coupon, "55") == 2
+        assert bot._coupon_eligible_referral_count(since_coupon, "55") == 1
+
+        write(bot.COINS_FILE, {"55": 0})
+        write(bot.COUPONS_FILE, {
+            "NEED3": {"coins": 8, "expires": None, "max_uses": None, "used_by": [], "referral_mode": "total", "referral_minimum": 3, "created_at": created_at},
+            "SINCE1": {"coins": 6, "expires": None, "max_uses": None, "used_by": [], "referral_mode": "since_created", "referral_minimum": 1, "created_at": created_at},
+        })
+        blocked_message = FakeMessage("NEED3")
+        blocked_update = SimpleNamespace(effective_user=SimpleNamespace(id=55), message=blocked_message)
+        assert await bot.coupon_redeem_input(blocked_update, SimpleNamespace(bot=FakeBot(), user_data={})) == bot.ConversationHandler.END
+        assert bot.load_json(bot.COINS_FILE)["55"] == 0
+        assert "דורש 3" in blocked_message.replies[-1][0]
+
+        allowed_message = FakeMessage("SINCE1")
+        allowed_update = SimpleNamespace(effective_user=SimpleNamespace(id=55), message=allowed_message)
+        assert await bot.coupon_redeem_input(allowed_update, SimpleNamespace(bot=FakeBot(), user_data={})) == bot.ConversationHandler.END
+        assert bot.load_json(bot.COINS_FILE)["55"] == 6
+
+        # Creating a coupon keeps the chosen referral policy in its persisted record.
+        coupon_context = SimpleNamespace(user_data={
+            "new_coupon_code": "TOTAL5", "new_coupon_coins": 12,
+            "new_coupon_expiry": None, "new_coupon_max_uses": None,
+        })
+        mode_message = FakeMessage("total")
+        mode_update = SimpleNamespace(effective_user=SimpleNamespace(id=owner), message=mode_message)
+        assert await bot.admin_coupon_get_referral_mode(mode_update, coupon_context) == bot.ADMIN_COUPON_REFERRAL_MINIMUM
+        minimum_message = FakeMessage("5")
+        minimum_update = SimpleNamespace(effective_user=SimpleNamespace(id=owner), message=minimum_message)
+        assert await bot.admin_coupon_get_referral_minimum(minimum_update, coupon_context) == bot.ConversationHandler.END
+        saved_coupon = bot.load_json(bot.COUPONS_FILE)["TOTAL5"]
+        assert saved_coupon["referral_mode"] == "total" and saved_coupon["referral_minimum"] == 5
+
         # Daily-bonus data continues to maintain an accurate total balance.
         write(bot.USERS_FILE, {"55": {"last_bonus_ts": 0}})
         write(bot.COINS_FILE, {"55": 7})
