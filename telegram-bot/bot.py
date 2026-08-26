@@ -72,6 +72,7 @@ TRASH_FILE     = DATA_DIR / "trash.json"
 ADMIN_ACTIONS_FILE = DATA_DIR / "admin_actions.json"
 COIN_TRANSACTIONS_FILE = DATA_DIR / "coin_transactions.json"
 AI_AUDIT_FILE = DATA_DIR / "ai_audit.json"
+ALERTS_FILE = DATA_DIR / "alerts.json"
 DUPLICATE_REVIEWS_FILE = DATA_DIR / "duplicate_reviews.json"
 AUTO_BACKUPS_DIR = DATA_DIR / "auto_backups"
 MAX_AUTO_BACKUPS = 30
@@ -89,6 +90,7 @@ BACKUP_ALLOWED_FILES = {
     "admin_actions.json": list,
     "coin_transactions.json": list,
     "ai_audit.json": list,
+    "alerts.json": list,
     "duplicate_reviews.json": list,
 }
 MAX_RESTORE_ARCHIVE_BYTES = 20 * 1024 * 1024
@@ -174,6 +176,7 @@ def ensure_data_files():
         (ADMIN_ACTIONS_FILE, []),
         (COIN_TRANSACTIONS_FILE, []),
         (AI_AUDIT_FILE, []),
+        (ALERTS_FILE, []),
         (DUPLICATE_REVIEWS_FILE, []),
     ]
     for filepath, default in defaults:
@@ -363,6 +366,7 @@ def restore_summary(payloads: dict) -> str:
         "admin_actions.json": "יומן פעולות מנהל",
         "coin_transactions.json": "היסטוריית מטבעות",
         "ai_audit.json": "תיעוד עוזר AI",
+        "alerts.json": "התראות מערכת",
         "duplicate_reviews.json": "סימוני לא־כפול",
     }
     parts = []
@@ -579,6 +583,8 @@ def callback_permission(callback_data: str) -> str | None:
         return "gallery_or_duplicates"
     if callback_data == "admin_ops_dashboard":
         return "dashboard"
+    if callback_data.startswith("admin_problem"):
+        return "dashboard"
     if callback_data.startswith((
         "vid_", "fav_", "admin_favorites", "admin_categories", "admin_cat_", "cat_", "admin_repair",
         "admin_video_search", "admin_search_sec",
@@ -759,6 +765,21 @@ def log_ai_audit(
         "details": details if isinstance(details, dict) else {},
     })
     save_json(AI_AUDIT_FILE, records)
+
+
+def record_system_alert(kind: str, message: str, *, level: str = "warning", details: dict | None = None) -> None:
+    """Persist a non-destructive alert so the owner can review system issues later."""
+    records = load_json(ALERTS_FILE)
+    if not isinstance(records, list):
+        records = []
+    records.append({
+        "at": datetime.now(timezone.utc).isoformat(),
+        "kind": str(kind),
+        "level": str(level),
+        "message": str(message)[:1000],
+        "details": details if isinstance(details, dict) else {},
+    })
+    save_json(ALERTS_FILE, records)
 
 
 DUPLICATE_REVIEWED_KEY = "reviewed_non_duplicate_groups"
@@ -1000,6 +1021,11 @@ async def alert_low_stock_if_needed(context, usable_video_count: int) -> None:
         return
     settings["last_low_stock_alert_count"] = usable_video_count
     save_settings(settings)
+    record_system_alert(
+        "low_stock",
+        "מלאי סרטונים תקינים נמוך מהסף שהוגדר.",
+        details={"usable_videos": usable_video_count, "threshold": threshold},
+    )
     await alert_admin(context, f"⚠️ *התראת מלאי נמוך*\n\nנותרו *{usable_video_count}* סרטונים תקינים במאגר. סף ההתראה: {threshold}.")
 
 def build_zip_of_data() -> io.BytesIO:
@@ -3313,6 +3339,73 @@ def _admin_inventory_summary() -> dict:
     }
 
 
+def _system_problem_report() -> dict[str, list[dict]]:
+    """Return read-only problem groups derived from the real persisted data."""
+    videos = load_videos_with_entry_ids()
+    categories = _admin_categories()
+    coupons = load_json(COUPONS_FILE)
+    users = load_json(USERS_FILE)
+    trash = load_json(TRASH_FILE)
+    today = date.today().isoformat()
+    broken = [
+        video for video in videos
+        if not video.get("file_id") or video.get("file_status") in {"broken", "broken_skipped"}
+    ]
+    empty_categories = [
+        {"category": category} for category in categories
+        if category != DEFAULT_CATEGORY and not any(category in video_categories(video) for video in videos)
+    ]
+    expired = [
+        {"code": code, **coupon} for code, coupon in coupons.items()
+        if isinstance(coupon, dict) and coupon.get("expires") and str(coupon.get("expires")) < today
+    ] if isinstance(coupons, dict) else []
+    invalid_users = [
+        {"user_id": user_id} for user_id, user in users.items() if not isinstance(user, dict)
+    ] if isinstance(users, dict) else [{"user_id": "נתוני משתמשים אינם במבנה תקין"}]
+    duplicate_groups = find_duplicate_groups(videos)
+    return {
+        "videos": broken,
+        "categories": empty_categories,
+        "duplicates": [{"duration": group[0].get("duration", 0), "count": len(group)} for group in duplicate_groups if group],
+        "coupons": expired,
+        "data": invalid_users,
+        "trash": trash if isinstance(trash, list) else [],
+    }
+
+
+def _dashboard_metrics() -> dict:
+    """Calculate dashboard values from orders, users and immutable coin transactions."""
+    users = load_json(USERS_FILE)
+    orders = load_json(ORDERS_FILE)
+    coins = load_json(COINS_FILE)
+    coupons = load_json(COUPONS_FILE)
+    transactions = load_json(COIN_TRANSACTIONS_FILE)
+    today = date.today().isoformat()
+    transactions = transactions if isinstance(transactions, list) else []
+    orders = orders if isinstance(orders, list) else []
+    users = users if isinstance(users, dict) else {}
+    coupons = coupons if isinstance(coupons, dict) else {}
+    inventory = _admin_inventory_summary()
+    problems = _system_problem_report()
+    return {
+        "users": len(users),
+        "new_users": sum(1 for user in users.values() if isinstance(user, dict) and str(user.get("joined", "")) == today),
+        "orders": len(orders),
+        "paypal_revenue": sum(float(order.get("amount", 0) or 0) for order in orders if isinstance(order, dict) and order.get("type") in {"manual", "paypal"}),
+        "videos_sent": sum(int(order.get("videos_count", 0) or 0) for order in orders if isinstance(order, dict)),
+        "coins_total": int(sum(int(value or 0) for value in coins.values())) if isinstance(coins, dict) else 0,
+        "coins_given": sum(max(0, int(row.get("change", 0) or 0)) for row in transactions if isinstance(row, dict)),
+        "coins_spent": sum(abs(min(0, int(row.get("change", 0) or 0))) for row in transactions if isinstance(row, dict)),
+        "daily_gifts": sum(1 for row in transactions if isinstance(row, dict) and row.get("reason") == "daily_gift"),
+        "referrals": sum(int((entry or {}).get("count", 0) or 0) for entry in load_json(REFERRALS_FILE).values()) if isinstance(load_json(REFERRALS_FILE), dict) else 0,
+        "coupon_uses": sum(len(coupon.get("used_by", [])) for coupon in coupons.values() if isinstance(coupon, dict)),
+        "vip_users": sum(1 for user_id in users if get_user_vip(user_id).get("name") != "ברונזה"),
+        "inventory": inventory,
+        "problem_counts": {key: len(value) for key, value in problems.items()},
+        "alerts": len(load_json(ALERTS_FILE)) if isinstance(load_json(ALERTS_FILE), list) else 0,
+    }
+
+
 async def admin_ops_dashboard(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -3339,8 +3432,81 @@ async def admin_ops_dashboard(update: Update, context: ContextTypes.DEFAULT_TYPE
         rows.append([InlineKeyboardButton("🎬 פתח גלריה", callback_data="admin_gallery"), InlineKeyboardButton("🏷 קטגוריות", callback_data="admin_categories")])
     if has_admin_permission(user_id, "duplicates"):
         rows.append([InlineKeyboardButton("🔎 בדוק כפילויות", callback_data="admin_dup_scan"), InlineKeyboardButton("🗑 סל מיחזור", callback_data="admin_trash_page_0")])
+    rows.append([InlineKeyboardButton("🧹 מרכז בעיות", callback_data="admin_problem_center")])
     rows.append(_back_to_admin_row())
     await query.edit_message_text(text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(rows))
+
+
+_PROBLEM_LABELS = {
+    "videos": "🎬 סרטונים בעייתיים",
+    "categories": "📁 קטגוריות ריקות",
+    "duplicates": "🔁 קבוצות חשד לכפילות",
+    "coupons": "🎟️ קופונים שפגו",
+    "data": "⚠️ רשומות נתונים לא תקינות",
+    "trash": "🗑️ סל מיחזור",
+}
+
+
+async def admin_problem_center(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    user_id = query.from_user.id
+    if not (is_owner(user_id) or has_admin_permission(user_id, "gallery") or has_admin_permission(user_id, "duplicates")):
+        return
+    report = _system_problem_report()
+    rows = [
+        [InlineKeyboardButton(f"{_PROBLEM_LABELS[key]} ({len(items)})", callback_data=f"admin_problem_show_{key}_0")]
+        for key, items in report.items()
+    ]
+    rows.append(_back_to_admin_row())
+    text = "🧹 *מרכז בעיות*\n\nהסריקה מציגה נתונים קיימים בלבד. שום פריט לא נמחק או משתנה אוטומטית.\n\n" + "\n".join(
+        f"• {_PROBLEM_LABELS[key]}: *{len(items)}*" for key, items in report.items()
+    )
+    await query.edit_message_text(text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(rows))
+
+
+async def admin_problem_show(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    user_id = query.from_user.id
+    if not (is_owner(user_id) or has_admin_permission(user_id, "gallery") or has_admin_permission(user_id, "duplicates")):
+        return
+    match = re.fullmatch(r"admin_problem_show_(videos|categories|duplicates|coupons|data|trash)_(\d+)", query.data or "")
+    if not match:
+        await admin_problem_center(update, context)
+        return
+    kind, raw_page = match.groups()
+    items = _system_problem_report().get(kind, [])
+    per_page = 8
+    pages = max(1, (len(items) + per_page - 1) // per_page)
+    page = max(0, min(int(raw_page), pages - 1))
+    current = items[page * per_page:(page + 1) * per_page]
+    lines = [f"{_PROBLEM_LABELS[kind]}\n"]
+    if not current:
+        lines.append("אין פריטים בקבוצה זו כרגע.")
+    for item in current:
+        if kind == "videos":
+            lines.append(f"• סרטון #{item.get('entry_id', 'לא ידוע')} — סטטוס: {item.get('file_status', 'חסר מזהה')}")
+        elif kind == "categories":
+            lines.append(f"• קטגוריה ללא סרטונים: {item.get('category', 'לא ידוע')}")
+        elif kind == "duplicates":
+            lines.append(f"• משך {format_duration(int(item.get('duration', 0) or 0))}: {item.get('count', 0)} סרטונים")
+        elif kind == "coupons":
+            lines.append(f"• {item.get('code', 'לא ידוע')} — פג בתאריך {item.get('expires', 'לא ידוע')}")
+        elif kind == "data":
+            lines.append(f"• משתמש/רשומה: {item.get('user_id', 'לא ידוע')}")
+        else:
+            lines.append(f"• פריט סל: {item.get('entry_id', item.get('file_id', 'ללא מזהה'))}")
+    navigation = []
+    if page > 0:
+        navigation.append(InlineKeyboardButton("⬅️ קודם", callback_data=f"admin_problem_show_{kind}_{page - 1}"))
+    navigation.append(InlineKeyboardButton(f"{page + 1}/{pages}", callback_data="noop"))
+    if page < pages - 1:
+        navigation.append(InlineKeyboardButton("הבא ➡️", callback_data=f"admin_problem_show_{kind}_{page + 1}"))
+    await query.edit_message_text(
+        "\n".join(lines),
+        reply_markup=InlineKeyboardMarkup([navigation, [InlineKeyboardButton("🔙 חזרה למרכז בעיות", callback_data="admin_problem_center")]]),
+    )
 
 
 def _owner_daily_report() -> str:
@@ -3397,35 +3563,37 @@ async def admin_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     if not is_admin(query.from_user.id):
         return
-    users    = load_json(USERS_FILE)
-    orders   = load_json(ORDERS_FILE)
-    videos   = load_json(VIDEOS_FILE)
-    coins    = load_json(COINS_FILE)
-    coupons  = load_json(COUPONS_FILE)
-    today    = str(date.today())
+    metrics = _dashboard_metrics()
+    orders = load_json(ORDERS_FILE)
     week_ago = str(date.today() - timedelta(days=7))
-    new_today  = sum(1 for u in users.values() if u.get("joined") == today)
-    new_week   = sum(1 for u in users.values() if u.get("joined", "") >= week_ago)
-    revenue    = sum(o.get("amount", 0) for o in orders if o.get("type") in ("manual", "paypal"))
-    coin_ords  = sum(1 for o in orders if o.get("type") == "coins")
-    pp_ords    = sum(1 for o in orders if o.get("type") in ("manual", "paypal"))
-    total_coins= sum(coins.values())
-    coupon_uses= sum(len(c.get("used_by", [])) for c in coupons.values())
+    new_week = sum(1 for u in load_json(USERS_FILE).values() if isinstance(u, dict) and u.get("joined", "") >= week_ago)
+    coin_ords = sum(1 for o in orders if isinstance(o, dict) and o.get("type") == "coins")
+    pp_ords = sum(1 for o in orders if isinstance(o, dict) and o.get("type") in ("manual", "paypal"))
     maint      = "✅ פעיל" if load_settings().get("maintenance") else "❌ כבוי"
     await query.edit_message_text(
-        f"📊 *סטטיסטיקה מפורטת*\n\n"
-        f"👤 סה\"כ משתמשים: *{len(users)}*\n"
-        f"🆕 חדשים היום: *{new_today}*\n"
+        f"📊 *Dashboard*\n\n"
+        f"👤 סה\"כ משתמשים: *{metrics['users']}*\n"
+        f"🆕 חדשים היום: *{metrics['new_users']}*\n"
         f"📅 חדשים השבוע: *{new_week}*\n\n"
-        f"💰 הכנסות פייפאל: *₪{revenue:.1f}*\n"
+        f"💰 הכנסות פייפאל: *₪{metrics['paypal_revenue']:.1f}*\n"
         f"🧾 הזמנות פייפאל: *{pp_ords}*\n"
         f"🪙 הזמנות מטבעות: *{coin_ords}*\n\n"
-        f"🪙 מטבעות בשוק: *{int(total_coins)}*\n"
-        f"🎟 שימושי קופונים: *{coupon_uses}*\n"
-        f"🎬 סרטונים: *{len(videos)}*\n"
+        f"🪙 מטבעות ביתרות: *{metrics['coins_total']}*\n"
+        f"➕ מטבעות שניתנו: *{metrics['coins_given']}*\n"
+        f"➖ מטבעות שנצרכו: *{metrics['coins_spent']}*\n"
+        f"🎁 מתנות יומיות: *{metrics['daily_gifts']}*\n"
+        f"👥 הפניות: *{metrics['referrals']}*\n"
+        f"🎟 שימושי קופונים: *{metrics['coupon_uses']}*\n"
+        f"👑 משתמשי VIP: *{metrics['vip_users']}*\n"
+        f"🎬 סרטונים שנמסרו בהזמנות: *{metrics['videos_sent']}*\n"
+        f"🔔 התראות מתועדות: *{metrics['alerts']}*\n"
+        f"⚠️ בעיות: *{sum(metrics['problem_counts'].values())}*\n"
         f"🔧 מצב תחזוקה: {maint}",
         parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 חזור", callback_data="back_admin")]]),
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("🧹 מרכז בעיות", callback_data="admin_problem_center")],
+            [InlineKeyboardButton("🔙 חזור", callback_data="back_admin")],
+        ]),
     )
 
 # ─── Admin: orders (paginated) ────────────────────────────────────────────────
@@ -7231,6 +7399,8 @@ def main():
         ("^admin_stats$",               admin_stats),
         ("^admin_daily_report$",        send_owner_daily_report),
         ("^admin_ops_dashboard$",       admin_ops_dashboard),
+        ("^admin_problem_center$",      admin_problem_center),
+        (r"^admin_problem_show_(videos|categories|duplicates|coupons|data|trash)_\d+$", admin_problem_show),
         ("^admin_audit_center$",        admin_audit_center),
         (r"^admin_audit_(all|ai|blocked|dangerous|coins|messages)_\d+$", admin_audit_filtered_page),
         (r"^admin_actions_page_\d+$",    admin_actions_page),

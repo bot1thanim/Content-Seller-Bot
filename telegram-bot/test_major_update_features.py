@@ -102,6 +102,7 @@ async def run():
         bot.ADMIN_ACTIONS_FILE = data / "admin_actions.json"
         bot.COIN_TRANSACTIONS_FILE = data / "coin_transactions.json"
         bot.AI_AUDIT_FILE = data / "ai_audit.json"
+        bot.ALERTS_FILE = data / "alerts.json"
         bot.DUPLICATE_REVIEWS_FILE = data / "duplicate_reviews.json"
         bot.AUTO_BACKUPS_DIR = data / "auto_backups"
         owner = bot.ADMIN_ID
@@ -115,6 +116,20 @@ async def run():
         ])
         assert bot._assistant_live_answer("כמה סרטונים יש במאגר?", owner) == "🎬 כרגע יש *4* סרטונים במאגר."
         assert bot._assistant_live_answer("כמה סרטונים יש במאגר?", 12345) is None
+        write(bot.TRASH_FILE, [{"entry_id": "trash-entry", "file_id": "old-file"}])
+        write(bot.COUPONS_FILE, {"OLD": {"coins": 1, "expires": "2020-01-01", "used_by": []}})
+        bot.save_json(bot.ALERTS_FILE, [{"kind": "test_alert"}])
+        report = bot._system_problem_report()
+        assert len(report["duplicates"]) == 2 and len(report["coupons"]) == 1 and len(report["trash"]) == 1
+        dashboard_metrics = bot._dashboard_metrics()
+        assert dashboard_metrics["alerts"] == 1 and dashboard_metrics["problem_counts"]["coupons"] == 1
+        problem_center = FakeUpdate("admin_problem_center", owner)
+        await bot.admin_problem_center(problem_center, SimpleNamespace())
+        problem_buttons = button_callbacks(problem_center.callback_query.edits[-1][1]["reply_markup"])
+        assert "admin_problem_show_coupons_0" in problem_buttons
+        problems_page = FakeUpdate("admin_problem_show_coupons_0", owner)
+        await bot.admin_problem_show(problems_page, SimpleNamespace())
+        assert "OLD" in problems_page.callback_query.edits[-1][0]
         reward_message = FakeMessage("תעשה את המתנה היומית 3 ואת ההפניות 2")
         reward_context = SimpleNamespace(user_data={})
         previous_reward_key = os.environ.get("GEMINI_API_KEY")
