@@ -1972,6 +1972,7 @@ async def admin_assistant_start(update: Update, context: ContextTypes.DEFAULT_TY
 
 def _assistant_navigation_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🧹 איפוס שיחה", callback_data="assistant_reset_conversation")],
         [InlineKeyboardButton("🔙 חזרה לפאנל", callback_data="admin_assistant_back")],
         [InlineKeyboardButton("❌ ביטול", callback_data="admin_assistant_back")],
     ])
@@ -2017,6 +2018,7 @@ _ASSISTANT_AI_SCHEMA = {
 _ASSISTANT_AI_PROMPT = """אתה Gemini, עוזר AI חכם, ידידותי ומדויק בתוך בוט ניהול Telegram.
 ענה בשפה שבה המשתמש כתב — עברית, English או שפה אחרת — לשאלות כלליות, לשיחות קצרות ולהסברים, גם כשהשאלה אינה פקודה או אינה קשורה ישירות לבוט.
 עם זאת, אין לך גישה לאינטרנט, לקבצים, לסרטונים, לטוקנים, לסיסמאות או לנתונים אישיים, ואסור לך להמציא מידע כזה.
+אל תזכיר את Gemini, ספקי AI, מפתחות API או פרטים פנימיים של המערכת בתשובה למשתמש. הצג את עצמך רק כעוזר של הבוט.
 
 המערכת הקיימת יודעת לבצע רק פעולות מוגדרות: הסברים על יכולות, עזרה, שליחת סרטונים לפי טווח זמן או מספר,
 שליחת כל הסרטונים, פתיחת גלריה, קטגוריות, כפילויות, סל מיחזור, סטטיסטיקה, הזמנות, משתמשים,
@@ -2040,6 +2042,7 @@ SET_DAILY_GIFT:3, ו"תעשה מתנות 3 והפניות 2" צריך להחזי
 להפעלת או כיבוי מצב תחזוקה השתמש ב-SET_MAINTENANCE:on או SET_MAINTENANCE:off.
 פעולת תחזוקה תבקש אישור מהמשתמש לפני ביצוע.
 לבקשה ליצור תמונה, החזר kind="rewrite" ו-GENERATE_IMAGE:<תיאור התמונה בשפת המשתמש>. אל תשתמש בזה לבקשה שאינה תמונה.
+אם המשתמש מבקש כמה פעולות בלתי תלויות ומלאות, החזר אותן ב-canonical_text כשהן מופרדות בדיוק ב-;;.
 אם חסר מידע הכרחי לביצוע פעולה, החזר kind="clarification" ושאל רק את שאלת ההבהרה הדרושה.
 אל תבצע פעולות, אל תנהל הרשאות ואל תחזיר טוקנים או מידע אישי.
 """
@@ -2056,12 +2059,44 @@ _GEMINI_ASSISTANT_RESPONSE_SCHEMA = {
     "required": ["kind", "canonical_text", "reply"],
 }
 
+_ASSISTANT_MODEL_CACHE: dict[str, str] = {}
+
 
 def _assistant_ai_enabled() -> bool:
     """Gemini is preferred; OpenAI remains a backward-compatible fallback."""
     return bool(os.environ.get("GEMINI_API_KEY")) or (
         bool(os.environ.get("OPENAI_API_KEY")) and OpenAI is not None
     )
+
+
+def _assistant_gemini_model(api_key: str) -> str:
+    """Select the strongest text model advertised for this key unless the owner pinned one."""
+    configured = os.environ.get("GEMINI_ASSISTANT_MODEL", "").strip()
+    if configured:
+        return configured
+    cached = _ASSISTANT_MODEL_CACHE.get("model")
+    if cached:
+        return cached
+    request = urllib.request.Request(
+        "https://generativelanguage.googleapis.com/v1beta/models?pageSize=100",
+        headers={"x-goog-api-key": api_key},
+        method="GET",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=12) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+        available = {
+            str(item.get("name", "")).removeprefix("models/")
+            for item in payload.get("models", [])
+            if "generateContent" in item.get("supportedGenerationMethods", [])
+        }
+        for candidate in ("gemini-3.7-flash", "gemini-3.6-flash", "gemini-2.5-pro", "gemini-2.5-flash"):
+            if candidate in available:
+                _ASSISTANT_MODEL_CACHE["model"] = candidate
+                return candidate
+    except Exception as exc:
+        logger.info("Gemini model discovery unavailable; using compatible fallback (%s)", type(exc).__name__)
+    return "gemini-2.5-flash"
 
 
 def _assistant_ai_payload_result(payload: dict) -> tuple[str | None, str | None]:
@@ -2088,6 +2123,12 @@ def _assistant_history_context(context: ContextTypes.DEFAULT_TYPE) -> str:
     return "שיחה קודמת קצרה:\n" + "\n".join(lines) if lines else ""
 
 
+def _assistant_capability_context(user_id: int) -> str:
+    """Tell the model only which high-level assistant capabilities the current manager has."""
+    available = [label for key, label in ASSISTANT_CAPABILITIES if has_assistant_capability(user_id, key)]
+    return "יכולות מורשות למשתמש זה: " + ", ".join(available) if available else "יכולות מורשות: תשובה כללית בלבד."
+
+
 def _assistant_append_history(context: ContextTypes.DEFAULT_TYPE, role: str, text: str) -> None:
     """Keep a bounded in-memory chat window for the current Telegram conversation."""
     clean = str(text or "").strip()
@@ -2098,6 +2139,26 @@ def _assistant_append_history(context: ContextTypes.DEFAULT_TYPE, role: str, tex
         history = []
     history.append({"role": role, "text": clean[:1000]})
     context.user_data["assistant_ai_history"] = history[-8:]
+
+
+def _assistant_action_steps(canonical_text: str | None) -> list[str]:
+    """Accept a small bounded action plan; actual execution stays allowlisted below."""
+    if not isinstance(canonical_text, str):
+        return []
+    return [part.strip() for part in canonical_text.split(";;") if part.strip()][:4]
+
+
+async def assistant_reset_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Forget only ephemeral assistant context; no bot data, audit data or settings are changed."""
+    query = update.callback_query
+    await query.answer()
+    context.user_data.pop("assistant_ai_history", None)
+    context.user_data.pop("assistant_pending_action", None)
+    await query.edit_message_text(
+        "🧹 השיחה עם העוזר אופסה. אפשר להתחיל נושא חדש.",
+        reply_markup=_assistant_navigation_keyboard(),
+    )
+    return ADMIN_ASSISTANT_COMMAND
 
 
 def _assistant_explicit_coin_command(text: str) -> str | None:
@@ -2428,9 +2489,9 @@ def _assistant_safe_runtime_context(user_id: int) -> str:
 def _assistant_gemini_payload(text: str) -> dict:
     """Call Gemini through its official REST endpoint without logging secrets."""
     api_key = os.environ.get("GEMINI_API_KEY", "").strip()
-    model = os.environ.get("GEMINI_ASSISTANT_MODEL", "gemini-2.5-flash").strip()
     if not api_key:
         raise RuntimeError("GEMINI_API_KEY is not configured")
+    model = _assistant_gemini_model(api_key)
 
     # Keep the API key out of the URL so it cannot accidentally appear in request logs.
     endpoint = (
@@ -2767,6 +2828,7 @@ async def admin_assistant_command(update: Update, context: ContextTypes.DEFAULT_
         user_id,
         runtime_context="\n\n".join(filter(None, [
             _assistant_safe_runtime_context(user_id),
+            _assistant_capability_context(user_id),
             _assistant_history_context(context),
         ])),
     )
@@ -2775,11 +2837,19 @@ async def admin_assistant_command(update: Update, context: ContextTypes.DEFAULT_
         await update.message.reply_text(ai_reply, reply_markup=_assistant_navigation_keyboard())
         return ADMIN_ASSISTANT_COMMAND
     if ai_rewrite and ai_rewrite != text:
-        if await _assistant_apply_reward_command(update, context, ai_rewrite, user_id):
+        action_steps = _assistant_action_steps(ai_rewrite)
+        handled_actions = 0
+        for action in action_steps:
+            if await _assistant_apply_reward_command(update, context, action, user_id):
+                handled_actions += 1
+                continue
+            if await _assistant_apply_runtime_command(update, context, action, user_id):
+                handled_actions += 1
+                continue
+            text = _assistant_normalize(action)
+            break
+        if handled_actions:
             return ADMIN_ASSISTANT_COMMAND
-        if await _assistant_apply_runtime_command(update, context, ai_rewrite, user_id):
-            return ADMIN_ASSISTANT_COMMAND
-        text = _assistant_normalize(ai_rewrite)
     explanation_markers = (
         "מה זה", "מהו", "מה עושה", "מה עושים", "מה המשמעות", "הסבר", "תסביר",
         "איך עובד", "איך משתמשים", "למה משמש", "מה כל", "על מה",
@@ -6306,7 +6376,7 @@ def main():
         states={ADMIN_ASSISTANT_COMMAND: [MessageHandler(
             filters.TEXT & ~filters.COMMAND & ~filters.Regex("^🛠 פאנל אדמין$"),
             admin_assistant_command,
-        )]},
+        ), CallbackQueryHandler(assistant_reset_conversation, pattern="^assistant_reset_conversation$")]},
         fallbacks=[
             CommandHandler("cancel", cancel),
             CallbackQueryHandler(admin_assistant_back, pattern="^admin_assistant_back$"),
@@ -6382,6 +6452,7 @@ def main():
         (r"^admin_mgr_assist_toggle_.+$", admin_manager_assistant_toggle),
         (r"^admin_mgr_toggle_.+$",       admin_manager_toggle),
         ("^admin_assistant_back$",        admin_assistant_back),
+        ("^assistant_reset_conversation$", assistant_reset_conversation),
         ("^assistant_confirm_action$",    assistant_confirm_action),
         ("^assistant_cancel_action$",     assistant_cancel_action),
         ("^admin_mgr_remove$",           admin_manager_remove),

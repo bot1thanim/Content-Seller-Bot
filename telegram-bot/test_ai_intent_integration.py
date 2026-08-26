@@ -85,6 +85,8 @@ async def run() -> None:
         captured = {}
 
         def fake_urlopen(request, timeout):
+            if request.full_url.endswith("/v1beta/models?pageSize=100"):
+                return FakeGeminiResponse({"models": [{"name": "models/gemini-3.7-flash", "supportedGenerationMethods": ["generateContent"]}]})
             captured["url"] = request.full_url
             captured["headers"] = {key.lower(): value for key, value in request.header_items()}
             captured["body"] = json.loads(request.data.decode("utf-8"))
@@ -104,10 +106,11 @@ async def run() -> None:
             })
 
         bot.urllib.request.urlopen = fake_urlopen
+        bot._ASSISTANT_MODEL_CACHE.clear()
         payload = bot._assistant_gemini_payload("ספר לי משהו כללי")
         assert payload["kind"] == "answer"
         assert "Gemini" in payload["reply"]
-        assert captured["url"].endswith("/models/gemini-2.5-flash:generateContent")
+        assert captured["url"].endswith("/models/gemini-3.7-flash:generateContent")
         assert "gemini-test-only" not in captured["url"]
         assert captured["headers"]["x-goog-api-key"] == "gemini-test-only"
         assert captured["body"]["generationConfig"]["responseMimeType"] == "application/json"
@@ -138,6 +141,7 @@ async def run() -> None:
         rewritten, reply = await bot._assistant_ai_rewrite("תעשה מתנות 3 והפניות 2", 1)
         assert rewritten == "SET_REWARDS:3,2"
         assert reply is None
+        assert bot._assistant_action_steps("SET_REWARDS:3,2;;ADJUST_COINS:5:+1") == ["SET_REWARDS:3,2", "ADJUST_COINS:5:+1"]
 
         image_bytes = base64.b64encode(b"image-test").decode("ascii")
         def fake_image_urlopen(request, timeout):
