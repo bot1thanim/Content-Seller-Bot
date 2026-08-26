@@ -158,6 +158,7 @@ VIP_LEVELS = [
     ADMIN_COUPON_REFERRAL_MODE, # 35
     ADMIN_COUPON_REFERRAL_MINIMUM, # 36
 ) = range(37)
+ADMIN_VIDEO_COMBINED_SEARCH = 37
 
 
 # ─── Data helpers ─────────────────────────────────────────────────────────────
@@ -587,7 +588,7 @@ def callback_permission(callback_data: str) -> str | None:
         return "dashboard"
     if callback_data.startswith((
         "vid_", "fav_", "admin_favorites", "admin_categories", "admin_cat_", "cat_", "admin_repair",
-        "admin_video_search", "admin_search_sec",
+        "admin_video_search", "admin_search_sec", "admin_combined_search",
     )):
         return "gallery"
     if callback_data.startswith(("admin_dup", "dup_", "admin_trash", "trash_", "del_eid_", "del_v_")):
@@ -968,6 +969,7 @@ async def send_videos_to_user(context, user_id: int, count: int) -> int:
             await context.bot.send_video(chat_id=user_id, video=file_id)
             seen.append(file_id)
             seen_set.add(file_id)
+            video["sent_count"] = int(video.get("sent_count", 0) or 0) + 1
             sent += 1
             await asyncio.sleep(0.05)
         except BadRequest as exc:
@@ -1608,28 +1610,69 @@ async def coins_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def coin_package_buy(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    uid   = str(query.from_user.id)
-    vip   = get_user_vip(uid)
+    uid = str(query.from_user.id)
+    vip = get_user_vip(uid)
     idx   = int(query.data.split("_")[1])
-    pkg   = PACKAGES[idx]
-    cost  = int(pkg["coins"] * (1 - vip["discount"]))
-    
+    pkg = PACKAGES[idx]
+    original_cost = int(pkg["coins"])
+    cost = int(original_cost * (1 - vip["discount"]))
     coins = load_json(COINS_FILE)
-    bal   = coins.get(uid, 0)
+    bal = int(coins.get(uid, 0) or 0)
     english = get_user_language(uid) == "en"
-    
     if bal < cost:
         await query.answer((f"❌ You do not have enough coins. Missing: {cost - bal}." if english else f"❌ אין לך מספיק מטבעות. חסרים {cost - bal}."), show_alert=True)
         return
-
-    available = count_unseen_videos(query.from_user.id)
-    if available < pkg["videos"]:
-        await query.answer(
-            (f"❌ Only {available} new videos are available for you. Choose a smaller package or wait for new content." if english else f"❌ נשארו לך רק {available} סרטונים חדשים שעדיין לא קיבלת. כדי למנוע כפילויות, בחר חבילה קטנה יותר או המתן לתוכן חדש."),
-            show_alert=True,
-        )
+    if count_unseen_videos(query.from_user.id) < pkg["videos"]:
+        await query.answer(("❌ There are not enough new videos available for this package. Choose a smaller package." if english else "❌ אין מספיק סרטונים חדשים זמינים לחבילה זו. בחר חבילה קטנה יותר."), show_alert=True)
         return
-        
+
+    context.user_data["coin_purchase_pending"] = {"user_id": uid, "package_index": idx}
+    discount_text = f"{int(vip['discount'] * 100)}%" if vip["discount"] else ("None" if english else "אין")
+    summary = (
+        f"🧾 *Purchase summary*\n\n📦 Package: *{pkg['videos']} videos*\n💰 Your balance: *{bal}* 🪙\n"
+        f"💳 Price: *{original_cost}* 🪙\n🏷 Discount: *{discount_text}*\n"
+        f"💰 Final price: *{cost}* 🪙\n💰 Balance after purchase: *{bal - cost}* 🪙\n\nConfirm purchase?"
+        if english else
+        f"🧾 *סיכום רכישה*\n\n📦 חבילה: *{pkg['videos']} סרטונים*\n💰 היתרה שלך: *{bal}* 🪙\n"
+        f"💳 מחיר: *{original_cost}* 🪙\n🏷 הנחה: *{discount_text}*\n"
+        f"💰 מחיר סופי: *{cost}* 🪙\n💰 יתרה לאחר רכישה: *{bal - cost}* 🪙\n\nלאשר רכישה?"
+    )
+    await query.edit_message_text(
+        summary,
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("✅ Confirm" if english else "✅ אשר רכישה", callback_data=f"coin_confirm_{idx}")],
+            [InlineKeyboardButton("❌ Cancel" if english else "❌ ביטול", callback_data="coins_menu")],
+        ]),
+    )
+
+
+async def coin_package_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    uid = str(query.from_user.id)
+    try:
+        idx = int((query.data or "").rsplit("_", 1)[1])
+    except (IndexError, ValueError):
+        await query.edit_message_text("❌ נתוני הרכישה אינם תקינים.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🪙 חזרה למטבעות", callback_data="coins_menu")]]))
+        return
+    pending = context.user_data.pop("coin_purchase_pending", None)
+    if not isinstance(pending, dict) or pending.get("user_id") != uid or pending.get("package_index") != idx:
+        await query.edit_message_text("❌ אין רכישה תקפה שממתינה לאישור. בחר חבילה מחדש.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🪙 חזרה למטבעות", callback_data="coins_menu")]]))
+        return
+    pkg = PACKAGES[idx]
+    vip = get_user_vip(uid)
+    cost = int(pkg["coins"] * (1 - vip["discount"]))
+    coins = load_json(COINS_FILE)
+    bal = int(coins.get(uid, 0) or 0)
+    english = get_user_language(uid) == "en"
+    if bal < cost:
+        await query.edit_message_text("❌ Your balance changed and is no longer sufficient." if english else "❌ היתרה השתנתה ואינה מספיקה עוד לרכישה זו.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🪙 Back" if english else "🪙 חזרה", callback_data="coins_menu")]]))
+        return
+    if count_unseen_videos(query.from_user.id) < pkg["videos"]:
+        await query.edit_message_text("❌ Not enough new videos are available for this package." if english else "❌ אין מספיק סרטונים חדשים זמינים לחבילה זו.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🪙 Back" if english else "🪙 חזרה", callback_data="coins_menu")]]))
+        return
+
     coins[uid] = bal - cost
     save_json(COINS_FILE, coins)
     log_coin_transaction(uid, bal, -cost, bal - cost, reason="video_purchase", source="user_coin_purchase")
@@ -4062,10 +4105,16 @@ async def admin_gallery_page(update: Update, context: ContextTypes.DEFAULT_TYPE,
     v = videos[page]
     favorites = admin_favorite_entry_ids()
     is_favorite = v["entry_id"] in favorites
+    added_at = str(v.get("added_at") or "")[:10] or "לא תועד בסרטון ישן"
+    status = str(v.get("file_status") or "לא נבדק")
     text = f"""🎬 *גלריית סרטונים ({page+1}/{total})*
 
+🆔 סרטון: `{v.get('entry_id', 'לא ידוע')}`
 📁 קטגוריות: {display_video_categories(v)}
 ⏱ אורך: {format_duration(v.get('duration', 0))}
+📤 נשלח: {int(v.get('sent_count', 0) or 0)} פעמים
+📅 נוסף: {added_at}
+✅ סטטוס: {status}
 {'⭐ מסומן כמועדף' if is_favorite else ''}"""
     
     nav = []
@@ -4081,6 +4130,7 @@ async def admin_gallery_page(update: Update, context: ContextTypes.DEFAULT_TYPE,
             InlineKeyboardButton("🔢 חיפוש לפי מספר", callback_data="admin_video_search"),
             InlineKeyboardButton("⏱ חיפוש לפי זמן", callback_data="admin_search_sec_start"),
         ],
+        [InlineKeyboardButton("🔎 חיפוש משולב", callback_data="admin_combined_search")],
         [InlineKeyboardButton("⭐ הסר ממועדפים" if is_favorite else "☆ סמן כמועדף", callback_data=f"fav_toggle_{v['entry_id']}")],
         [InlineKeyboardButton("🗑 מחק סרטון זה", callback_data=f"vid_del_{page}")],
         [InlineKeyboardButton("🔙 חזרה לגלריה", callback_data="admin_gallery")]
@@ -4873,6 +4923,112 @@ async def admin_repair_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 
 # ─── Admin: video search ──────────────────────────────────────────────────────
+
+def _parse_combined_video_search(text: str) -> tuple[dict | None, str | None]:
+    """Parse a deliberately small, predictable gallery-filter grammar."""
+    filters_out: dict[str, object] = {}
+    aliases = {
+        "category": "category", "קטגוריה": "category",
+        "duration": "duration", "משך": "duration", "זמן": "duration",
+        "status": "status", "סטטוס": "status",
+        "favorite": "favorite", "מועדף": "favorite", "מועדפים": "favorite",
+        "since": "since", "מתאריך": "since", "תאריך": "since",
+    }
+    for part in re.split(r"[;\n]", str(text or "")):
+        if "=" not in part:
+            continue
+        raw_key, raw_value = (value.strip() for value in part.split("=", 1))
+        key = aliases.get(raw_key.casefold())
+        if not key or not raw_value:
+            return None, "כל מסנן צריך להיכתב בפורמט מפתח=ערך."
+        if key == "duration":
+            interval = parse_smart_time_range(raw_value)
+            if not interval:
+                return None, "משך לא תקין. כתוב למשל `משך=30-90` או `משך=1:30-2:10`."
+            filters_out[key] = interval
+        elif key == "status":
+            normalized = raw_value.casefold()
+            statuses = {"תקין": "valid", "valid": "valid", "שבור": "broken", "broken": "broken", "לא נבדק": "unknown", "unknown": "unknown"}
+            if normalized not in statuses:
+                return None, "סטטוס צריך להיות תקין, שבור או לא נבדק."
+            filters_out[key] = statuses[normalized]
+        elif key == "favorite":
+            normalized = raw_value.casefold()
+            if normalized in {"כן", "yes", "true", "1"}:
+                filters_out[key] = True
+            elif normalized in {"לא", "no", "false", "0"}:
+                filters_out[key] = False
+            else:
+                return None, "מועדף צריך להיות כן או לא."
+        elif key == "since":
+            if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", raw_value):
+                return None, "תאריך צריך להיות בפורמט YYYY-MM-DD."
+            filters_out[key] = raw_value
+        else:
+            filters_out[key] = raw_value
+    if not filters_out:
+        return None, "לא זוהו מסננים."
+    return filters_out, None
+
+
+async def admin_combined_search_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if not has_admin_permission(query.from_user.id, "gallery"):
+        return ConversationHandler.END
+    await query.edit_message_text(
+        "🔎 *חיפוש משולב בגלריה*\n\n"
+        "שלח שורה אחת או יותר בפורמט `מפתח=ערך`, מופרדות ב־`;`.\n\n"
+        "מסננים זמינים:\n"
+        "• `קטגוריה=ישראלי`\n• `משך=30-90` או `משך=1:30-2:10`\n"
+        "• `סטטוס=תקין` / `שבור` / `לא נבדק`\n• `מועדף=כן`\n• `מתאריך=2026-08-01`\n\n"
+        "דוגמה: `קטגוריה=ישראלי;משך=30-90;סטטוס=תקין;מועדף=כן`",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 חזרה לגלריה", callback_data="admin_gallery")]]),
+    )
+    return ADMIN_VIDEO_COMBINED_SEARCH
+
+
+async def admin_combined_search_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not has_admin_permission(update.effective_user.id, "gallery"):
+        return ConversationHandler.END
+    filters_out, error = _parse_combined_video_search(update.message.text)
+    if error:
+        await update.message.reply_text(f"❌ {error}", reply_markup=_flow_back_markup("admin_gallery"))
+        return ADMIN_VIDEO_COMBINED_SEARCH
+    favorites = admin_favorite_entry_ids()
+    videos = load_videos_with_entry_ids()
+    selected = []
+    for video in videos:
+        if "category" in filters_out and str(filters_out["category"]) not in video_categories(video):
+            continue
+        if "duration" in filters_out:
+            low, high = filters_out["duration"]
+            if not low <= int(video.get("duration", 0) or 0) <= high:
+                continue
+        if "status" in filters_out and str(video.get("file_status") or "unknown") != filters_out["status"]:
+            continue
+        if "favorite" in filters_out and ((video.get("entry_id") in favorites) != bool(filters_out["favorite"])):
+            continue
+        if "since" in filters_out and str(video.get("added_at") or "")[:10] < str(filters_out["since"]):
+            continue
+        selected.append(video)
+    selected.sort(key=lambda item: (int(item.get("duration", 0) or 0), str(item.get("added_at") or ""), str(item.get("entry_id") or "")))
+    if not selected:
+        await update.message.reply_text("🔎 לא נמצאו סרטונים שמתאימים לכל המסננים.", reply_markup=_flow_back_markup("admin_gallery"))
+        return ConversationHandler.END
+    lines = [f"🔎 *נמצאו {len(selected)} סרטונים*\n"]
+    buttons = []
+    all_videos = load_videos_with_entry_ids()
+    for video in selected[:10]:
+        page = next((index for index, item in enumerate(all_videos) if item.get("entry_id") == video.get("entry_id")), 0)
+        lines.append(f"• {format_duration(int(video.get('duration', 0) or 0))} — {display_video_categories(video)} — `{video.get('entry_id')}`")
+        buttons.append([InlineKeyboardButton(f"🎬 פתח {video.get('entry_id')}", callback_data=f"vid_page_{page}")])
+    if len(selected) > 10:
+        lines.append("\nמוצגות עשר התוצאות הראשונות. צמצם את המסננים כדי לדייק.")
+    buttons.append([InlineKeyboardButton("🔙 חזרה לגלריה", callback_data="admin_gallery")])
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(buttons))
+    return ConversationHandler.END
 
 async def admin_video_search_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query  = update.callback_query
@@ -7244,6 +7400,17 @@ def main():
         ],
         per_message=False, per_chat=True,
     )
+    video_combined_search_conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(admin_combined_search_start, pattern="^admin_combined_search$")],
+        states={ADMIN_VIDEO_COMBINED_SEARCH: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_combined_search_input)]},
+        fallbacks=[
+            CommandHandler("cancel", cancel),
+            CallbackQueryHandler(exit_to_gallery, pattern="^admin_gallery$"),
+            CallbackQueryHandler(exit_to_admin_panel, pattern="^back_admin$"),
+        ],
+        per_message=False,
+        per_chat=True,
+    )
     repair_conv = ConversationHandler(
         entry_points=[
             CallbackQueryHandler(admin_repair_scan, pattern="^admin_repair_scan$"),
@@ -7349,7 +7516,7 @@ def main():
     for conv in [
         check_conv, send_conv, approve_conv, broadcast_conv, coins_conv, vip_conv,
         coupon_new_conv, coin_control_conv, restore_conv, global_reset_conv,
-        video_search_conv, video_search_sec_conv, repair_conv, support_conv, coupon_redeem_conv, support_reply_conv,
+        video_search_conv, video_search_sec_conv, video_combined_search_conv, repair_conv, support_conv, coupon_redeem_conv, support_reply_conv,
         cat_add_conv, cat_rename_conv, manager_add_conv, assistant_conv, video_upload_conv
     ]:
         app.add_handler(conv)
@@ -7369,6 +7536,7 @@ def main():
         ("^paypal_menu$",               paypal_menu),
         (r"^pp_\d+$",                   paypal_package_selected),
         ("^coins_menu$",                coins_menu),
+        (r"^coin_confirm_\d+$",          coin_package_confirm),
         (r"^coin_\d+$",                 coin_package_buy),
         ("^referrals$",                 referrals_menu),
         ("^wallet$",                    wallet_menu),

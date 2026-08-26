@@ -75,6 +75,7 @@ async def run_tests():
         bot.COINS_FILE = base / 'coins.json'
         bot.save_json(bot.SETTINGS_FILE, {'categories': ['כללי', 'ישראלי', 'חו״ל'], 'maintenance': False})
         bot.save_json(bot.USERS_FILE, {'100': {'seen_videos': ['seen-id']}})
+        bot.save_json(bot.COINS_FILE, {'100': 100})
         bot.save_json(bot.VIDEOS_FILE, [
             {'entry_id': '1', 'file_id': 'seen-id', 'duration': 10, 'category': 'כללי'},
             {'entry_id': '2', 'file_id': 'fresh-a', 'duration': 15, 'category': 'ישראלי'},
@@ -97,6 +98,15 @@ async def run_tests():
             english_labels = [button.text for row in english_keyboard.inline_keyboard for button in row]
             assert '🎁 Daily gift' in english_labels and '🌐 Language' in english_labels
 
+            coin_preview_query = FakeQuery('coin_0')
+            coin_preview_query.from_user = SimpleNamespace(id=100, first_name='Buyer')
+            coin_preview_context = SimpleNamespace(user_data={})
+            balance_before_preview = bot.load_json(bot.COINS_FILE)['100']
+            await bot.coin_package_buy(SimpleNamespace(callback_query=coin_preview_query), coin_preview_context)
+            assert 'Purchase summary' in coin_preview_query.edits[-1][0]
+            assert bot.load_json(bot.COINS_FILE)['100'] == balance_before_preview
+            assert coin_preview_context.user_data['coin_purchase_pending']['package_index'] == 0
+
             # Public delivery remains random, never repeats prior deliveries, and excludes broken records.
             context = SimpleNamespace(bot=FakeBot(), user_data={})
             assert bot.count_unseen_videos(100) == 3, 'Availability must ignore seen and broken videos'
@@ -104,6 +114,8 @@ async def run_tests():
             assert sent == 3, 'All three unseen valid videos should be delivered'
             delivered = {file_id for _, file_id in context.bot.sent_video_ids}
             assert delivered == {'fresh-a', 'fresh-b', 'israeli-b'}, f'Unexpected delivery: {delivered}'
+            delivered_records = [video for video in bot.load_json(bot.VIDEOS_FILE) if video.get('file_id') in delivered]
+            assert all(video.get('sent_count') == 1 for video in delivered_records), 'Delivery count was not saved on delivered videos'
             assert await bot.send_videos_to_user(context, 100, 1) == 0, 'Previously delivered videos must never repeat'
 
             # A video upload is stored immediately in the default category without category or preview questions.
@@ -118,6 +130,7 @@ async def run_tests():
             videos = bot.load_json(bot.VIDEOS_FILE)
             added = next(item for item in videos if item['file_id'] == 'upload-id')
             assert added['category'] == 'רנדומלי' and added['preview'] is None, 'Upload must use the random default category and no preview'
+            assert added.get('added_at') and added.get('file_status') == 'valid', 'New uploads must retain operational metadata'
             assert 'קטגוריה: רנדומלי' in upload_message.replies[-1][0], 'Upload confirmation is missing the random default category'
 
             # One hundred sequential updates must all be stored immediately; no upload is skipped for category/preview input.

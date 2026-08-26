@@ -130,6 +130,12 @@ async def run():
         problems_page = FakeUpdate("admin_problem_show_coupons_0", owner)
         await bot.admin_problem_show(problems_page, SimpleNamespace())
         assert "OLD" in problems_page.callback_query.edits[-1][0]
+        parsed_filters, parse_error = bot._parse_combined_video_search("קטגוריה=ישראלי;משך=10-10;מועדף=לא")
+        assert parse_error is None and parsed_filters["category"] == "ישראלי" and parsed_filters["duration"] == (10, 10)
+        combined_message = FakeMessage("קטגוריה=ישראלי;משך=10-10")
+        combined_update = SimpleNamespace(effective_user=SimpleNamespace(id=owner), message=combined_message)
+        assert await bot.admin_combined_search_input(combined_update, SimpleNamespace(user_data={})) == bot.ConversationHandler.END
+        assert "נמצאו 2 סרטונים" in combined_message.replies[-1][0]
         reward_message = FakeMessage("תעשה את המתנה היומית 3 ואת ההפניות 2")
         reward_context = SimpleNamespace(user_data={})
         previous_reward_key = os.environ.get("GEMINI_API_KEY")
