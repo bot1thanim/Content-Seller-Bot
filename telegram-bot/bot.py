@@ -3321,7 +3321,7 @@ def _assistant_gemini_payload(text: str) -> dict:
 
 
 async def _assistant_ai_rewrite(
-    raw_text: str, user_id: int, runtime_context: str = ""
+    raw_text: str, user_id: int, runtime_context: str = "", audit_request_id: str = ""
 ) -> tuple[str | None, str | None]:
     """Use Gemini or OpenAI only for language understanding; actions remain code-controlled."""
     text = raw_text.strip()
@@ -3332,7 +3332,7 @@ async def _assistant_ai_rewrite(
         payload = await asyncio.to_thread(_assistant_gemini_payload, model_input)
         return _assistant_ai_payload_result(payload)
     except GeminiFreeTierUnavailable:
-        log_ai_audit(user_id, raw_text, "provider_unavailable", status="unavailable", details={"policy": "free_tier_only"})
+        log_ai_audit(user_id, raw_text, "provider_unavailable", status="unavailable", details={"policy": "free_tier_only", "request_id": audit_request_id})
         return None, "🤖 העוזר החכם אינו זמין כרגע כי לא נמצא מודל Gemini מורשה במסגרת המכסה החינמית. לא בוצע חיוב ולא בוצעה פעולה."
     except Exception as exc:
         provider = "Gemini"
@@ -3342,7 +3342,7 @@ async def _assistant_ai_rewrite(
             provider,
             type(exc).__name__,
         )
-        log_ai_audit(user_id, raw_text, "provider_error", status="failed", details={"provider": provider, "error_type": type(exc).__name__})
+        log_ai_audit(user_id, raw_text, "provider_error", status="failed", details={"provider": provider, "error_type": type(exc).__name__, "request_id": audit_request_id})
     return None, None
 
 
@@ -3599,6 +3599,7 @@ async def admin_assistant_command(update: Update, context: ContextTypes.DEFAULT_
             _assistant_capability_context(user_id),
             _assistant_history_context(context),
         ])),
+        audit_request_id=request_id,
     )
     if ai_reply:
         log_ai_audit(user_id, raw_request, "ai_reply", response_text=ai_reply, status="answered", details={"request_id": request_id})
