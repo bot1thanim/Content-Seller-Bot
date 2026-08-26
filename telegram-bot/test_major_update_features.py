@@ -134,6 +134,11 @@ async def run():
                 os.environ.pop("GEMINI_API_KEY", None)
             else:
                 os.environ["GEMINI_API_KEY"] = previous_reward_key
+        write(bot.USERS_FILE, {"77": {"first_name": "Dana", "username": "dana_admin", "joined": "today"}})
+        name_lookup_message = FakeMessage("@dana_admin")
+        name_lookup_update = SimpleNamespace(effective_user=SimpleNamespace(id=owner), message=name_lookup_message)
+        await bot.admin_check_user(name_lookup_update, SimpleNamespace())
+        assert "`77`" in name_lookup_message.replies[-1][0]
         # The currency-multiplier button opens for the owner and explains its exact effect.
         multiplier_query = FakeQuery("admin_multiplier", owner)
         multiplier_state = await bot.admin_multiplier_start(
@@ -279,7 +284,7 @@ async def run():
         assert not bot.has_admin_permission(12345, "backup")
         keyboard = bot.get_admin_inline_keyboard(12345)
         callback_data = [button.callback_data for row in keyboard.inline_keyboard for button in row]
-        assert callback_data == ["admin_assistant", "admin_gallery"], callback_data
+        assert callback_data == ["admin_assistant", "admin_gallery", "admin_ops_dashboard"], callback_data
         # The owner retains the familiar detailed panel with direct day-to-day actions.
         owner_callbacks = button_callbacks(bot.get_admin_inline_keyboard(owner))
         assert {"admin_stats", "admin_gallery", "admin_maintenance", "admin_menu_system"}.issubset(owner_callbacks)
@@ -296,8 +301,8 @@ async def run():
         assert "admin_send" in user_menu_buttons and "admin_check" not in user_menu_buttons
         # Every partial-permission manager sees only the direct controls for their own permission.
         permission_controls = {
-            "gallery": (["admin_gallery"], "admin_backup"),
-            "duplicates": (["admin_gallery"], "admin_backup"),
+            "gallery": (["admin_gallery", "admin_ops_dashboard"], "admin_backup"),
+            "duplicates": (["admin_gallery", "admin_ops_dashboard"], "admin_backup"),
             "users": (["admin_stats", "admin_orders_page_0", "admin_check", "users_page_0"], "admin_backup"),
             "user_messages": (["admin_send", "admin_approve"], "admin_backup"),
             "broadcast": (["admin_broadcast"], "admin_backup"),
