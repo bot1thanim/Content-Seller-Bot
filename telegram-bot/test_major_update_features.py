@@ -153,8 +153,8 @@ async def run():
             assert "הבוט הבין" in reward_message.replies[-1][0]
             ai_events = bot.load_json(bot.AI_AUDIT_FILE)
             assert ai_events[0]["event"] == "request_received"
-            assert ai_events[-1]["event"] == "ai_action_plan"
-            assert ai_events[-1]["canonical_text"] == "SET_REWARDS:3,2"
+            assert any(row["event"] == "ai_action_plan" and row["canonical_text"] == "SET_REWARDS:3,2" for row in ai_events)
+            assert any(row["event"] == "tool_execution" and row["status"] == "success" for row in ai_events)
         finally:
             bot._assistant_gemini_payload = previous_reward_payload
             if previous_reward_key is None:
@@ -177,6 +177,35 @@ async def run():
         assistant_history_update = SimpleNamespace(effective_user=SimpleNamespace(id=owner), message=assistant_history_message)
         assert await bot._assistant_apply_runtime_command(assistant_history_update, SimpleNamespace(user_data={}), "GET_USER_COIN_HISTORY:77", owner)
         assert "+2" in assistant_history_message.replies[-1][0]
+        tool_context = SimpleNamespace(user_data={"assistant_audit_request": {"request_id": "audit-1", "request": "בדיקות Tools"}}, bot=FakeBot())
+        balance_message = FakeMessage("יתרת משתמש 77")
+        assert await bot._assistant_apply_runtime_command(SimpleNamespace(effective_user=SimpleNamespace(id=owner), message=balance_message), tool_context, "GET_USER_BALANCE:77", owner)
+        assert "42" in balance_message.replies[-1][0]
+        orders_message = FakeMessage("הזמנות משתמש 77")
+        assert await bot._assistant_apply_runtime_command(SimpleNamespace(effective_user=SimpleNamespace(id=owner), message=orders_message), tool_context, "GET_USER_ORDERS:77", owner)
+        assert "הזמנות" in orders_message.replies[-1][0]
+        system_message = FakeMessage("מצב מערכת")
+        assert await bot._assistant_apply_runtime_command(SimpleNamespace(effective_user=SimpleNamespace(id=owner), message=system_message), tool_context, "GET_SYSTEM_STATUS", owner)
+        assert "מצב מערכת" in system_message.replies[-1][0]
+        problems_message = FakeMessage("בעיות")
+        assert await bot._assistant_apply_runtime_command(SimpleNamespace(effective_user=SimpleNamespace(id=owner), message=problems_message), tool_context, "GET_PROBLEMS", owner)
+        assert "מרכז בעיות" in problems_message.replies[-1][0]
+        send_message = FakeMessage("שלח הודעה")
+        assert await bot._assistant_apply_runtime_command(SimpleNamespace(effective_user=SimpleNamespace(id=owner), message=send_message), tool_context, "SEND_USER_MESSAGE:77:hello", owner)
+        assert tool_context.user_data["assistant_pending_action"]["name"] == "send_user_message"
+        send_confirmation = FakeQuery("assistant_confirm_action", owner)
+        await bot.assistant_confirm_action(SimpleNamespace(callback_query=send_confirmation), tool_context)
+        assert tool_context.bot.sent_texts[-1][:2] == (77, "hello")
+        settings = bot.load_settings()
+        settings["admin_managers"] = {"88": {"permissions": ["assistant", "users"], "assistant_capabilities": ["users"]}}
+        bot.save_settings(settings)
+        denied_message = FakeMessage("הוסף מטבעות")
+        denied_context = SimpleNamespace(user_data={"assistant_audit_request": {"request_id": "audit-denied", "request": "הוסף מטבעות"}})
+        assert await bot._assistant_apply_runtime_command(SimpleNamespace(effective_user=SimpleNamespace(id=88), message=denied_message), denied_context, "ADJUST_COINS:77:+2", 88)
+        assert "אין לך הרשאה" in denied_message.replies[-1][0]
+        bot.log_ai_audit(owner, "api_key=AIzaABCDEF012345678901234567890", "redaction_check", response_text="Bearer secret-token")
+        redacted = bot.load_json(bot.AI_AUDIT_FILE)[-1]
+        assert "AIza" not in redacted["request"] and "secret-token" not in redacted["response"]
         name_lookup_message = FakeMessage("@dana_admin")
         name_lookup_update = SimpleNamespace(effective_user=SimpleNamespace(id=owner), message=name_lookup_message)
         await bot.admin_check_user(name_lookup_update, SimpleNamespace())

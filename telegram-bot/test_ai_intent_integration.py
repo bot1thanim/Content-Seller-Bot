@@ -91,11 +91,10 @@ async def run() -> None:
         assert captured["url"].endswith("/models/gemini-3.7-flash:generateContent")
         assert "gemini-test-only" not in captured["url"]
         assert captured["headers"]["x-goog-api-key"] == "gemini-test-only"
-        assert captured["body"]["generationConfig"]["responseMimeType"] == "application/json"
-        schema = captured["body"]["generationConfig"]["responseSchema"]
-        assert schema["required"] == ["kind", "canonical_text", "reply"]
-        assert schema["properties"]["canonical_text"] == {"type": "string", "nullable": True}
-        assert schema["properties"]["reply"] == {"type": "string", "nullable": True}
+        declarations = captured["body"]["tools"][0]["functionDeclarations"]
+        assert any(item["name"] == "set_rewards" for item in declarations)
+        assert any(item["name"] == "send_user_message" for item in declarations)
+        assert captured["body"]["toolConfig"]["functionCallingConfig"]["mode"] == "AUTO"
 
         rewritten, reply = await bot._assistant_ai_rewrite(
             "ספר לי משהו כללי", 1, runtime_context="מצב חי מורשה:\n- סרטונים במאגר: 4"
@@ -120,6 +119,15 @@ async def run() -> None:
         assert rewritten == "SET_REWARDS:3,2"
         assert reply is None
         assert bot._assistant_action_steps("SET_REWARDS:3,2;;ADJUST_COINS:5:+1") == ["SET_REWARDS:3,2", "ADJUST_COINS:5:+1"]
+        function_payload = bot._assistant_function_call_payload({"name": "set_rewards", "args": {"daily_gift": 3, "referral_reward": 2}})
+        assert function_payload == {"kind": "rewrite", "canonical_text": "SET_REWARDS:3,2"}
+        assert bot._assistant_function_call_payload({"name": "unknown", "args": {}}) is None
+
+        def fake_function_call_urlopen(request, timeout):
+            return FakeGeminiResponse({"candidates": [{"content": {"parts": [{"functionCall": {"name": "get_user_balance", "args": {"user_id": "55"}}}]}}]})
+
+        bot.urllib.request.urlopen = fake_function_call_urlopen
+        assert bot._assistant_gemini_payload("מה היתרה של משתמש 55") == {"kind": "rewrite", "canonical_text": "GET_USER_BALANCE:55"}
 
         image_bytes = base64.b64encode(b"image-test").decode("ascii")
         def fake_image_urlopen(request, timeout):

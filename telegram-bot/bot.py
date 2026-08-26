@@ -741,6 +741,21 @@ def log_coin_transaction(
     save_json(COIN_TRANSACTIONS_FILE, records)
 
 
+def _redact_sensitive_audit_text(value: str) -> str:
+    """Prevent accidental persistence of common credentials from manager prompts or model text."""
+    text = str(value or "")
+    patterns = [
+        r"AIza[\w-]{20,}",
+        r"ghp_[A-Za-z0-9]{20,}",
+        r"\b\d{6,}:[A-Za-z0-9_-]{20,}\b",
+        r"(?i)(api[_ -]?key|token|secret|password)\s*[:=]\s*[^\s,;]+",
+        r"(?i)bearer\s+[A-Za-z0-9._-]+",
+    ]
+    for pattern in patterns:
+        text = re.sub(pattern, "[REDACTED]", text)
+    return text
+
+
 def log_ai_audit(
     actor_id: int,
     request_text: str,
@@ -758,10 +773,10 @@ def log_ai_audit(
     records.append({
         "at": datetime.now(timezone.utc).isoformat(),
         "admin_id": int(actor_id),
-        "request": str(request_text or "")[:4000],
+        "request": _redact_sensitive_audit_text(request_text)[:4000],
         "event": str(event),
-        "canonical_text": str(canonical_text or "")[:1000] or None,
-        "response": str(response_text or "")[:4000] or None,
+        "canonical_text": _redact_sensitive_audit_text(canonical_text)[:1000] or None,
+        "response": _redact_sensitive_audit_text(response_text)[:4000] or None,
         "status": str(status),
         "details": details if isinstance(details, dict) else {},
     })
@@ -2281,8 +2296,9 @@ _ASSISTANT_AI_PROMPT = """אתה Gemini, עוזר AI חכם, ידידותי ומ
 השתמש רק בו כדי לענות על שאלות עובדתיות על המערכת. אל תנחש נתון שאינו נמצא בו, אל תחשוף מזהי משתמשים,
 שמות, פרטי הזמנות, תוכן הודעות, מפתחות או רשומות גולמיות, ואל תטען שביצעת פעולה.
 
-החזר JSON בלבד. אם המשתמש מבקש פעולה קיימת שאפשר לתרגם לפקודה קצרה שהמערכת מבינה, החזר kind="rewrite"
-ו-canonical_text. עבור שינוי תגמולים, השתמש רק באחת מהצורות המדויקות הבאות:
+אם המשתמש מבקש פעולה שקיימת ב־Function Call, בחר באותה Function Call עם arguments מדויקים.
+אם אין Function Call מתאים אך אפשר לתרגם לפקודה קצרה שהמערכת מבינה, החזר JSON עם kind="rewrite"
+ו־canonical_text. עבור שינוי תגמולים, השתמש רק באחת מהצורות המדויקות הבאות:
 SET_DAILY_GIFT:<מספר שלם אי-שלילי>, SET_REFERRAL_REWARD:<מספר שלם אי-שלילי>,
 או SET_REWARDS:<מתנה יומית>,<תגמול הפניה>. לדוגמה, "שנה את המתנה היומית ל-3" צריך להחזיר
 SET_DAILY_GIFT:3, ו"תעשה מתנות 3 והפניות 2" צריך להחזיר SET_REWARDS:3,2.
@@ -2313,6 +2329,68 @@ _GEMINI_ASSISTANT_RESPONSE_SCHEMA = {
     },
     "required": ["kind", "canonical_text", "reply"],
 }
+
+# Gemini may select one of these declarations, but its output is translated only
+# to an existing canonical command; the code remains the sole executor.
+_GEMINI_ASSISTANT_FUNCTION_DECLARATIONS = [
+    {"name": "set_daily_gift", "description": "Set future daily-gift coins.", "parameters": {"type": "OBJECT", "properties": {"amount": {"type": "INTEGER"}}, "required": ["amount"]}},
+    {"name": "set_referral_reward", "description": "Set future referral-reward coins.", "parameters": {"type": "OBJECT", "properties": {"amount": {"type": "INTEGER"}}, "required": ["amount"]}},
+    {"name": "set_rewards", "description": "Set both future daily-gift and referral-reward coins.", "parameters": {"type": "OBJECT", "properties": {"daily_gift": {"type": "INTEGER"}, "referral_reward": {"type": "INTEGER"}}, "required": ["daily_gift", "referral_reward"]}},
+    {"name": "get_user", "description": "Inspect one registered user by Telegram ID.", "parameters": {"type": "OBJECT", "properties": {"user_id": {"type": "STRING"}}, "required": ["user_id"]}},
+    {"name": "get_user_balance", "description": "Read one registered user's coin balance.", "parameters": {"type": "OBJECT", "properties": {"user_id": {"type": "STRING"}}, "required": ["user_id"]}},
+    {"name": "get_user_coin_history", "description": "Read a registered user's five latest coin transactions.", "parameters": {"type": "OBJECT", "properties": {"user_id": {"type": "STRING"}}, "required": ["user_id"]}},
+    {"name": "adjust_coins", "description": "Add or remove a non-zero signed coin amount for a registered user.", "parameters": {"type": "OBJECT", "properties": {"user_id": {"type": "STRING"}, "amount": {"type": "INTEGER"}}, "required": ["user_id", "amount"]}},
+    {"name": "get_user_orders", "description": "Read one registered user's orders.", "parameters": {"type": "OBJECT", "properties": {"user_id": {"type": "STRING"}}, "required": ["user_id"]}},
+    {"name": "get_system_status", "description": "Read permission-filtered system status counts.", "parameters": {"type": "OBJECT", "properties": {}}},
+    {"name": "get_problems", "description": "Read permission-filtered operational problem counts.", "parameters": {"type": "OBJECT", "properties": {}}},
+    {"name": "send_user_message", "description": "Stage a message to one registered user for explicit confirmation.", "parameters": {"type": "OBJECT", "properties": {"user_id": {"type": "STRING"}, "text": {"type": "STRING"}}, "required": ["user_id", "text"]}},
+    {"name": "set_maintenance", "description": "Stage maintenance on or off for explicit confirmation.", "parameters": {"type": "OBJECT", "properties": {"enabled": {"type": "BOOLEAN"}}, "required": ["enabled"]}},
+]
+
+
+def _assistant_function_call_payload(function_call: dict) -> dict | None:
+    """Translate only declared Gemini calls into the existing code-controlled allowlist."""
+    if not isinstance(function_call, dict):
+        return None
+    name = str(function_call.get("name") or "")
+    args = function_call.get("args") if isinstance(function_call.get("args"), dict) else {}
+    target = str(args.get("user_id") or "")
+    target = target if target.isdigit() else None
+    def nonnegative(field: str) -> int | None:
+        try:
+            value = int(args.get(field))
+        except (TypeError, ValueError):
+            return None
+        return value if value >= 0 else None
+    if name == "set_daily_gift" and (amount := nonnegative("amount")) is not None:
+        return {"kind": "rewrite", "canonical_text": f"SET_DAILY_GIFT:{amount}"}
+    if name == "set_referral_reward" and (amount := nonnegative("amount")) is not None:
+        return {"kind": "rewrite", "canonical_text": f"SET_REFERRAL_REWARD:{amount}"}
+    if name == "set_rewards":
+        daily, referral = nonnegative("daily_gift"), nonnegative("referral_reward")
+        if daily is not None and referral is not None:
+            return {"kind": "rewrite", "canonical_text": f"SET_REWARDS:{daily},{referral}"}
+    if name in {"get_user", "get_user_balance", "get_user_coin_history", "get_user_orders"} and target:
+        command = {"get_user": "GET_USER", "get_user_balance": "GET_USER_BALANCE", "get_user_coin_history": "GET_USER_COIN_HISTORY", "get_user_orders": "GET_USER_ORDERS"}[name]
+        return {"kind": "rewrite", "canonical_text": f"{command}:{target}"}
+    if name == "adjust_coins" and target:
+        try:
+            amount = int(args.get("amount"))
+        except (TypeError, ValueError):
+            amount = 0
+        if amount:
+            return {"kind": "rewrite", "canonical_text": f"ADJUST_COINS:{target}:{amount:+d}"}
+    if name == "get_system_status":
+        return {"kind": "rewrite", "canonical_text": "GET_SYSTEM_STATUS"}
+    if name == "get_problems":
+        return {"kind": "rewrite", "canonical_text": "GET_PROBLEMS"}
+    if name == "send_user_message" and target:
+        message = str(args.get("text") or "").strip()
+        if message:
+            return {"kind": "rewrite", "canonical_text": f"SEND_USER_MESSAGE:{target}:{message[:3500]}"}
+    if name == "set_maintenance" and isinstance(args.get("enabled"), bool):
+        return {"kind": "rewrite", "canonical_text": f"SET_MAINTENANCE:{'on' if args['enabled'] else 'off'}"}
+    return None
 
 _ASSISTANT_MODEL_CACHE: dict[str, str] = {}
 _GEMINI_FREE_TIER_TEXT_MODEL_PRIORITY = (
@@ -2495,6 +2573,7 @@ async def _assistant_apply_reward_command(
     if not values:
         return False
     if not has_assistant_capability(user_id, "coins"):
+        _assistant_log_tool(context, user_id, canonical_text, "coins", "blocked", "אין הרשאת מטבעות לעוזר")
         await update.message.reply_text(
             "⛔ אין לך הרשאה לעדכן מתנות או תגמולי הפניה דרך העוזר.",
             reply_markup=_assistant_navigation_keyboard(),
@@ -2508,6 +2587,7 @@ async def _assistant_apply_reward_command(
     elif reward_kind == "both":
         settings["referral_reward_amount"] = values[1]
     save_settings(settings)
+    _assistant_log_tool(context, user_id, canonical_text, "coins", "success", "תגמולי העתיד עודכנו", {"daily_gift_amount": settings["daily_gift_amount"], "referral_reward_amount": settings["referral_reward_amount"]})
     log_admin_action(user_id, "assistant_reward_update", {
         "daily_gift_amount": settings["daily_gift_amount"],
         "referral_reward_amount": settings["referral_reward_amount"],
@@ -2528,19 +2608,44 @@ async def _assistant_apply_reward_command(
     return True
 
 
+def _assistant_log_tool(
+    context: ContextTypes.DEFAULT_TYPE, actor_id: int, canonical_text: str, required_permission: str,
+    status: str, result: str, safe_arguments: dict | None = None,
+) -> None:
+    """Record a tool decision without credentials, provider payloads or unsanitized data."""
+    current = context.user_data.get("assistant_audit_request", {})
+    raw_request = str(current.get("request") or "") if isinstance(current, dict) else ""
+    request_id = str(current.get("request_id") or "") if isinstance(current, dict) else ""
+    log_ai_audit(
+        actor_id, raw_request, "tool_execution", canonical_text=canonical_text,
+        response_text=result, status=status,
+        details={
+            "request_id": request_id,
+            "tool": canonical_text.split(":", 1)[0],
+            "required_permission": required_permission,
+            "arguments": safe_arguments if isinstance(safe_arguments, dict) else {},
+            "result": result[:800],
+        },
+    )
+
+
 async def _assistant_apply_runtime_command(
     update: Update, context: ContextTypes.DEFAULT_TYPE, canonical_text: str, user_id: int
 ) -> bool:
     """Execute a small allowlist of Gemini-translated operations with validation and confirmations."""
     user_match = re.fullmatch(r"GET_USER:(\d+)", canonical_text)
+    balance_match = re.fullmatch(r"GET_USER_BALANCE:(\d+)", canonical_text)
     history_match = re.fullmatch(r"GET_USER_COIN_HISTORY:(\d+)", canonical_text)
-    if user_match or history_match:
+    orders_match = re.fullmatch(r"GET_USER_ORDERS:(\d+)", canonical_text)
+    if user_match or balance_match or history_match or orders_match:
         if not has_assistant_capability(user_id, "users"):
+            _assistant_log_tool(context, user_id, canonical_text, "users", "blocked", "אין הרשאת משתמשים לעוזר")
             await update.message.reply_text("⛔ אין לך הרשאה לצפות בפרטי משתמשים דרך העוזר.", reply_markup=_assistant_navigation_keyboard())
             return True
-        target_id = (user_match or history_match).group(1)
+        target_id = (user_match or balance_match or history_match or orders_match).group(1)
         users = load_json(USERS_FILE)
         if target_id not in users:
+            _assistant_log_tool(context, user_id, canonical_text, "users", "failed", "מזהה משתמש אינו תקין", {"target_user_id": target_id})
             await update.message.reply_text("❌ מזהה המשתמש אינו תקין או שהמשתמש עדיין לא התחיל את הבוט.", reply_markup=_assistant_navigation_keyboard())
             return True
         if history_match:
@@ -2557,12 +2662,24 @@ async def _assistant_apply_runtime_command(
             else:
                 reply = "🪙 אין עדיין תנועות מטבעות מתועדות למשתמש זה."
             log_admin_action(user_id, "assistant_user_coin_history_viewed", {"target_id": target_id}, source="assistant", target_user_id=target_id)
+            _assistant_log_tool(context, user_id, canonical_text, "users", "success", "הוצגה היסטוריית מטבעות", {"target_user_id": target_id})
             await update.message.reply_text(reply, parse_mode="Markdown", reply_markup=_assistant_navigation_keyboard())
             return True
         user = users.get(target_id, {})
         coins = int(load_json(COINS_FILE).get(target_id, 0) or 0)
+        if balance_match:
+            _assistant_log_tool(context, user_id, canonical_text, "users", "success", "הוצגה יתרת מטבעות", {"target_user_id": target_id})
+            await update.message.reply_text(f"🪙 יתרת המטבעות של `{target_id}` היא *{coins}*.", parse_mode="Markdown", reply_markup=_assistant_navigation_keyboard())
+            return True
         referrals = int((load_json(REFERRALS_FILE).get(target_id, {}) or {}).get("count", 0) or 0)
         orders = [row for row in load_json(ORDERS_FILE) if isinstance(row, dict) and str(row.get("user_id")) == target_id]
+        if orders_match:
+            lines = [f"🧾 *הזמנות של `{target_id}`: {len(orders)}*"]
+            for row in orders[-5:]:
+                lines.append(f"• {str(row.get('date') or 'ללא תאריך')[:19]} — {int(row.get('videos_count', 0) or 0)} סרטונים — {row.get('type', 'לא צוין')}")
+            _assistant_log_tool(context, user_id, canonical_text, "users", "success", "הוצגו הזמנות משתמש", {"target_user_id": target_id, "orders": len(orders)})
+            await update.message.reply_text("\n".join(lines), parse_mode="Markdown", reply_markup=_assistant_navigation_keyboard())
+            return True
         vip = get_user_vip(target_id)
         reply = (
             "👤 *פרטי משתמש מורשים*\n\n"
@@ -2574,7 +2691,37 @@ async def _assistant_apply_runtime_command(
             f"🛒 רכישות: {len(orders)}"
         )
         log_admin_action(user_id, "assistant_user_viewed", {"target_id": target_id}, source="assistant", target_user_id=target_id)
+        _assistant_log_tool(context, user_id, canonical_text, "users", "success", "הוצגו פרטי משתמש", {"target_user_id": target_id})
         await update.message.reply_text(reply, parse_mode="Markdown", reply_markup=_assistant_navigation_keyboard())
+        return True
+
+    if canonical_text == "GET_SYSTEM_STATUS":
+        if not has_assistant_capability(user_id, "users"):
+            _assistant_log_tool(context, user_id, canonical_text, "users", "blocked", "אין הרשאת נתוני מערכת לעוזר")
+            await update.message.reply_text("⛔ אין לך הרשאה לראות נתוני מערכת דרך העוזר.", reply_markup=_assistant_navigation_keyboard())
+            return True
+        metrics = _dashboard_metrics()
+        reply = f"📊 *מצב מערכת מורשה*\n\n👥 משתמשים: {metrics['users']}\n🧾 הזמנות: {metrics['orders']}\n🎬 סרטונים: {metrics['inventory']['videos']}\n🪙 מטבעות: {metrics['coins_total']}\n⚠️ בעיות: {sum(metrics['problem_counts'].values())}"
+        _assistant_log_tool(context, user_id, canonical_text, "users", "success", "הוצג מצב מערכת")
+        await update.message.reply_text(reply, parse_mode="Markdown", reply_markup=_assistant_navigation_keyboard())
+        return True
+
+    if canonical_text == "GET_PROBLEMS":
+        allowed_groups = []
+        if has_assistant_capability(user_id, "gallery"):
+            allowed_groups.extend(["videos", "categories"])
+        if has_assistant_capability(user_id, "duplicates"):
+            allowed_groups.extend(["duplicates", "trash"])
+        if has_assistant_capability(user_id, "users"):
+            allowed_groups.extend(["coupons", "data"])
+        if not allowed_groups:
+            _assistant_log_tool(context, user_id, canonical_text, "gallery/duplicates/users", "blocked", "אין הרשאה למרכז בעיות")
+            await update.message.reply_text("⛔ אין לך הרשאה למרכז הבעיות דרך העוזר.", reply_markup=_assistant_navigation_keyboard())
+            return True
+        report = _system_problem_report()
+        lines = ["⚠️ *מרכז בעיות מורשה*"] + [f"• {key}: {len(report.get(key, []))}" for key in allowed_groups]
+        _assistant_log_tool(context, user_id, canonical_text, "gallery/duplicates/users", "success", "הוצג סיכום בעיות", {"groups": allowed_groups})
+        await update.message.reply_text("\n".join(lines), parse_mode="Markdown", reply_markup=_assistant_navigation_keyboard())
         return True
 
     coin_match = re.fullmatch(r"ADJUST_COINS:(\d+):([+-]?\d+)", canonical_text)
@@ -2604,6 +2751,26 @@ async def _assistant_apply_runtime_command(
             f"✅ הבוט עדכן את יתרת המטבעות.\n\n{abs(applied)} מטבעות {action_word}.\nיתרה חדשה: *{new_balance}*",
             parse_mode="Markdown",
             reply_markup=_assistant_navigation_keyboard(),
+        )
+        return True
+
+    message_match = re.fullmatch(r"SEND_USER_MESSAGE:(\d+):(.+)", canonical_text, flags=re.DOTALL)
+    if message_match:
+        if not has_assistant_capability(user_id, "user_messages"):
+            _assistant_log_tool(context, user_id, canonical_text, "user_messages", "blocked", "אין הרשאת שליחה למשתמש לעוזר")
+            await update.message.reply_text("⛔ אין לך הרשאה לשלוח הודעה למשתמש דרך העוזר.", reply_markup=_assistant_navigation_keyboard())
+            return True
+        target_id, message_text = message_match.groups()
+        if target_id not in load_json(USERS_FILE):
+            _assistant_log_tool(context, user_id, canonical_text, "user_messages", "failed", "מזהה משתמש אינו תקין", {"target_user_id": target_id})
+            await update.message.reply_text("❌ מזהה המשתמש אינו תקין או שהמשתמש עדיין לא התחיל את הבוט.", reply_markup=_assistant_navigation_keyboard())
+            return True
+        context.user_data["assistant_pending_action"] = {"name": "send_user_message", "target_id": target_id, "text": message_text[:3500], "actor_id": user_id}
+        _assistant_log_tool(context, user_id, canonical_text, "user_messages", "planned", "ממתין לאישור שליחת הודעה", {"target_user_id": target_id, "text_length": len(message_text)})
+        await update.message.reply_text(
+            f"⚠️ הבקשה עומדת לשלוח הודעה למשתמש `{target_id}`.\n\nתוכן:\n{message_text[:500]}\n\nלאשר?",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("✅ אשר", callback_data="assistant_confirm_action")], [InlineKeyboardButton("❌ ביטול", callback_data="assistant_cancel_action")]]),
         )
         return True
 
@@ -2751,6 +2918,26 @@ async def assistant_confirm_action(update: Update, context: ContextTypes.DEFAULT
     if not isinstance(plan, dict) or plan.get("actor_id") != query.from_user.id:
         await query.edit_message_text("❌ אין פעולה תקפה שממתינה לאישור.", reply_markup=_assistant_navigation_keyboard())
         return
+    if plan.get("name") == "send_user_message":
+        if not has_assistant_capability(query.from_user.id, "user_messages"):
+            _assistant_log_tool(context, query.from_user.id, "SEND_USER_MESSAGE", "user_messages", "blocked", "ההרשאה השתנתה לפני האישור")
+            await query.edit_message_text("⛔ הפעולה אינה מורשית.", reply_markup=_assistant_navigation_keyboard())
+            return
+        target_id = str(plan.get("target_id") or "")
+        if target_id not in load_json(USERS_FILE):
+            _assistant_log_tool(context, query.from_user.id, "SEND_USER_MESSAGE", "user_messages", "failed", "המשתמש אינו קיים בעת האישור", {"target_user_id": target_id})
+            await query.edit_message_text("❌ המשתמש אינו קיים עוד בבוט.", reply_markup=_assistant_navigation_keyboard())
+            return
+        try:
+            await context.bot.send_message(chat_id=int(target_id), text=str(plan.get("text") or ""))
+        except Exception as exc:
+            _assistant_log_tool(context, query.from_user.id, "SEND_USER_MESSAGE", "user_messages", "failed", f"שליחת ההודעה נכשלה: {type(exc).__name__}", {"target_user_id": target_id})
+            await query.edit_message_text("❌ ההודעה לא נשלחה. לא בוצעה פעולה נוספת.", reply_markup=_assistant_navigation_keyboard())
+            return
+        log_admin_action(query.from_user.id, "assistant_user_message_sent", {"target_id": target_id, "text_length": len(str(plan.get("text") or ""))}, source="assistant", target_user_id=target_id)
+        _assistant_log_tool(context, query.from_user.id, "SEND_USER_MESSAGE", "user_messages", "success", "הודעה נשלחה", {"target_user_id": target_id, "text_length": len(str(plan.get("text") or ""))})
+        await query.edit_message_text("✅ ההודעה נשלחה למשתמש.", reply_markup=_assistant_navigation_keyboard())
+        return
     if plan.get("name") != "maintenance" or not has_assistant_capability(query.from_user.id, "maintenance"):
         await query.edit_message_text("⛔ הפעולה אינה מורשית.", reply_markup=_assistant_navigation_keyboard())
         return
@@ -2761,6 +2948,7 @@ async def assistant_confirm_action(update: Update, context: ContextTypes.DEFAULT
         settings["waiting_users"] = []
     save_settings(settings)
     log_admin_action(query.from_user.id, "assistant_maintenance_update", {"enabled": enabled}, source="assistant", dangerous=True)
+    _assistant_log_tool(context, query.from_user.id, f"SET_MAINTENANCE:{'on' if enabled else 'off'}", "maintenance", "success", "מצב התחזוקה עודכן", {"enabled": enabled})
     await query.edit_message_text(
         f"✅ הבוט עדכן את מצב התחזוקה ל־{'פעיל' if enabled else 'כבוי'}.",
         reply_markup=_assistant_navigation_keyboard(),
@@ -2770,7 +2958,9 @@ async def assistant_confirm_action(update: Update, context: ContextTypes.DEFAULT
 async def assistant_cancel_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    context.user_data.pop("assistant_pending_action", None)
+    plan = context.user_data.pop("assistant_pending_action", None)
+    if isinstance(plan, dict) and plan.get("actor_id") == query.from_user.id:
+        _assistant_log_tool(context, query.from_user.id, str(plan.get("name") or "pending_action").upper(), "confirmation", "cancelled", "הפעולה בוטלה לפני ביצוע")
     await query.edit_message_text("❌ הפעולה בוטלה ולא בוצע שינוי.", reply_markup=_assistant_navigation_keyboard())
 
 
@@ -2836,11 +3026,11 @@ def _assistant_gemini_payload(text: str) -> dict:
     body = {
         "systemInstruction": {"parts": [{"text": _ASSISTANT_AI_PROMPT}]},
         "contents": [{"role": "user", "parts": [{"text": text}]}],
+        "tools": [{"functionDeclarations": _GEMINI_ASSISTANT_FUNCTION_DECLARATIONS}],
+        "toolConfig": {"functionCallingConfig": {"mode": "AUTO"}},
         "generationConfig": {
             "temperature": 0.35,
             "maxOutputTokens": 600,
-            "responseMimeType": "application/json",
-            "responseSchema": _GEMINI_ASSISTANT_RESPONSE_SCHEMA,
         },
     }
     request_data = json.dumps(body, ensure_ascii=False).encode("utf-8")
@@ -2875,13 +3065,19 @@ def _assistant_gemini_payload(text: str) -> dict:
 
     candidates = raw.get("candidates") or []
     parts = ((candidates[0].get("content") or {}).get("parts") or []) if candidates else []
+    for part in parts:
+        if isinstance(part, dict) and isinstance(part.get("functionCall"), dict):
+            payload = _assistant_function_call_payload(part["functionCall"])
+            if payload:
+                return payload
+            raise RuntimeError("Gemini returned an unsupported function call")
     content = "".join(str(part.get("text", "")) for part in parts if isinstance(part, dict)).strip()
     if not content:
         raise RuntimeError("Gemini returned no usable text content")
     try:
         payload = json.loads(content)
-    except json.JSONDecodeError as exc:
-        raise RuntimeError("Gemini returned invalid JSON") from exc
+    except json.JSONDecodeError:
+        return {"kind": "answer", "canonical_text": None, "reply": content[:4000]}
     if not isinstance(payload, dict):
         raise RuntimeError("Gemini returned a JSON value instead of an object")
     return payload
@@ -3125,7 +3321,9 @@ async def admin_assistant_command(update: Update, context: ContextTypes.DEFAULT_
         log_admin_action(user_id, "assistant_access_blocked", {"required_permission": "assistant"}, source="assistant", status="blocked")
         return ConversationHandler.END
     text = _assistant_normalize(update.message.text)
-    log_ai_audit(user_id, raw_request, "request_received", status="received", details={"capabilities": sorted(assistant_capabilities(user_id))})
+    request_id = uuid.uuid4().hex
+    context.user_data["assistant_audit_request"] = {"request_id": request_id, "request": raw_request[:4000]}
+    log_ai_audit(user_id, raw_request, "request_received", status="received", details={"request_id": request_id, "capabilities": sorted(assistant_capabilities(user_id))})
     _assistant_append_history(context, "user", update.message.text)
     explicit_image_command = _assistant_explicit_image_command(text)
     if explicit_image_command:
