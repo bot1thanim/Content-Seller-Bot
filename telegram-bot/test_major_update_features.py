@@ -101,6 +101,7 @@ async def run():
         bot.TRASH_FILE = data / "trash.json"
         bot.ADMIN_ACTIONS_FILE = data / "admin_actions.json"
         bot.COIN_TRANSACTIONS_FILE = data / "coin_transactions.json"
+        bot.AI_AUDIT_FILE = data / "ai_audit.json"
         bot.DUPLICATE_REVIEWS_FILE = data / "duplicate_reviews.json"
         bot.AUTO_BACKUPS_DIR = data / "auto_backups"
         owner = bot.ADMIN_ID
@@ -129,6 +130,10 @@ async def run():
             assert reward_settings["daily_gift_amount"] == 3
             assert reward_settings["referral_reward_amount"] == 2
             assert "הבוט הבין" in reward_message.replies[-1][0]
+            ai_events = bot.load_json(bot.AI_AUDIT_FILE)
+            assert ai_events[0]["event"] == "request_received"
+            assert ai_events[-1]["event"] == "ai_action_plan"
+            assert ai_events[-1]["canonical_text"] == "SET_REWARDS:3,2"
         finally:
             bot._assistant_gemini_payload = previous_reward_payload
             if previous_reward_key is None:
@@ -136,6 +141,21 @@ async def run():
             else:
                 os.environ["GEMINI_API_KEY"] = previous_reward_key
         write(bot.USERS_FILE, {"77": {"first_name": "Dana", "username": "dana_admin", "joined": "today"}})
+        write(bot.COINS_FILE, {"77": 42})
+        write(bot.REFERRALS_FILE, {"77": {"count": 3}})
+        write(bot.ORDERS_FILE, [{"user_id": "77", "type": "coins"}])
+        bot.save_json(bot.COIN_TRANSACTIONS_FILE, [{
+            "at": "2026-08-26T12:00:00+00:00", "user_id": "77", "amount_before": 40,
+            "change": 2, "amount_after": 42, "reason": "test", "source": "test", "actor_id": owner,
+        }])
+        assistant_user_message = FakeMessage("בדוק משתמש 77")
+        assistant_user_update = SimpleNamespace(effective_user=SimpleNamespace(id=owner), message=assistant_user_message)
+        assert await bot._assistant_apply_runtime_command(assistant_user_update, SimpleNamespace(user_data={}), "GET_USER:77", owner)
+        assert "Dana" in assistant_user_message.replies[-1][0] and "42" in assistant_user_message.replies[-1][0]
+        assistant_history_message = FakeMessage("תנועות משתמש 77")
+        assistant_history_update = SimpleNamespace(effective_user=SimpleNamespace(id=owner), message=assistant_history_message)
+        assert await bot._assistant_apply_runtime_command(assistant_history_update, SimpleNamespace(user_data={}), "GET_USER_COIN_HISTORY:77", owner)
+        assert "+2" in assistant_history_message.replies[-1][0]
         name_lookup_message = FakeMessage("@dana_admin")
         name_lookup_update = SimpleNamespace(effective_user=SimpleNamespace(id=owner), message=name_lookup_message)
         await bot.admin_check_user(name_lookup_update, SimpleNamespace())

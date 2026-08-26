@@ -71,6 +71,7 @@ SETTINGS_FILE  = DATA_DIR / "settings.json"
 TRASH_FILE     = DATA_DIR / "trash.json"
 ADMIN_ACTIONS_FILE = DATA_DIR / "admin_actions.json"
 COIN_TRANSACTIONS_FILE = DATA_DIR / "coin_transactions.json"
+AI_AUDIT_FILE = DATA_DIR / "ai_audit.json"
 DUPLICATE_REVIEWS_FILE = DATA_DIR / "duplicate_reviews.json"
 AUTO_BACKUPS_DIR = DATA_DIR / "auto_backups"
 MAX_AUTO_BACKUPS = 30
@@ -87,6 +88,7 @@ BACKUP_ALLOWED_FILES = {
     "trash.json": list,
     "admin_actions.json": list,
     "coin_transactions.json": list,
+    "ai_audit.json": list,
     "duplicate_reviews.json": list,
 }
 MAX_RESTORE_ARCHIVE_BYTES = 20 * 1024 * 1024
@@ -171,6 +173,7 @@ def ensure_data_files():
         (TRASH_FILE,     []),
         (ADMIN_ACTIONS_FILE, []),
         (COIN_TRANSACTIONS_FILE, []),
+        (AI_AUDIT_FILE, []),
         (DUPLICATE_REVIEWS_FILE, []),
     ]
     for filepath, default in defaults:
@@ -359,6 +362,7 @@ def restore_summary(payloads: dict) -> str:
         "trash.json": "סל מיחזור",
         "admin_actions.json": "יומן פעולות מנהל",
         "coin_transactions.json": "היסטוריית מטבעות",
+        "ai_audit.json": "תיעוד עוזר AI",
         "duplicate_reviews.json": "סימוני לא־כפול",
     }
     parts = []
@@ -728,6 +732,33 @@ def log_coin_transaction(
         "actor_id": int(actor_id) if actor_id is not None else None,
     })
     save_json(COIN_TRANSACTIONS_FILE, records)
+
+
+def log_ai_audit(
+    actor_id: int,
+    request_text: str,
+    event: str,
+    *,
+    canonical_text: str | None = None,
+    response_text: str | None = None,
+    status: str = "recorded",
+    details: dict | None = None,
+) -> None:
+    """Persist AI activity for the owner without logging credentials or raw provider payloads."""
+    records = load_json(AI_AUDIT_FILE)
+    if not isinstance(records, list):
+        records = []
+    records.append({
+        "at": datetime.now(timezone.utc).isoformat(),
+        "admin_id": int(actor_id),
+        "request": str(request_text or "")[:4000],
+        "event": str(event),
+        "canonical_text": str(canonical_text or "")[:1000] or None,
+        "response": str(response_text or "")[:4000] or None,
+        "status": str(status),
+        "details": details if isinstance(details, dict) else {},
+    })
+    save_json(AI_AUDIT_FILE, records)
 
 
 DUPLICATE_REVIEWED_KEY = "reviewed_non_duplicate_groups"
@@ -2192,6 +2223,8 @@ SET_DAILY_GIFT:3, ו"תעשה מתנות 3 והפניות 2" צריך להחזי
 לתשלום ולשליטה במטבעות, אפשר להשתמש גם ב-ADJUST_COINS:<מזהה משתמש רשום>:<מספר שלם עם פלוס או מינוס>.
 לדוגמה, "תוסיף 5 מטבעות למשתמש 123" מחזיר ADJUST_COINS:123:+5.
 אם מופיעים בבקשה גם המילים מטבע, מטבעות, coins או balance וגם מזהה משתמש ומספר, זו תמיד בקשת ADJUST_COINS ולא תחזוקה.
+לבדיקת פרטי משתמש מורשים לפי מזהה, החזר GET_USER:<מזהה משתמש>.
+להצגת חמש תנועות מטבעות אחרונות של משתמש מורשה, החזר GET_USER_COIN_HISTORY:<מזהה משתמש>.
 להפעלת או כיבוי מצב תחזוקה השתמש ב-SET_MAINTENANCE:on או SET_MAINTENANCE:off.
 פעולת תחזוקה תבקש אישור מהמשתמש לפני ביצוע.
 לבקשה ליצור תמונה, החזר kind="rewrite" ו-GENERATE_IMAGE:<תיאור התמונה בשפת המשתמש>. אל תשתמש בזה לבקשה שאינה תמונה.
@@ -2213,22 +2246,34 @@ _GEMINI_ASSISTANT_RESPONSE_SCHEMA = {
 }
 
 _ASSISTANT_MODEL_CACHE: dict[str, str] = {}
+_GEMINI_FREE_TIER_TEXT_MODEL_PRIORITY = (
+    "gemini-3.7-flash",
+    "gemini-3.6-flash",
+    "gemini-3.5-flash",
+    "gemini-3.5-flash-lite",
+    "gemini-3.1-flash-lite",
+    "gemini-2.5-flash",
+    "gemini-2.5-flash-lite",
+    "gemini-2.0-flash",
+)
+
+
+class GeminiFreeTierUnavailable(RuntimeError):
+    """Raised when no advertised model is allowed by the bot's zero-cost policy."""
 
 
 def _assistant_ai_enabled() -> bool:
-    """Gemini is preferred; OpenAI remains a backward-compatible fallback."""
-    return bool(os.environ.get("GEMINI_API_KEY")) or (
-        bool(os.environ.get("OPENAI_API_KEY")) and OpenAI is not None
-    )
+    """The management assistant uses Gemini only; no alternate paid provider is allowed."""
+    return bool(os.environ.get("GEMINI_API_KEY"))
 
 
 def _assistant_gemini_model(api_key: str) -> str:
-    """Select the strongest text model advertised for this key unless the owner pinned one."""
-    configured = os.environ.get("GEMINI_ASSISTANT_MODEL", "").strip()
-    if configured:
-        return configured
+    """Select only an advertised model from the explicit Free Tier allowlist."""
+    configured = (os.environ.get("GEMINI_FAST_MODEL") or os.environ.get("GEMINI_ASSISTANT_MODEL") or "").strip()
+    if configured and configured not in _GEMINI_FREE_TIER_TEXT_MODEL_PRIORITY:
+        raise GeminiFreeTierUnavailable("Configured Gemini model is not allowed by the Free Tier policy")
     cached = _ASSISTANT_MODEL_CACHE.get("model")
-    if cached:
+    if cached and cached in _GEMINI_FREE_TIER_TEXT_MODEL_PRIORITY:
         return cached
     request = urllib.request.Request(
         "https://generativelanguage.googleapis.com/v1beta/models?pageSize=100",
@@ -2243,13 +2288,14 @@ def _assistant_gemini_model(api_key: str) -> str:
             for item in payload.get("models", [])
             if "generateContent" in item.get("supportedGenerationMethods", [])
         }
-        for candidate in ("gemini-3.7-flash", "gemini-3.6-flash", "gemini-2.5-pro", "gemini-2.5-flash"):
+        candidates = (configured,) if configured else _GEMINI_FREE_TIER_TEXT_MODEL_PRIORITY
+        for candidate in candidates:
             if candidate in available:
                 _ASSISTANT_MODEL_CACHE["model"] = candidate
                 return candidate
     except Exception as exc:
         logger.info("Gemini model discovery unavailable; using compatible fallback (%s)", type(exc).__name__)
-    return "gemini-2.5-flash"
+    raise GeminiFreeTierUnavailable("No Free Tier Gemini text model is advertised for this API key")
 
 
 def _assistant_ai_payload_result(payload: dict) -> tuple[str | None, str | None]:
@@ -2330,6 +2376,21 @@ def _assistant_explicit_coin_command(text: str) -> str | None:
     return f"ADJUST_COINS:{target_match.group(1)}:{amount:+d}"
 
 
+def _assistant_explicit_user_lookup_command(text: str) -> str | None:
+    """Resolve explicit user-inspection requests before a model can omit the requested ID."""
+    if not any(marker in text for marker in ("משתמש", "user")):
+        return None
+    match = re.search(r"(?:משתמש|user)\s*(\d+)", text, flags=re.IGNORECASE)
+    if not match:
+        return None
+    target_id = match.group(1)
+    if any(marker in text for marker in ("היסטור", "history", "תנוע")):
+        return f"GET_USER_COIN_HISTORY:{target_id}"
+    if any(marker in text for marker in ("בדוק", "תבדוק", "הצג", "פרטים", "details", "check", "show")):
+        return f"GET_USER:{target_id}"
+    return None
+
+
 def _assistant_explicit_image_command(text: str) -> str | None:
     """Route clear image-creation requests before a general AI rewrite can misclassify them."""
     patterns = (
@@ -2381,7 +2442,7 @@ async def _assistant_apply_reward_command(
     log_admin_action(user_id, "assistant_reward_update", {
         "daily_gift_amount": settings["daily_gift_amount"],
         "referral_reward_amount": settings["referral_reward_amount"],
-    })
+    }, source="assistant")
     _assistant_append_history(
         context,
         "assistant",
@@ -2402,6 +2463,51 @@ async def _assistant_apply_runtime_command(
     update: Update, context: ContextTypes.DEFAULT_TYPE, canonical_text: str, user_id: int
 ) -> bool:
     """Execute a small allowlist of Gemini-translated operations with validation and confirmations."""
+    user_match = re.fullmatch(r"GET_USER:(\d+)", canonical_text)
+    history_match = re.fullmatch(r"GET_USER_COIN_HISTORY:(\d+)", canonical_text)
+    if user_match or history_match:
+        if not has_assistant_capability(user_id, "users"):
+            await update.message.reply_text("⛔ אין לך הרשאה לצפות בפרטי משתמשים דרך העוזר.", reply_markup=_assistant_navigation_keyboard())
+            return True
+        target_id = (user_match or history_match).group(1)
+        users = load_json(USERS_FILE)
+        if target_id not in users:
+            await update.message.reply_text("❌ מזהה המשתמש אינו תקין או שהמשתמש עדיין לא התחיל את הבוט.", reply_markup=_assistant_navigation_keyboard())
+            return True
+        if history_match:
+            transactions = [
+                row for row in load_json(COIN_TRANSACTIONS_FILE)
+                if isinstance(row, dict) and str(row.get("user_id")) == target_id
+            ][-5:]
+            if transactions:
+                lines = ["🪙 *חמש תנועות המטבעות האחרונות:*"]
+                for row in reversed(transactions):
+                    at = str(row.get("at", ""))[:19].replace("T", " ")
+                    lines.append(f"• `{at}` — {int(row.get('change', 0)):+d} | {row.get('reason', 'לא צוין')} | יתרה: {row.get('amount_after', 0)}")
+                reply = "\n".join(lines)
+            else:
+                reply = "🪙 אין עדיין תנועות מטבעות מתועדות למשתמש זה."
+            log_admin_action(user_id, "assistant_user_coin_history_viewed", {"target_id": target_id}, source="assistant", target_user_id=target_id)
+            await update.message.reply_text(reply, parse_mode="Markdown", reply_markup=_assistant_navigation_keyboard())
+            return True
+        user = users.get(target_id, {})
+        coins = int(load_json(COINS_FILE).get(target_id, 0) or 0)
+        referrals = int((load_json(REFERRALS_FILE).get(target_id, {}) or {}).get("count", 0) or 0)
+        orders = [row for row in load_json(ORDERS_FILE) if isinstance(row, dict) and str(row.get("user_id")) == target_id]
+        vip = get_user_vip(target_id)
+        reply = (
+            "👤 *פרטי משתמש מורשים*\n\n"
+            f"🆔 `{target_id}`\n"
+            f"שם: {str(user.get('first_name') or 'לא צוין')[:80]}\n"
+            f"👑 דרגה: {vip['icon']} {vip['name']}\n"
+            f"🪙 מטבעות: {coins}\n"
+            f"👥 הפניות: {referrals}\n"
+            f"🛒 רכישות: {len(orders)}"
+        )
+        log_admin_action(user_id, "assistant_user_viewed", {"target_id": target_id}, source="assistant", target_user_id=target_id)
+        await update.message.reply_text(reply, parse_mode="Markdown", reply_markup=_assistant_navigation_keyboard())
+        return True
+
     coin_match = re.fullmatch(r"ADJUST_COINS:(\d+):([+-]?\d+)", canonical_text)
     if coin_match:
         if not has_assistant_capability(user_id, "coins"):
@@ -2423,7 +2529,7 @@ async def _assistant_apply_runtime_command(
         coins[target_id] = new_balance
         save_json(COINS_FILE, coins)
         log_coin_transaction(target_id, old_balance, applied, new_balance, reason="assistant_coin_adjustment", source="assistant", actor_id=user_id)
-        log_admin_action(user_id, "assistant_coin_adjustment", {"target_id": target_id, "change": applied, "new_balance": new_balance})
+        log_admin_action(user_id, "assistant_coin_adjustment", {"target_id": target_id, "change": applied, "new_balance": new_balance}, source="assistant", target_user_id=target_id)
         action_word = "נוספו" if applied >= 0 else "הוסרו"
         await update.message.reply_text(
             f"✅ הבוט עדכן את יתרת המטבעות.\n\n{abs(applied)} מטבעות {action_word}.\nיתרה חדשה: *{new_balance}*",
@@ -2455,6 +2561,12 @@ async def _assistant_apply_runtime_command(
         if not has_assistant_capability(user_id, "media"):
             await update.message.reply_text("⛔ אין לך הרשאה ליצור תמונות דרך העוזר.", reply_markup=_assistant_navigation_keyboard())
             return True
+        if not os.environ.get("GEMINI_FREE_TIER_IMAGE_MODEL", "").strip():
+            await update.message.reply_text(
+                "❌ יצירת תמונות מושבתת כרגע במדיניות ללא חיוב, כי לא הוגדר מודל תמונות שאומת למסלול החינמי. לא בוצעה בקשת API ולא בוצע חיוב.",
+                reply_markup=_assistant_navigation_keyboard(),
+            )
+            return True
         if not os.environ.get("GEMINI_API_KEY"):
             await update.message.reply_text("❌ יצירת תמונות אינה זמינה כי מפתח Gemini לא הוגדר.", reply_markup=_assistant_navigation_keyboard())
             return True
@@ -2463,7 +2575,7 @@ async def _assistant_apply_runtime_command(
             photo = io.BytesIO(image_bytes)
             photo.name = "gemini_image.png" if mime_type.endswith("png") else "gemini_image.jpg"
             await update.message.reply_photo(photo=photo, caption="🎨 התמונה מוכנה.")
-            log_admin_action(user_id, "assistant_image_generated", {"mime_type": mime_type})
+            log_admin_action(user_id, "assistant_image_generated", {"mime_type": mime_type}, source="assistant")
         except Exception as exc:
             logger.warning("Gemini image request failed safely: %s", str(exc)[:240])
             await update.message.reply_text(
@@ -2479,7 +2591,7 @@ def _assistant_gemini_image(prompt: str) -> tuple[bytes, str]:
     api_key = os.environ.get("GEMINI_API_KEY", "").strip()
     if not api_key:
         raise RuntimeError("Gemini API key missing")
-    configured_model = os.environ.get("GEMINI_IMAGE_MODEL", "").strip()
+    configured_model = os.environ.get("GEMINI_FREE_TIER_IMAGE_MODEL", "").strip()
     model = configured_model or _assistant_gemini_image_model(api_key)
     payload = {
         "model": model,
@@ -2579,7 +2691,7 @@ async def assistant_confirm_action(update: Update, context: ContextTypes.DEFAULT
     if enabled:
         settings["waiting_users"] = []
     save_settings(settings)
-    log_admin_action(query.from_user.id, "assistant_maintenance_update", {"enabled": enabled})
+    log_admin_action(query.from_user.id, "assistant_maintenance_update", {"enabled": enabled}, source="assistant", dangerous=True)
     await query.edit_message_text(
         f"✅ הבוט עדכן את מצב התחזוקה ל־{'פעיל' if enabled else 'כבוי'}.",
         reply_markup=_assistant_navigation_keyboard(),
@@ -2715,33 +2827,20 @@ async def _assistant_ai_rewrite(
         return None, None
     model_input = f"{text}\n\n{runtime_context}" if runtime_context else text
     try:
-        if os.environ.get("GEMINI_API_KEY"):
-            payload = await asyncio.to_thread(_assistant_gemini_payload, model_input)
-        else:
-            client = OpenAI()
-            response = await asyncio.to_thread(
-                client.chat.completions.create,
-                model=os.environ.get("ADMIN_ASSISTANT_MODEL", "gpt-4o-mini"),
-                messages=[
-                    {"role": "system", "content": _ASSISTANT_AI_PROMPT},
-                    {"role": "user", "content": model_input},
-                ],
-                response_format=_ASSISTANT_AI_SCHEMA,
-                max_completion_tokens=500,
-            )
-            content = getattr(response.choices[0].message, "content", None)
-            if not content:
-                raise RuntimeError("OpenAI returned no text content")
-            payload = json.loads(content)
+        payload = await asyncio.to_thread(_assistant_gemini_payload, model_input)
         return _assistant_ai_payload_result(payload)
+    except GeminiFreeTierUnavailable:
+        log_ai_audit(user_id, raw_text, "provider_unavailable", status="unavailable", details={"policy": "free_tier_only"})
+        return None, "🤖 העוזר החכם אינו זמין כרגע כי לא נמצא מודל Gemini מורשה במסגרת המכסה החינמית. לא בוצע חיוב ולא בוצעה פעולה."
     except Exception as exc:
-        provider = "Gemini" if os.environ.get("GEMINI_API_KEY") else "OpenAI"
+        provider = "Gemini"
         # Do not include provider URLs, request bodies or environment values in logs.
         logger.warning(
             "Assistant %s layer failed; using deterministic fallback (%s)",
             provider,
             type(exc).__name__,
         )
+        log_ai_audit(user_id, raw_text, "provider_error", status="failed", details={"provider": provider, "error_type": type(exc).__name__})
     return None, None
 
 
@@ -2951,16 +3050,27 @@ def _assistant_explanation(text: str, user_id: int) -> str | None:
 async def admin_assistant_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Deterministically parse safe Hebrew manager commands without an external AI service."""
     user_id = update.effective_user.id
+    raw_request = str(getattr(update.message, "text", "") or "")
     if not has_admin_permission(user_id, "assistant"):
+        log_ai_audit(user_id, raw_request, "assistant_access_denied", status="blocked", details={"required_permission": "assistant"})
+        log_admin_action(user_id, "assistant_access_blocked", {"required_permission": "assistant"}, source="assistant", status="blocked")
         return ConversationHandler.END
     text = _assistant_normalize(update.message.text)
+    log_ai_audit(user_id, raw_request, "request_received", status="received", details={"capabilities": sorted(assistant_capabilities(user_id))})
     _assistant_append_history(context, "user", update.message.text)
     explicit_image_command = _assistant_explicit_image_command(text)
     if explicit_image_command:
+        log_ai_audit(user_id, raw_request, "deterministic_tool_selected", canonical_text=explicit_image_command, status="planned")
         if await _assistant_apply_runtime_command(update, context, explicit_image_command, user_id):
+            return ADMIN_ASSISTANT_COMMAND
+    explicit_user_command = _assistant_explicit_user_lookup_command(text)
+    if explicit_user_command:
+        log_ai_audit(user_id, raw_request, "deterministic_tool_selected", canonical_text=explicit_user_command, status="planned")
+        if await _assistant_apply_runtime_command(update, context, explicit_user_command, user_id):
             return ADMIN_ASSISTANT_COMMAND
     live_answer = _assistant_live_answer(text, user_id)
     if live_answer:
+        log_ai_audit(user_id, raw_request, "live_data_answer", response_text=live_answer, status="answered")
         _assistant_append_history(context, "assistant", live_answer)
         await update.message.reply_text(
             live_answer,
@@ -2987,10 +3097,12 @@ async def admin_assistant_command(update: Update, context: ContextTypes.DEFAULT_
         ])),
     )
     if ai_reply:
+        log_ai_audit(user_id, raw_request, "ai_reply", response_text=ai_reply, status="answered")
         _assistant_append_history(context, "assistant", ai_reply)
         await update.message.reply_text(ai_reply, reply_markup=_assistant_navigation_keyboard())
         return ADMIN_ASSISTANT_COMMAND
     if ai_rewrite and ai_rewrite != text:
+        log_ai_audit(user_id, raw_request, "ai_action_plan", canonical_text=ai_rewrite, status="planned")
         action_steps = _assistant_action_steps(ai_rewrite)
         handled_actions = 0
         for action in action_steps:
@@ -3475,7 +3587,27 @@ def _filtered_audit_records(filter_key: str) -> list[dict]:
     if not isinstance(records, list):
         return []
     if filter_key == "ai":
-        return [record for record in records if record.get("source") == "assistant" or str(record.get("action", "")).startswith("assistant_")]
+        ai_records = load_json(AI_AUDIT_FILE)
+        if not isinstance(ai_records, list):
+            ai_records = []
+        return [
+            {
+                "at": record.get("at"),
+                "admin_id": record.get("admin_id"),
+                "action": f"ai_{record.get('event', 'event')}",
+                "details": {
+                    "request": record.get("request"),
+                    "canonical_text": record.get("canonical_text"),
+                    "response": record.get("response"),
+                    **(record.get("details") if isinstance(record.get("details"), dict) else {}),
+                },
+                "source": "assistant",
+                "status": record.get("status", "recorded"),
+                "target_user_id": None,
+                "dangerous": False,
+            }
+            for record in ai_records if isinstance(record, dict)
+        ]
     if filter_key == "blocked":
         return [record for record in records if record.get("status") in {"blocked", "failed", "cancelled"}]
     if filter_key == "dangerous":
@@ -3548,6 +3680,17 @@ async def admin_audit_filtered_page(update: Update, context: ContextTypes.DEFAUL
         line = f"• `{when}` — *{action}*\n  מבצע: `{actor}` | מקור: {source} | מצב: {status}"
         if target:
             line += f" | יעד: `{target}`"
+        if filter_key == "ai":
+            details = record.get("details") if isinstance(record.get("details"), dict) else {}
+            request = str(details.get("request") or "").strip()[:240]
+            canonical = str(details.get("canonical_text") or "").strip()[:160]
+            response = str(details.get("response") or "").strip()[:240]
+            if request:
+                line += f"\n  בקשה: {request}"
+            if canonical:
+                line += f"\n  תכנית: {canonical}"
+            if response:
+                line += f"\n  תשובה: {response}"
         lines.append(line)
     navigation = []
     if page > 0:

@@ -54,32 +54,10 @@ async def run() -> None:
     os.environ["OPENAI_API_KEY"] = "test-only"
     os.environ.pop("GEMINI_API_KEY", None)
     try:
-        bot.OpenAI = lambda: FakeClient({
-            "kind": "rewrite",
-            "canonical_text": "שלח סרטונים מ-10 עד 20 שניות",
-            "reply": None,
-        })
+        # The production assistant is Gemini-only: an OpenAI key alone must never trigger a fallback request.
         rewritten, reply = await bot._assistant_ai_rewrite("תביא לי וידאו מעשר עד עשרים", 1)
-        assert rewritten == "שלח סרטונים מ-10 עד 20 שניות"
-        assert reply is None
-
-        bot.OpenAI = lambda: FakeClient({
-            "kind": "clarification",
-            "canonical_text": None,
-            "reply": "איזה משתמש תרצה לבדוק?",
-        })
-        rewritten, reply = await bot._assistant_ai_rewrite("תבדוק אותו", 1)
-        assert rewritten is None
-        assert reply == "איזה משתמש תרצה לבדוק?"
-
-        bot.OpenAI = lambda: FakeClient({
-            "kind": "answer",
-            "canonical_text": None,
-            "reply": "🤖 כן. אני יכול לענות גם על שאלות כלליות בעברית, בלי לבצע פעולה בבוט.",
-        })
-        rewritten, reply = await bot._assistant_ai_rewrite("מה ההבדל בין גיבוי לשחזור?", 1)
-        assert rewritten is None
-        assert "שאלות כלליות" in reply
+        assert rewritten is None and reply is None
+        assert not bot._assistant_ai_enabled()
 
         os.environ["GEMINI_API_KEY"] = "gemini-test-only"
         captured = {}
