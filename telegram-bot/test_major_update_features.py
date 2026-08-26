@@ -627,6 +627,11 @@ async def run():
             "source": "telegram_callback", "status": "success",
         })
         assert "מרכז הבעיות" in human_callback and "admin_problem_center" not in human_callback
+        human_assistant_action = bot._format_admin_action_record({
+            "at": "2026-08-26T17:35:00+00:00", "admin_id": owner,
+            "action": "assistant_reward_update", "details": {}, "source": "assistant", "status": "success",
+        })
+        assert "עוזר AI" in human_assistant_action
         human_ai = bot._format_ai_audit_record({
             "at": "2026-08-26T18:02:00+00:00", "admin_id": owner, "request": "תן למשתמש 77 עוד 2 מטבעות",
             "event": "tool_execution", "canonical_text": "ADJUST_COINS:77:+2", "status": "success",

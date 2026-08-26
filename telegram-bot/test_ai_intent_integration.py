@@ -137,6 +137,14 @@ async def run() -> None:
 
         bot.urllib.request.urlopen = fake_multi_function_call_urlopen
         assert bot._assistant_gemini_payload("בדוק משתמש 55 והיסטוריה") == {"kind": "rewrite", "canonical_text": "GET_USER:55;;GET_USER_COIN_HISTORY:55"}
+        fake_context = SimpleNamespace(user_data={})
+        bot._assistant_append_history(fake_context, "user", "שנה את המתנה ל-5")
+        bot._assistant_append_history(fake_context, "assistant", "המתנה עודכנה")
+        assert "שנה את המתנה ל-5" in bot._assistant_history_context(fake_context)
+        assert bot._assistant_action_steps("SET_DAILY_GIFT:5;;SET_REFERRAL_REWARD:3") == ["SET_DAILY_GIFT:5", "SET_REFERRAL_REWARD:3"]
+        assert bot._assistant_risk_level("GET_USER_BALANCE:55") == "info"
+        assert bot._assistant_risk_level("SET_DAILY_GIFT:5") == "normal"
+        assert bot._assistant_risk_level("SEND_USER_MESSAGE:55:hello") == "dangerous"
 
         image_bytes = base64.b64encode(b"image-test").decode("ascii")
         def fake_image_urlopen(request, timeout):

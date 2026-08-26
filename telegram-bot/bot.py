@@ -922,7 +922,9 @@ def _format_admin_action_record(record: dict) -> str:
     label = _human_action_label(action, details)
     verb = "ניסה" if str(record.get("status")) in {"blocked", "failed", "cancelled"} else "ביצע"
     actor = record.get("admin_id") or "מערכת"
-    lines = [f"👤 {'מנהל' if actor != 'מערכת' else 'מערכת'}: `{actor}`", f"🕐 {_hebrew_timestamp(record.get('at'))}", f"🖱️ {verb}: {label}", _hebrew_status(record.get("status"))]
+    source = str(record.get("source") or "manual")
+    actor_kind = "מערכת" if actor == "מערכת" else ("עוזר AI בשם מנהל" if source == "assistant" else "מנהל")
+    lines = [f"👤 {actor_kind}: `{actor}`", f"🕐 {_hebrew_timestamp(record.get('at'))}", f"🖱️ {verb}: {label}", _hebrew_status(record.get("status"))]
     if record.get("target_user_id"):
         lines.append(f"🎯 משתמש יעד: `{record['target_user_id']}`")
     permission = details.get("permission")
