@@ -26,6 +26,7 @@ class FakeBot:
         self.sent_videos = []
         self.sent_texts = []
         self.sent_photos = []
+        self.sent_documents = []
         self.deleted = []
         self.chat_actions = []
     async def send_video(self, chat_id, video, reply_markup=None):
@@ -37,10 +38,18 @@ class FakeBot:
     async def send_photo(self, chat_id, photo, caption=None, **kwargs):
         self.sent_photos.append((chat_id, photo, caption, kwargs))
         return Msg()
+    async def send_document(self, chat_id, document, filename=None, caption=None, **kwargs):
+        self.sent_documents.append((chat_id, document.getvalue(), filename, caption, kwargs))
+        return Msg()
     async def delete_message(self, chat_id, message_id):
         self.deleted.append((chat_id, message_id))
     async def send_chat_action(self, chat_id, action):
         self.chat_actions.append((chat_id, action))
+
+
+class FailingDocumentBot(FakeBot):
+    async def send_document(self, chat_id, document, filename=None, caption=None, **kwargs):
+        raise RuntimeError("document delivery failed")
 
 
 class FakeMessage:
@@ -497,6 +506,12 @@ async def run():
         bot.log_admin_action(owner, "test_action", {"ok": True})
         actions = bot.load_json(bot.ADMIN_ACTIONS_FILE)
         assert actions[-1]["action"] == "test_action"
+        daily_backup_bot = FakeBot()
+        await bot.send_owner_daily_report_with_backup(daily_backup_bot)
+        assert len(daily_backup_bot.sent_documents) == 1
+        daily_document = daily_backup_bot.sent_documents[0]
+        assert daily_document[0] == owner and daily_document[2].startswith("daily_backup_")
+        assert "דוח יומי לבעלים" in daily_document[3] and "גיבוי יומי מלא" in daily_document[3]
         # An empty assistant-manager list offers a direct manager-creation action.
         empty_assistant_list = FakeUpdate("admin_mgr_assistant_list", owner)
         await bot.admin_manager_assistant_list(empty_assistant_list, SimpleNamespace(user_data={}))
@@ -901,6 +916,36 @@ async def run():
         write(bot.USERS_FILE, {"55": {"last_bonus_ts": 0}})
         write(bot.COINS_FILE, {"55": 7})
         assert bot.count_unseen_videos(55) == 4
+
+        # Destructive actions must deliver a restorable emergency ZIP before changing data.
+        write(bot.VIDEOS_FILE, [{"entry_id": "emergency-video", "file_id": "v", "duration": 10}])
+        reset_bot = FakeBot()
+        reset_message = FakeMessage("מאשר")
+        reset_update = SimpleNamespace(effective_user=SimpleNamespace(id=owner), message=reset_message)
+        assert await bot.admin_global_reset_execute(reset_update, SimpleNamespace(bot=reset_bot, user_data={})) == bot.ConversationHandler.END
+        assert len(reset_bot.sent_documents) == 1
+        assert "גיבוי חירום" in reset_bot.sent_documents[0][3]
+        assert bot.load_json(bot.USERS_FILE) == {} and bot.load_json(bot.VIDEOS_FILE) == []
+        write(bot.VIDEOS_FILE, [{"entry_id": "emergency-video", "file_id": "v", "duration": 10}])
+        delete_bot = FakeBot()
+        delete_update = FakeUpdate("admin_delete_confirm", owner)
+        await bot.admin_delete_confirm(delete_update, SimpleNamespace(bot=delete_bot, user_data={}))
+        assert len(delete_bot.sent_documents) == 1
+        assert "מחיקת כל הסרטונים" in delete_bot.sent_documents[0][3]
+        assert bot.load_json(bot.VIDEOS_FILE) == []
+        write(bot.USERS_FILE, {"55": {"last_bonus_ts": 0}})
+        failed_reset_message = FakeMessage("מאשר")
+        failed_reset_update = SimpleNamespace(effective_user=SimpleNamespace(id=owner), message=failed_reset_message)
+        assert await bot.admin_global_reset_execute(
+            failed_reset_update, SimpleNamespace(bot=FailingDocumentBot(), user_data={})
+        ) == bot.ConversationHandler.END
+        assert "האיפוס בוטל" in failed_reset_message.replies[-1][0]
+        assert "55" in bot.load_json(bot.USERS_FILE)
+        write(bot.VIDEOS_FILE, [{"entry_id": "keep-video", "file_id": "v", "duration": 10}])
+        failed_delete_update = FakeUpdate("admin_delete_confirm", owner)
+        await bot.admin_delete_confirm(failed_delete_update, SimpleNamespace(bot=FailingDocumentBot(), user_data={}))
+        assert "מחיקת הסרטונים בוטלה" in failed_delete_update.callback_query.edits[-1][0]
+        assert len(bot.load_json(bot.VIDEOS_FILE)) == 1
     print("PASS: gallery, user, messaging, rewards, communications, system, and owner permission boundaries are enforced.")
 
 

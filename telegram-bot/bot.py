@@ -921,6 +921,7 @@ _ACTION_LABELS_HE = {
     "owner_nickname_changed": "עדכון כינוי בעלים",
     "manager_removed": "הסרת מנהל",
     "manual_backup_created": "יצירת גיבוי ידני",
+    "emergency_backup_sent": "שליחת גיבוי חירום אוטומטי",
     "trash_emptied": "ריקון סל המיחזור",
     "video_permanently_deleted": "מחיקת סרטון לצמיתות",
     "admin_callback_accessed": "לחיצה על כפתור ניהול",
@@ -4762,6 +4763,51 @@ def _owner_daily_report() -> str:
     )
 
 
+async def _send_owner_backup_document(bot_instance, *, filename: str, caption: str) -> None:
+    """Create a fresh in-memory ZIP and deliver it only to the configured owner."""
+    archive = build_zip_of_data()
+    await bot_instance.send_document(
+        chat_id=ADMIN_ID,
+        document=archive,
+        filename=filename,
+        caption=caption,
+        parse_mode="Markdown",
+    )
+
+
+async def send_owner_daily_report_with_backup(bot_instance) -> None:
+    """Deliver the daily owner report as the caption of one complete daily backup."""
+    today = datetime.now(ISRAEL_TZ).date().isoformat()
+    await _send_owner_backup_document(
+        bot_instance,
+        filename=f"daily_backup_{today}.zip",
+        caption=f"{_owner_daily_report()}\n\n💾 מצורף גיבוי יומי מלא של נתוני הבוט.",
+    )
+
+
+async def send_emergency_backup_before_change(bot_instance, reason: str, actor_id: int) -> bool:
+    """Keep a local snapshot and deliver a restorable ZIP before a destructive action."""
+    snapshot = create_auto_backup(reason, actor_id)
+    if not snapshot:
+        return False
+    stamp = datetime.now(ISRAEL_TZ).strftime("%Y%m%d_%H%M%S")
+    reason_label = {
+        "global_reset": "איפוס נתונים",
+        "delete_all_videos": "מחיקת כל הסרטונים",
+    }.get(reason, "פעולה מסוכנת")
+    try:
+        await _send_owner_backup_document(
+            bot_instance,
+            filename=f"emergency_before_{reason}_{stamp}.zip",
+            caption=f"💾 *גיבוי חירום אוטומטי*\n\nנוצר לפני: {reason_label}.",
+        )
+    except Exception as exc:
+        logger.warning("Emergency backup delivery failed before %s: %s", reason, type(exc).__name__)
+        return False
+    log_admin_action(actor_id, "emergency_backup_sent", {"reason": reason}, source="system")
+    return True
+
+
 async def send_owner_daily_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -4780,7 +4826,7 @@ async def daily_owner_report_loop(bot_instance) -> None:
             now = datetime.now(timezone(timedelta(hours=3)))
             report_date = now.date().isoformat()
             if now.hour == hour and settings.get("last_daily_report_date") != report_date:
-                await bot_instance.send_message(chat_id=ADMIN_ID, text=_owner_daily_report(), parse_mode="Markdown")
+                await send_owner_daily_report_with_backup(bot_instance)
                 settings["last_daily_report_date"] = report_date
                 save_settings(settings)
             await asyncio.sleep(60)
@@ -8593,9 +8639,8 @@ async def admin_global_reset_execute(update: Update, context: ContextTypes.DEFAU
         await update.message.reply_text("❌ ביטול — הטקסט לא תאם. שלח 'מאשר' בדיוק.")
         return ADMIN_GLOBAL_RESET_CONFIRM
 
-    backup = create_auto_backup("global_reset", update.effective_user.id)
-    if not backup:
-        await update.message.reply_text("❌ לא נוצר גיבוי בטיחותי ולכן האיפוס בוטל.", reply_markup=get_admin_inline_keyboard())
+    if not await send_emergency_backup_before_change(context.bot, "global_reset", update.effective_user.id):
+        await update.message.reply_text("❌ גיבוי החירום לא נשלח לבעלים, ולכן האיפוס בוטל. הנתונים לא שונו.", reply_markup=get_admin_inline_keyboard())
         return ConversationHandler.END
 
     for filepath, default in [
@@ -8610,7 +8655,7 @@ async def admin_global_reset_execute(update: Update, context: ContextTypes.DEFAU
 
     log_admin_action(update.effective_user.id, "global_data_reset", {})
     await update.message.reply_text(
-        "✅ *כל הנתונים נמחקו בהצלחה!*\nהגדרות המערכת (settings.json) נשמרו.",
+        "✅ *כל הנתונים נמחקו בהצלחה!*\nהגדרות המערכת (settings.json) נשמרו, וגיבוי חירום של המצב הקודם נשלח לבעלים.",
         parse_mode="Markdown",
         reply_markup=get_admin_inline_keyboard(),
     )
@@ -8638,15 +8683,17 @@ async def admin_delete_confirm(update: Update, context: ContextTypes.DEFAULT_TYP
     await query.answer()
     if not is_admin(query.from_user.id):
         return
-    backup = create_auto_backup("delete_all_videos", query.from_user.id)
-    if not backup:
-        await query.answer("לא נוצר גיבוי בטיחותי ולכן המחיקה בוטלה.", show_alert=True)
+    if not await send_emergency_backup_before_change(context.bot, "delete_all_videos", query.from_user.id):
+        await query.edit_message_text(
+            "❌ גיבוי החירום לא נשלח לבעלים, ולכן מחיקת הסרטונים בוטלה. הנתונים לא שונו.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 חזור", callback_data="back_admin")]]),
+        )
         return
     count = len(load_json(VIDEOS_FILE))
     save_json(VIDEOS_FILE, [])
     log_admin_action(query.from_user.id, "all_videos_deleted", {"count": count})
     await query.edit_message_text(
-        "✅ כל הסרטונים נמחקו לאחר יצירת גיבוי בטיחותי!",
+        "✅ כל הסרטונים נמחקו לאחר שגיבוי חירום של המצב הקודם נשלח לבעלים.",
         reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 חזור", callback_data="back_admin")]]),
     )
 
@@ -8821,19 +8868,11 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ─── Automated Admin Backup Scheduler ──────────────────────────────────────────
 
 async def send_automated_backup(context: ContextTypes.DEFAULT_TYPE):
+    """Compatibility wrapper; daily delivery is normally driven by the owner report loop."""
     try:
-        buf = build_zip_of_data()
-        today_str = str(date.today())
-        await context.bot.send_document(
-            chat_id=ADMIN_ID,
-            document=buf,
-            filename=f"bot_backup_{today_str}.zip",
-            caption=f"""💾 *גיבוי אוטומתי יומי*
-📅 תאריך: {today_str}""",
-            parse_mode="Markdown"
-        )
-    except Exception as e:
-        logger.warning(f"Failed to send automated backup: {e}")
+        await send_owner_daily_report_with_backup(context.bot)
+    except Exception as exc:
+        logger.warning("Failed to send combined daily backup and report: %s", type(exc).__name__)
 
 def setup_automated_backup(application):
     job_queue = application.job_queue
