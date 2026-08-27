@@ -274,11 +274,54 @@ async def run():
         )
         assert (sent, failed) == (2, 0)
         assert {(row[0], row[1]) for row in localization_context.bot.sent_texts} == {(77, "מבצע חדש"), (7706183809, "מבצע חדש")}
+        write(bot.COUPONS_FILE, {
+            "WELCOME": {
+                "coins": 10, "expires": "2030-01-01", "max_uses": 10,
+                "used_by": ["77", "88"], "referral_mode": "none", "referral_minimum": 0,
+            }
+        })
+        coupons_query = FakeQuery("admin_coupons", owner)
+        await bot.admin_coupons_menu(SimpleNamespace(callback_query=coupons_query), SimpleNamespace())
+        coupon_menu_buttons = button_callbacks(coupons_query.edits[-1][1]["reply_markup"])
+        assert "coupon_edit_pick_0_0" in coupon_menu_buttons
+        assert bot.callback_permission("coupon_edit_pick_0_0") == "coins"
+        coupon_edit_context = SimpleNamespace(user_data={})
+        coupon_pick = FakeUpdate("coupon_edit_pick_0_0", owner)
+        assert await bot.admin_coupon_edit_start(coupon_pick, coupon_edit_context) == bot.ADMIN_COUPON_EDIT_MENU
+        assert "עריכת קופון" in coupon_pick.callback_query.edits[-1][0]
+        coupon_coins_field = FakeUpdate("coupon_edit_field_coins", owner)
+        assert await bot.admin_coupon_edit_field(coupon_coins_field, coupon_edit_context) == bot.ADMIN_COUPON_EDIT_VALUE
+        coupon_coins_message = FakeMessage("30")
+        assert await bot.admin_coupon_edit_value(SimpleNamespace(effective_user=SimpleNamespace(id=owner), message=coupon_coins_message), coupon_edit_context) == bot.ADMIN_COUPON_EDIT_MENU
+        updated_coupon = bot.load_json(bot.COUPONS_FILE)["WELCOME"]
+        assert updated_coupon["coins"] == 30 and updated_coupon["used_by"] == ["77", "88"]
+        coupon_limit_field = FakeUpdate("coupon_edit_field_max_uses", owner)
+        assert await bot.admin_coupon_edit_field(coupon_limit_field, coupon_edit_context) == bot.ADMIN_COUPON_EDIT_VALUE
+        too_low_limit_message = FakeMessage("1")
+        assert await bot.admin_coupon_edit_value(SimpleNamespace(effective_user=SimpleNamespace(id=owner), message=too_low_limit_message), coupon_edit_context) == bot.ADMIN_COUPON_EDIT_VALUE
+        assert bot.load_json(bot.COUPONS_FILE)["WELCOME"]["max_uses"] == 10
+        coupon_expiry_field = FakeUpdate("coupon_edit_field_expires", owner)
+        assert await bot.admin_coupon_edit_field(coupon_expiry_field, coupon_edit_context) == bot.ADMIN_COUPON_EDIT_VALUE
+        assert await bot.admin_coupon_edit_value(SimpleNamespace(effective_user=SimpleNamespace(id=owner), message=FakeMessage("skip")), coupon_edit_context) == bot.ADMIN_COUPON_EDIT_MENU
+        assert bot.load_json(bot.COUPONS_FILE)["WELCOME"]["expires"] is None
+        coupon_referral_field = FakeUpdate("coupon_edit_field_referrals", owner)
+        assert await bot.admin_coupon_edit_field(coupon_referral_field, coupon_edit_context) == bot.ADMIN_COUPON_EDIT_REFERRAL_MODE
+        assert await bot.admin_coupon_edit_referral_mode(SimpleNamespace(effective_user=SimpleNamespace(id=owner), message=FakeMessage("total")), coupon_edit_context) == bot.ADMIN_COUPON_EDIT_REFERRAL_MINIMUM
+        assert await bot.admin_coupon_edit_referral_minimum(SimpleNamespace(effective_user=SimpleNamespace(id=owner), message=FakeMessage("10")), coupon_edit_context) == bot.ADMIN_COUPON_EDIT_MENU
+        updated_coupon = bot.load_json(bot.COUPONS_FILE)["WELCOME"]
+        assert (updated_coupon["referral_mode"], updated_coupon["referral_minimum"]) == ("total", 10)
+        coupon_referral_field = FakeUpdate("coupon_edit_field_referrals", owner)
+        assert await bot.admin_coupon_edit_field(coupon_referral_field, coupon_edit_context) == bot.ADMIN_COUPON_EDIT_REFERRAL_MODE
+        assert await bot.admin_coupon_edit_referral_mode(SimpleNamespace(effective_user=SimpleNamespace(id=owner), message=FakeMessage("skip")), coupon_edit_context) == bot.ADMIN_COUPON_EDIT_MENU
+        updated_coupon = bot.load_json(bot.COUPONS_FILE)["WELCOME"]
+        assert (updated_coupon["referral_mode"], updated_coupon["referral_minimum"]) == ("none", 0)
+        assert any(row["action"] == "coupon_updated" for row in bot.load_json(bot.ADMIN_ACTIONS_FILE))
         settings = bot.load_settings()
         settings["admin_managers"] = {"88": {"permissions": ["assistant", "users"], "assistant_capabilities": ["users"]}}
         bot.save_settings(settings)
         assert await gate_allows("broadcast_confirm_send", owner)
         assert not await gate_allows("broadcast_confirm_send", 88)
+        assert not await gate_allows("coupon_edit_pick_0_0", 88)
         denied_message = FakeMessage("הוסף מטבעות")
         denied_context = SimpleNamespace(user_data={"assistant_audit_request": {"request_id": "audit-denied", "request": "הוסף מטבעות"}})
         assert await bot._assistant_apply_runtime_command(SimpleNamespace(effective_user=SimpleNamespace(id=88), message=denied_message), denied_context, "ADJUST_COINS:77:+2", 88)

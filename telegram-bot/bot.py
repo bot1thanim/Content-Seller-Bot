@@ -164,6 +164,10 @@ ADMIN_AUDIT_SEARCH = 38
 ADMIN_ASSISTANT_DELIVERY_CONTENT = 39
 ADMIN_ASSISTANT_DELIVERY_DELAY = 40
 ADMIN_ASSISTANT_DELIVERY_CONFIRM = 41
+ADMIN_COUPON_EDIT_MENU = 42
+ADMIN_COUPON_EDIT_VALUE = 43
+ADMIN_COUPON_EDIT_REFERRAL_MODE = 44
+ADMIN_COUPON_EDIT_REFERRAL_MINIMUM = 45
 
 
 # ─── Data helpers ─────────────────────────────────────────────────────────────
@@ -631,7 +635,7 @@ async def admin_callback_gate(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
     data = query.data or ""
     permission = callback_permission(data)
-    private_callback = data.startswith(("admin_", "broadcast_", "cat_", "dup_", "vid_", "trash_", "del_", "maint_", "support_reply"))
+    private_callback = data.startswith(("admin_", "broadcast_", "coupon_", "cat_", "dup_", "vid_", "trash_", "del_", "maint_", "support_reply"))
     allowed = is_owner(query.from_user.id)
     if not allowed and permission == "panel":
         allowed = is_admin(query.from_user.id)
@@ -809,6 +813,7 @@ _ACTION_LABELS_HE = {
     "category_deleted": "מחיקת קטגוריה",
     "category_sort_rescan": "מיון קטגוריות מחדש",
     "coin_reward_settings_updated": "עדכון הגדרות תגמול מטבעות",
+    "coupon_updated": "עריכת קופון",
     "coins_balance_changed": "שינוי יתרת מטבעות",
     "favorite_video_toggled": "עדכון מועדף סרטון",
     "global_data_reset": "איפוס נתוני הבוט",
@@ -1432,7 +1437,8 @@ def _clear_transient_flow_state(context: ContextTypes.DEFAULT_TYPE) -> None:
         "pending_restore", "support_reply_target", "category_rename_old",
         "broadcast_msg", "broadcast_media", "broadcast_markup", "broadcast_delay",
         "broadcast_edit_mode", "repair_list", "repair_index", "repair_scan_summary",
-        "assistant_pending_action", "assistant_delivery_draft",
+        "assistant_pending_action", "assistant_delivery_draft", "coupon_edit_code",
+        "coupon_edit_field", "coupon_edit_referral_mode",
     ):
         context.user_data.pop(key, None)
 
@@ -7309,31 +7315,79 @@ def _coupon_referral_requirement_text(coupon: dict) -> str:
         else f"{minimum} הפניות בסך הכול"
     )
 
+
+def _coupon_codes_page(coupons: dict, page: int, page_size: int = 8) -> list[str]:
+    return sorted(str(code) for code in coupons)[page * page_size:(page + 1) * page_size]
+
+
+def _coupon_edit_summary(code: str, coupon: dict) -> str:
+    used_by = coupon.get("used_by", [])
+    uses = len(used_by) if isinstance(used_by, list) else 0
+    maximum = coupon.get("max_uses") or "ללא הגבלה"
+    return (
+        f"🎟 *עריכת קופון: `{code}`*\n\n"
+        f"🪙 שווי: *{coupon.get('coins', 0)} מטבעות*\n"
+        f"📅 תפוגה: *{coupon.get('expires') or 'ללא הגבלה'}*\n"
+        f"👥 מימושים: *{uses}/{maximum}*\n"
+        f"🤝 תנאי הפניות: *{_coupon_referral_requirement_text(coupon)}*\n\n"
+        "שינויים יחולו רק על מימושים עתידיים. מימושים שכבר בוצעו נשמרים."
+    )
+
+
+def _coupon_edit_markup() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🪙 שנה שווי מטבעות", callback_data="coupon_edit_field_coins")],
+        [InlineKeyboardButton("📅 שנה תאריך תפוגה", callback_data="coupon_edit_field_expires")],
+        [InlineKeyboardButton("👥 שנה מגבלת מימושים", callback_data="coupon_edit_field_max_uses")],
+        [InlineKeyboardButton("🤝 שנה תנאי הפניות", callback_data="coupon_edit_field_referrals")],
+        [InlineKeyboardButton("🔙 חזרה לקופונים", callback_data="coupon_edit_back")],
+    ])
+
 async def admin_coupons_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query   = update.callback_query
     await query.answer()
-    if not is_admin(query.from_user.id):
+    if not has_admin_permission(query.from_user.id, "coins"):
         return
     coupons = load_json(COUPONS_FILE)
+    try:
+        page = max(0, int((query.data or "").rsplit("_", 1)[1])) if (query.data or "").startswith("admin_coupons_page_") else 0
+    except ValueError:
+        page = 0
+    total_pages = max(1, (len(coupons) + 7) // 8)
+    page = min(page, total_pages - 1)
+    codes = _coupon_codes_page(coupons, page)
     lines   = ["🎟 *ניהול קופונים*\n"]
     if coupons:
-        for code, c in coupons.items():
+        for code in codes:
+            c = coupons[code]
             uses  = len(c.get("used_by", []))
-            max_u = c.get("max_uses", "∞")
+            max_u = c.get("max_uses") or "∞"
             exp   = c.get("expires", "ללא הגבלה")
             lines.append(f"• `{code}` — 🪙{c['coins']} | {uses}/{max_u} | תפוגה: {exp} | 👥 {_coupon_referral_requirement_text(c)}")
+        lines.append(f"\nעמוד {page + 1} מתוך {total_pages}")
     else:
         lines.append("אין קופונים עדיין.")
     btns = [[InlineKeyboardButton("➕ צור קופון חדש", callback_data="admin_coupon_new")]]
-    for code in list(coupons.keys())[:10]:
-        btns.append([InlineKeyboardButton(f"🗑 מחק {code}", callback_data=f"coupon_del_{code}")])
+    for index, code in enumerate(codes):
+        btns.append([
+            InlineKeyboardButton(f"✏️ ערוך {code}", callback_data=f"coupon_edit_pick_{page}_{index}"),
+            InlineKeyboardButton(f"🗑 מחק {code}", callback_data=f"coupon_del_{code}"),
+        ])
+    if total_pages > 1:
+        navigation = []
+        if page > 0:
+            navigation.append(InlineKeyboardButton("◀️ קודם", callback_data=f"admin_coupons_page_{page - 1}"))
+        if page < total_pages - 1:
+            navigation.append(InlineKeyboardButton("הבא ▶️", callback_data=f"admin_coupons_page_{page + 1}"))
+        if navigation:
+            btns.append(navigation)
     btns.append([InlineKeyboardButton("🔙 חזור", callback_data="back_admin")])
     await query.edit_message_text("\n".join(lines), parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(btns))
 
 async def admin_coupon_delete(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    if not is_admin(query.from_user.id):
+    if not has_admin_permission(query.from_user.id, "coins"):
         return
     code    = query.data.replace("coupon_del_", "")
     coupons = load_json(COUPONS_FILE)
@@ -7341,6 +7395,191 @@ async def admin_coupon_delete(update: Update, context: ContextTypes.DEFAULT_TYPE
         del coupons[code]
         save_json(COUPONS_FILE, coupons)
     await admin_coupons_menu(update, context)
+
+
+async def admin_coupon_edit_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if not has_admin_permission(query.from_user.id, "coins"):
+        return ConversationHandler.END
+    try:
+        _, _, _, page_text, index_text = (query.data or "").split("_", 4)
+        page, index = int(page_text), int(index_text)
+    except (ValueError, AttributeError):
+        await query.edit_message_text("❌ לא ניתן לזהות את הקופון. חזור לרשימה ונסה שוב.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 חזרה לקופונים", callback_data="admin_coupons")]]))
+        return ConversationHandler.END
+    coupons = load_json(COUPONS_FILE)
+    codes = _coupon_codes_page(coupons, page)
+    if not 0 <= index < len(codes) or codes[index] not in coupons:
+        await query.edit_message_text("❌ הקופון כבר אינו קיים. חזור לרשימה.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 חזרה לקופונים", callback_data="admin_coupons")]]))
+        return ConversationHandler.END
+    context.user_data["coupon_edit_code"] = codes[index]
+    await query.edit_message_text(_coupon_edit_summary(codes[index], coupons[codes[index]]), parse_mode="Markdown", reply_markup=_coupon_edit_markup())
+    return ADMIN_COUPON_EDIT_MENU
+
+
+async def _admin_coupon_edit_show(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    query = update.callback_query
+    code = context.user_data.get("coupon_edit_code")
+    coupons = load_json(COUPONS_FILE)
+    if not isinstance(code, str) or code not in coupons:
+        context.user_data.pop("coupon_edit_code", None)
+        await query.edit_message_text("❌ הקופון כבר אינו קיים.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 חזרה לקופונים", callback_data="admin_coupons")]]))
+        return ConversationHandler.END
+    await query.edit_message_text(_coupon_edit_summary(code, coupons[code]), parse_mode="Markdown", reply_markup=_coupon_edit_markup())
+    return ADMIN_COUPON_EDIT_MENU
+
+
+async def admin_coupon_edit_field(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if not has_admin_permission(query.from_user.id, "coins"):
+        return ConversationHandler.END
+    field = (query.data or "").removeprefix("coupon_edit_field_")
+    if field not in {"coins", "expires", "max_uses", "referrals"} or not context.user_data.get("coupon_edit_code"):
+        return await _admin_coupon_edit_show(update, context)
+    if field == "referrals":
+        await query.edit_message_text(
+            "🤝 תנאי הפניות חדש?\n\nשלח `skip` ללא תנאי, `total` לסך הפניות, או `since` להפניות חדשות בלבד מאז יצירת הקופון.",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 ביטול וחזרה", callback_data="coupon_edit_back")]]),
+        )
+        return ADMIN_COUPON_EDIT_REFERRAL_MODE
+    context.user_data["coupon_edit_field"] = field
+    prompts = {
+        "coins": "🪙 שלח את שווי הקופון החדש במספר מטבעות חיובי.",
+        "expires": "📅 שלח תאריך תפוגה בפורמט `YYYY-MM-DD`, או `skip` ללא תוקף.",
+        "max_uses": "👥 שלח מגבלת מימושים חיובית, או `skip` ללא מגבלה. אי אפשר להגדיר מספר נמוך ממספר המימושים שכבר בוצעו.",
+    }
+    await query.edit_message_text(prompts[field], parse_mode="Markdown", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 ביטול וחזרה", callback_data="coupon_edit_back")]]))
+    return ADMIN_COUPON_EDIT_VALUE
+
+
+async def _admin_coupon_edit_save_field(update: Update, context: ContextTypes.DEFAULT_TYPE, field: str, value) -> int:
+    code = context.user_data.get("coupon_edit_code")
+    coupons = load_json(COUPONS_FILE)
+    coupon = coupons.get(code) if isinstance(code, str) else None
+    if not isinstance(coupon, dict):
+        _clear_transient_flow_state(context)
+        await update.message.reply_text("❌ הקופון כבר אינו קיים.", reply_markup=get_admin_inline_keyboard(update.effective_user.id))
+        return ConversationHandler.END
+    previous = coupon.get(field)
+    coupon[field] = value
+    coupons[code] = coupon
+    save_json(COUPONS_FILE, coupons)
+    log_admin_action(update.effective_user.id, "coupon_updated", {"code": code, "field": field, "before": previous, "after": value})
+    await update.message.reply_text(f"✅ הקופון `{code}` עודכן. המימושים הקיימים נשמרו.", parse_mode="Markdown", reply_markup=_coupon_edit_markup())
+    return ADMIN_COUPON_EDIT_MENU
+
+
+async def admin_coupon_edit_value(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not has_admin_permission(update.effective_user.id, "coins"):
+        return ConversationHandler.END
+    field = context.user_data.get("coupon_edit_field")
+    raw = (update.message.text or "").strip()
+    if field == "coins":
+        try:
+            value = int(raw)
+            if value <= 0:
+                raise ValueError
+        except ValueError:
+            await update.message.reply_text("❌ שלח מספר מטבעות חיובי.", reply_markup=_flow_back_markup())
+            return ADMIN_COUPON_EDIT_VALUE
+    elif field == "expires":
+        value = None if raw.casefold() == "skip" else raw
+        if value:
+            try:
+                datetime.strptime(value, "%Y-%m-%d")
+            except ValueError:
+                await update.message.reply_text("❌ פורמט לא תקין. שלח `YYYY-MM-DD` או `skip`.", parse_mode="Markdown", reply_markup=_flow_back_markup())
+                return ADMIN_COUPON_EDIT_VALUE
+    elif field == "max_uses":
+        value = None if raw.casefold() == "skip" else None
+        if raw.casefold() != "skip":
+            try:
+                value = int(raw)
+                if value <= 0:
+                    raise ValueError
+            except ValueError:
+                await update.message.reply_text("❌ שלח מספר חיובי או `skip`.", parse_mode="Markdown", reply_markup=_flow_back_markup())
+                return ADMIN_COUPON_EDIT_VALUE
+            coupon = load_json(COUPONS_FILE).get(context.user_data.get("coupon_edit_code"), {})
+            used_count = len(coupon.get("used_by", []) if isinstance(coupon, dict) else [])
+            if value < used_count:
+                await update.message.reply_text(f"❌ כבר בוצעו {used_count} מימושים. המגבלה החדשה חייבת להיות לפחות {used_count}.", reply_markup=_flow_back_markup())
+                return ADMIN_COUPON_EDIT_VALUE
+    else:
+        await update.message.reply_text("❌ שדה העריכה אינו תקין.", reply_markup=get_admin_inline_keyboard(update.effective_user.id))
+        return ConversationHandler.END
+    context.user_data.pop("coupon_edit_field", None)
+    return await _admin_coupon_edit_save_field(update, context, field, value)
+
+
+async def admin_coupon_edit_referral_mode(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not has_admin_permission(update.effective_user.id, "coins"):
+        return ConversationHandler.END
+    aliases = {
+        "skip": "none", "none": "none", "0": "none", "ללא": "none",
+        "total": "total", "all": "total", "סהכ": "total", "סך הכל": "total",
+        "since": "since_created", "new": "since_created", "מאז": "since_created", "חדש": "since_created",
+    }
+    mode = aliases.get((update.message.text or "").strip().casefold())
+    if mode is None:
+        await update.message.reply_text("❌ בחר `skip`, `total` או `since`.", parse_mode="Markdown", reply_markup=_flow_back_markup())
+        return ADMIN_COUPON_EDIT_REFERRAL_MODE
+    if mode == "none":
+        code = context.user_data.get("coupon_edit_code")
+        coupons = load_json(COUPONS_FILE)
+        coupon = coupons.get(code) if isinstance(code, str) else None
+        if not isinstance(coupon, dict):
+            await update.message.reply_text("❌ הקופון כבר אינו קיים.", reply_markup=get_admin_inline_keyboard(update.effective_user.id))
+            return ConversationHandler.END
+        before = {"mode": coupon.get("referral_mode", "none"), "minimum": coupon.get("referral_minimum", 0)}
+        coupon["referral_mode"] = "none"
+        coupon["referral_minimum"] = 0
+        coupons[code] = coupon
+        save_json(COUPONS_FILE, coupons)
+        log_admin_action(update.effective_user.id, "coupon_updated", {"code": code, "field": "referral_requirement", "before": before, "after": {"mode": "none", "minimum": 0}})
+        await update.message.reply_text(f"✅ תנאי ההפניות של `{code}` בוטל. המימושים הקיימים נשמרו.", parse_mode="Markdown", reply_markup=_coupon_edit_markup())
+        return ADMIN_COUPON_EDIT_MENU
+    context.user_data["coupon_edit_referral_mode"] = mode
+    label = "מאז יצירת הקופון" if mode == "since_created" else "בסך הכול"
+    await update.message.reply_text(f"כמה הפניות מוצלחות נדרשות {label}? שלח מספר שלם חיובי.", reply_markup=_flow_back_markup())
+    return ADMIN_COUPON_EDIT_REFERRAL_MINIMUM
+
+
+async def admin_coupon_edit_referral_minimum(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not has_admin_permission(update.effective_user.id, "coins"):
+        return ConversationHandler.END
+    try:
+        minimum = int((update.message.text or "").strip())
+        if minimum <= 0:
+            raise ValueError
+    except ValueError:
+        await update.message.reply_text("❌ שלח מספר שלם חיובי של הפניות נדרשות.", reply_markup=_flow_back_markup())
+        return ADMIN_COUPON_EDIT_REFERRAL_MINIMUM
+    code = context.user_data.get("coupon_edit_code")
+    coupons = load_json(COUPONS_FILE)
+    coupon = coupons.get(code) if isinstance(code, str) else None
+    if not isinstance(coupon, dict):
+        await update.message.reply_text("❌ הקופון כבר אינו קיים.", reply_markup=get_admin_inline_keyboard(update.effective_user.id))
+        return ConversationHandler.END
+    old_mode, old_minimum = coupon.get("referral_mode", "none"), coupon.get("referral_minimum", 0)
+    coupon["referral_mode"] = context.user_data.pop("coupon_edit_referral_mode", "total")
+    coupon["referral_minimum"] = minimum
+    coupons[code] = coupon
+    save_json(COUPONS_FILE, coupons)
+    log_admin_action(update.effective_user.id, "coupon_updated", {"code": code, "field": "referral_requirement", "before": {"mode": old_mode, "minimum": old_minimum}, "after": {"mode": coupon["referral_mode"], "minimum": minimum}})
+    await update.message.reply_text(f"✅ תנאי ההפניות של `{code}` עודכן. המימושים הקיימים נשמרו.", parse_mode="Markdown", reply_markup=_coupon_edit_markup())
+    return ADMIN_COUPON_EDIT_MENU
+
+
+async def admin_coupon_edit_back(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.pop("coupon_edit_code", None)
+    context.user_data.pop("coupon_edit_field", None)
+    context.user_data.pop("coupon_edit_referral_mode", None)
+    await admin_coupons_menu(update, context)
+    return ConversationHandler.END
 
 async def admin_coupon_new_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -8132,6 +8371,24 @@ def main():
         fallbacks=[CommandHandler("cancel", cancel), CallbackQueryHandler(back_admin, pattern="^back_admin$")],
         per_message=False, per_chat=True,
     )
+    coupon_edit_conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(admin_coupon_edit_start, pattern=r"^coupon_edit_pick_\d+_\d+$")],
+        states={
+            ADMIN_COUPON_EDIT_MENU: [
+                CallbackQueryHandler(admin_coupon_edit_field, pattern=r"^coupon_edit_field_(coins|expires|max_uses|referrals)$"),
+                CallbackQueryHandler(admin_coupon_edit_back, pattern="^coupon_edit_back$"),
+            ],
+            ADMIN_COUPON_EDIT_VALUE: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_coupon_edit_value)],
+            ADMIN_COUPON_EDIT_REFERRAL_MODE: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_coupon_edit_referral_mode)],
+            ADMIN_COUPON_EDIT_REFERRAL_MINIMUM: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_coupon_edit_referral_minimum)],
+        },
+        fallbacks=[
+            CommandHandler("cancel", cancel),
+            CallbackQueryHandler(admin_coupon_edit_back, pattern="^coupon_edit_back$"),
+            CallbackQueryHandler(back_admin, pattern="^back_admin$"),
+        ],
+        per_message=False, per_chat=True,
+    )
     coin_control_conv = ConversationHandler(
         entry_points=[CallbackQueryHandler(admin_coin_control_start, pattern="^admin_coin_set_(daily|referral|both)$")],
         states={ADMIN_MULTIPLIER: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_coin_control_apply)]},
@@ -8318,7 +8575,7 @@ def main():
     
     for conv in [
         check_conv, send_conv, approve_conv, broadcast_conv, coins_conv, vip_conv,
-        coupon_new_conv, coin_control_conv, restore_conv, global_reset_conv,
+        coupon_new_conv, coupon_edit_conv, coin_control_conv, restore_conv, global_reset_conv,
         video_search_conv, video_search_sec_conv, video_combined_search_conv, repair_conv, support_conv, coupon_redeem_conv, support_reply_conv,
         cat_add_conv, cat_rename_conv, manager_add_conv, assistant_conv, audit_search_conv, video_upload_conv
     ]:
@@ -8430,6 +8687,7 @@ def main():
         (r"^cat_quick_toggle_[0-9a-f]+_\d+$", admin_quick_category_toggle),
         (r"^cat_quick_done_[0-9a-f]+$", admin_quick_category_done),
         ("^admin_coupons$",             admin_coupons_menu),
+        (r"^admin_coupons_page_\d+$",   admin_coupons_menu),
         (r"^coupon_del_",               admin_coupon_delete),
         ("^admin_backup$",              admin_backup),
         ("^admin_delete$",              admin_delete_start),
