@@ -214,7 +214,7 @@ async def run():
         assistant_history_message = FakeMessage("תנועות משתמש 77")
         assistant_history_update = SimpleNamespace(effective_user=SimpleNamespace(id=owner), message=assistant_history_message)
         assert await bot._assistant_apply_runtime_command(assistant_history_update, SimpleNamespace(user_data={}), "GET_USER_COIN_HISTORY:77", owner)
-        assert "+2" in assistant_history_message.replies[-1][0]
+        assert "נוספו 2 מטבעות" in assistant_history_message.replies[-1][0]
         tool_context = SimpleNamespace(user_data={"assistant_audit_request": {"request_id": "audit-1", "request": "בדיקות Tools"}}, bot=FakeBot())
         balance_message = FakeMessage("יתרת משתמש 77")
         assert await bot._assistant_apply_runtime_command(SimpleNamespace(effective_user=SimpleNamespace(id=owner), message=balance_message), tool_context, "GET_USER_BALANCE:77", owner)
@@ -234,6 +234,32 @@ async def run():
         send_confirmation = FakeQuery("assistant_confirm_action", owner)
         await bot.assistant_confirm_action(SimpleNamespace(callback_query=send_confirmation), tool_context)
         assert tool_context.bot.sent_texts[-1][:2] == (77, "hello")
+        bot.AUTO_BACKUPS_DIR.mkdir(exist_ok=True)
+        snapshot_path = bot.AUTO_BACKUPS_DIR / "auto_20260827T120000Z_global_reset.zip"
+        with zipfile.ZipFile(snapshot_path, "w", zipfile.ZIP_DEFLATED) as archive:
+            archive.writestr("users.json", json.dumps({"77": {"first_name": "Dana"}}, ensure_ascii=False))
+            archive.writestr("coins.json", json.dumps({"77": 42}, ensure_ascii=False))
+            archive.writestr("orders.json", json.dumps([{ "user_id": "77", "type": "coins"}], ensure_ascii=False))
+            archive.writestr("coin_transactions.json", json.dumps([{
+                "at": "2026-08-26T12:00:00+00:00", "user_id": "77", "amount_before": 40,
+                "change": 2, "amount_after": 42, "reason": "daily_gift", "source": "system_daily_gift",
+            }], ensure_ascii=False))
+        write(bot.USERS_FILE, {})
+        write(bot.COINS_FILE, {})
+        write(bot.ORDERS_FILE, [])
+        bot.save_json(bot.COIN_TRANSACTIONS_FILE, [])
+        historical_message = FakeMessage("האם היו למשתמש 77 מטבעות לפני האיפוס?")
+        historical_update = SimpleNamespace(effective_user=SimpleNamespace(id=owner), message=historical_message)
+        assert await bot._assistant_apply_runtime_command(historical_update, tool_context, "GET_USER_HISTORY:77", owner)
+        historical_text = historical_message.replies[-1][0]
+        assert "אינו רשום כרגע" in historical_text and "יתרה שנשמרה: 42" in historical_text
+        assert "מתנה יומית" in historical_text
+        missing_history_message = FakeMessage("מה היה למשתמש 99?")
+        assert await bot._assistant_apply_runtime_command(
+            SimpleNamespace(effective_user=SimpleNamespace(id=owner), message=missing_history_message),
+            tool_context, "GET_USER_HISTORY:99", owner,
+        )
+        assert "לא נמצא" in missing_history_message.replies[-1][0]
         write(bot.USERS_FILE, {
             "77": {"first_name": "Dana", "username": "dana_admin", "joined": "today", "language": "he"},
             "7706183809": {"first_name": "Owner", "username": "owner", "joined": "today", "language": "en"},
@@ -823,7 +849,17 @@ async def run():
             "at": "2026-08-26T17:35:00+00:00", "admin_id": owner,
             "action": "assistant_reward_update", "details": {}, "source": "assistant", "status": "success",
         })
-        assert "עוזר AI" in human_assistant_action
+        assert "בוצע דרך העוזר של הבוט" in human_assistant_action
+        settings = bot.load_settings()
+        settings["admin_managers"] = {"12345": {"nickname": "מנהל משני", "permissions": []}}
+        bot.save_settings(settings)
+        human_coin_action = bot._format_admin_action_record({
+            "at": "2026-08-26T17:35:00+00:00", "admin_id": 12345,
+            "action": "coins_balance_changed", "details": {"target_user_id": "77", "change": 10}, "status": "success",
+        })
+        assert "━━━━━━━━" in human_coin_action and "מנהל משני" in human_coin_action
+        assert "מזהה מנהל: `12345`" in human_coin_action
+        assert "הוסיף 10 מטבעות למשתמש 77" in human_coin_action
         human_ai = bot._format_ai_audit_record({
             "at": "2026-08-26T18:02:00+00:00", "admin_id": owner, "request": "תן למשתמש 77 עוד 2 מטבעות",
             "event": "tool_execution", "canonical_text": "ADJUST_COINS:77:+2", "status": "success",

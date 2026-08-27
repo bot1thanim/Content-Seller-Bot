@@ -134,6 +134,8 @@ async def run() -> None:
         assert bot._assistant_action_steps("SET_REWARDS:3,2;;ADJUST_COINS:5:+1") == ["SET_REWARDS:3,2", "ADJUST_COINS:5:+1"]
         function_payload = bot._assistant_function_call_payload({"name": "set_rewards", "args": {"daily_gift": 3, "referral_reward": 2}})
         assert function_payload == {"kind": "rewrite", "canonical_text": "SET_REWARDS:3,2"}
+        historical_function_payload = bot._assistant_function_call_payload({"name": "get_user_history", "args": {"user_id": "55"}})
+        assert historical_function_payload == {"kind": "rewrite", "canonical_text": "GET_USER_HISTORY:55"}
         assert bot._assistant_function_call_payload({"name": "unknown", "args": {}}) is None
 
         def fake_function_call_urlopen(request, timeout):

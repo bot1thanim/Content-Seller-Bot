@@ -1025,17 +1025,52 @@ def _format_change_lines(details: dict) -> list[str]:
     return lines
 
 
+def _human_admin_action_description(action: object, details: dict) -> str:
+    """Describe common administrative changes as a complete Hebrew sentence."""
+    key = str(action or "")
+    target = str(details.get("target_user_id") or details.get("target_id") or "").strip()
+    if key in {"coins_balance_changed", "assistant_coin_adjustment"}:
+        try:
+            change = int(details.get("change", details.get("amount", 0)) or 0)
+        except (TypeError, ValueError):
+            change = 0
+        if target and change:
+            verb = "הוסיף" if change > 0 else "הסיר"
+            return f"{verb} {abs(change)} מטבעות למשתמש {target}"
+    if key in {"admin_callback_accessed", "admin_callback_blocked"}:
+        callback_label = _human_callback_label(details.get("callback"))
+        return (
+            f"ניסה להיכנס ל־{callback_label} ללא הרשאה"
+            if key == "admin_callback_blocked"
+            else f"פתח את {callback_label}"
+        )
+    return _human_action_label(key, details)
+
+
 def _format_admin_action_record(record: dict) -> str:
     details = record.get("details") if isinstance(record.get("details"), dict) else {}
     action = str(record.get("action") or "")
-    label = _human_action_label(action, details)
-    verb = "ניסה" if str(record.get("status")) in {"blocked", "failed", "cancelled"} else "ביצע"
     actor = record.get("admin_id") or "מערכת"
     source = str(record.get("source") or "manual")
-    actor_kind = "מערכת" if actor == "מערכת" else ("עוזר AI בשם מנהל" if source == "assistant" else "מנהל")
-    lines = [f"👤 {actor_kind}: `{actor}`", f"🕐 {_hebrew_timestamp(record.get('at'))}", f"🖱️ {verb}: {label}", _hebrew_status(record.get("status"))]
-    if record.get("target_user_id"):
-        lines.append(f"🎯 משתמש יעד: `{record['target_user_id']}`")
+    if actor == "מערכת":
+        actor_lines = ["👤 מבצע הפעולה: מערכת"]
+    else:
+        actor_lines = [
+            f"👤 מנהל: *{admin_display_name(actor)}*",
+            f"🆔 מזהה מנהל: `{actor}`",
+        ]
+    lines = [
+        "━━━━━━━━━━━━━━━━━━━━",
+        *actor_lines,
+        f"📌 פעולה: {_human_admin_action_description(action, details)}",
+        f"🕐 מתי: {_hebrew_timestamp(record.get('at'))}",
+        f"📍 תוצאה: {_hebrew_status(record.get('status'))}",
+    ]
+    if source == "assistant":
+        lines.append("🤖 בוצע דרך העוזר של הבוט")
+    target = str(record.get("target_user_id") or details.get("target_user_id") or details.get("target_id") or "").strip()
+    if target and target not in _human_admin_action_description(action, details):
+        lines.append(f"🎯 משתמש יעד: `{target}`")
     permission = details.get("permission")
     if permission:
         lines.append(f"🔐 הרשאה: {PERMISSION_LABELS.get(str(permission), 'גישה ניהולית')}")
@@ -1055,6 +1090,7 @@ def _human_tool_label(canonical_text: object) -> str:
         "GET_USER": "בדיקת פרטי משתמש",
         "GET_USER_BALANCE": "בדיקת יתרת מטבעות",
         "GET_USER_COIN_HISTORY": "בדיקת היסטוריית מטבעות",
+        "GET_USER_HISTORY": "בדיקת מצב היסטורי של משתמש",
         "GET_USER_ORDERS": "בדיקת הזמנות משתמש",
         "GET_SYSTEM_STATUS": "בדיקת נתוני מערכת",
         "GET_PROBLEMS": "הצגת מרכז בעיות",
@@ -2890,7 +2926,10 @@ SET_DAILY_GIFT:3, ו"תעשה מתנות 3 והפניות 2" צריך להחזי
 לדוגמה, "תוסיף 5 מטבעות למשתמש 123" מחזיר ADJUST_COINS:123:+5.
 אם מופיעים בבקשה גם המילים מטבע, מטבעות, coins או balance וגם מזהה משתמש ומספר, זו תמיד בקשת ADJUST_COINS ולא תחזוקה.
 לבדיקת פרטי משתמש מורשים לפי מזהה, החזר GET_USER:<מזהה משתמש>.
-להצגת חמש תנועות מטבעות אחרונות של משתמש מורשה, החזר GET_USER_COIN_HISTORY:<מזהה משתמש>.
+להצגת תנועות מטבעות אחרונות של משתמש מורשה, החזר GET_USER_COIN_HISTORY:<מזהה משתמש>.
+אם המשתמש שואל מה היה מצב המשתמש בעבר, האם היו לו מטבעות, מה הייתה הסיבה למטבעות, או מה נשמר לפני איפוס,
+החזר GET_USER_HISTORY:<מזהה משתמש>. פעולה זו יכולה לקרוא רק היסטוריית מטבעות קיימת וגיבוי בטיחות אוטומטי;
+אם אין תיעוד כזה, היא תאמר זאת במפורש ולא תנחש נתונים.
 להפעלת או כיבוי מצב תחזוקה השתמש ב-SET_MAINTENANCE:on או SET_MAINTENANCE:off.
 פעולת תחזוקה תבקש אישור מהמשתמש לפני ביצוע.
 לבקשה ליצור תמונה, החזר kind="rewrite" ו-GENERATE_IMAGE:<תיאור התמונה בשפת המשתמש>. אל תשתמש בזה לבקשה שאינה תמונה.
@@ -2921,6 +2960,7 @@ _GEMINI_ASSISTANT_FUNCTION_DECLARATIONS = [
     {"name": "get_user", "description": "Inspect one registered user by Telegram ID.", "parameters": {"type": "OBJECT", "properties": {"user_id": {"type": "STRING"}}, "required": ["user_id"]}},
     {"name": "get_user_balance", "description": "Read one registered user's coin balance.", "parameters": {"type": "OBJECT", "properties": {"user_id": {"type": "STRING"}}, "required": ["user_id"]}},
     {"name": "get_user_coin_history", "description": "Read a registered user's five latest coin transactions.", "parameters": {"type": "OBJECT", "properties": {"user_id": {"type": "STRING"}}, "required": ["user_id"]}},
+    {"name": "get_user_history", "description": "Read a user's historical coin and order snapshot from current history or an automatic safety backup. Use for questions about past state or data before reset.", "parameters": {"type": "OBJECT", "properties": {"user_id": {"type": "STRING"}}, "required": ["user_id"]}},
     {"name": "adjust_coins", "description": "Add or remove a non-zero signed coin amount for a registered user.", "parameters": {"type": "OBJECT", "properties": {"user_id": {"type": "STRING"}, "amount": {"type": "INTEGER"}}, "required": ["user_id", "amount"]}},
     {"name": "get_user_orders", "description": "Read one registered user's orders.", "parameters": {"type": "OBJECT", "properties": {"user_id": {"type": "STRING"}}, "required": ["user_id"]}},
     {"name": "get_system_status", "description": "Read permission-filtered system status counts.", "parameters": {"type": "OBJECT", "properties": {}}},
@@ -2952,8 +2992,8 @@ def _assistant_function_call_payload(function_call: dict) -> dict | None:
         daily, referral = nonnegative("daily_gift"), nonnegative("referral_reward")
         if daily is not None and referral is not None:
             return {"kind": "rewrite", "canonical_text": f"SET_REWARDS:{daily},{referral}"}
-    if name in {"get_user", "get_user_balance", "get_user_coin_history", "get_user_orders"} and target:
-        command = {"get_user": "GET_USER", "get_user_balance": "GET_USER_BALANCE", "get_user_coin_history": "GET_USER_COIN_HISTORY", "get_user_orders": "GET_USER_ORDERS"}[name]
+    if name in {"get_user", "get_user_balance", "get_user_coin_history", "get_user_history", "get_user_orders"} and target:
+        command = {"get_user": "GET_USER", "get_user_balance": "GET_USER_BALANCE", "get_user_coin_history": "GET_USER_COIN_HISTORY", "get_user_history": "GET_USER_HISTORY", "get_user_orders": "GET_USER_ORDERS"}[name]
         return {"kind": "rewrite", "canonical_text": f"{command}:{target}"}
     if name == "adjust_coins" and target:
         try:
@@ -3156,7 +3196,13 @@ def _assistant_explicit_user_lookup_command(text: str) -> str | None:
     if not match:
         return None
     target_id = match.group(1)
-    if any(marker in text for marker in ("היסטור", "history", "תנוע")):
+    if any(marker in text for marker in ("איפוס", "אופס", "נמחק", "לפני", "פעם", "היה", "היו", "היסטור", "history")):
+        return f"GET_USER_HISTORY:{target_id}"
+    if any(marker in text for marker in ("מטבע", "coins", "coin", "יתרה", "balance")):
+        return f"GET_USER_BALANCE:{target_id}"
+    if any(marker in text for marker in ("הזמנ", "orders", "purchases", "רכיש")):
+        return f"GET_USER_ORDERS:{target_id}"
+    if any(marker in text for marker in ("תנוע",)):
         return f"GET_USER_COIN_HISTORY:{target_id}"
     if any(marker in text for marker in ("בדוק", "תבדוק", "הצג", "פרטים", "details", "check", "show")):
         return f"GET_USER:{target_id}"
@@ -3276,6 +3322,123 @@ def _assistant_risk_level(canonical_text: str) -> str:
     return "normal"
 
 
+def _coin_reason_label(reason: object) -> str:
+    """Translate stored internal coin-reason codes without exposing implementation labels."""
+    return {
+        "referral_reward": "תגמול על הפניית משתמש חדש",
+        "daily_gift": "מתנה יומית",
+        "video_purchase": "רכישת סרטונים במטבעות",
+        "purchase_refund_no_delivery": "החזר על רכישה שלא נשלחה",
+        "coupon_redeemed": "מימוש קופון",
+        "assistant_coin_adjustment": "עדכון יתרה לפי בקשת מנהל דרך העוזר",
+        "admin_balance_adjustment": "עדכון יתרה ידני על ידי מנהל",
+    }.get(str(reason or ""), "עדכון מטבעות")
+
+
+def _format_coin_history_entry(row: dict) -> str:
+    """Render one stored balance change in plain Hebrew for an authorized manager."""
+    try:
+        change = int(row.get("change", 0) or 0)
+    except (TypeError, ValueError):
+        change = 0
+    direction = "נוספו" if change >= 0 else "הוסרו"
+    after = row.get("amount_after", "לא ידוע")
+    return (
+        f"• {_hebrew_timestamp(row.get('at'))} — {direction} {abs(change)} מטבעות.\n"
+        f"  סיבה: {_coin_reason_label(row.get('reason'))}. יתרה לאחר הפעולה: {after}."
+    )
+
+
+def _automatic_backup_user_snapshot(target_id: str) -> dict | None:
+    """Find the newest bounded automatic backup containing a user's historical data."""
+    try:
+        backups = sorted(AUTO_BACKUPS_DIR.glob("auto_*.zip"), key=lambda item: item.stat().st_mtime, reverse=True)
+    except OSError:
+        return None
+    for path in backups[:MAX_AUTO_BACKUPS]:
+        try:
+            with zipfile.ZipFile(path, "r") as archive:
+                def read_json(filename: str, default):
+                    try:
+                        info = archive.getinfo(filename)
+                        if info.file_size > 8 * 1024 * 1024:
+                            return default
+                        payload = json.loads(archive.read(info).decode("utf-8"))
+                        return payload if isinstance(payload, type(default)) else default
+                    except (KeyError, OSError, UnicodeDecodeError, json.JSONDecodeError, zipfile.BadZipFile):
+                        return default
+
+                users = read_json("users.json", {})
+                coins = read_json("coins.json", {})
+                orders = read_json("orders.json", [])
+                transactions = read_json("coin_transactions.json", [])
+            matching_transactions = [
+                row for row in transactions
+                if isinstance(row, dict) and str(row.get("user_id")) == target_id
+            ]
+            matching_orders = [
+                row for row in orders
+                if isinstance(row, dict) and str(row.get("user_id")) == target_id
+            ]
+            if target_id in users or target_id in coins or matching_orders or matching_transactions:
+                return {
+                    "saved_at": datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc).astimezone(ISRAEL_TZ),
+                    "coins": coins.get(target_id),
+                    "orders": matching_orders,
+                    "transactions": matching_transactions,
+                }
+        except (OSError, zipfile.BadZipFile):
+            continue
+    return None
+
+
+async def _assistant_show_historical_user_state(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, canonical_text: str, user_id: int, target_id: str
+) -> bool:
+    """Show only owner-authorized historical data, never fabricate a prior balance after data loss."""
+    can_view_users = has_assistant_capability(user_id, "users", "user_lookup")
+    can_view_backups = has_assistant_capability(user_id, "backup", "backup")
+    if not (can_view_users and can_view_backups):
+        _assistant_log_tool(context, user_id, canonical_text, "user_lookup + backup", "blocked", "חסרה הרשאת משתמשים או גיבויים לעיון היסטורי")
+        await update.message.reply_text("⛔ אין לך הרשאה לעיין במידע היסטורי של משתמשים דרך העוזר.", reply_markup=_assistant_navigation_keyboard())
+        return True
+
+    users = load_json(USERS_FILE)
+    coins = load_json(COINS_FILE)
+    orders = [row for row in load_json(ORDERS_FILE) if isinstance(row, dict) and str(row.get("user_id")) == target_id]
+    transactions = [
+        row for row in load_json(COIN_TRANSACTIONS_FILE)
+        if isinstance(row, dict) and str(row.get("user_id")) == target_id
+    ]
+    snapshot = _automatic_backup_user_snapshot(target_id)
+    if target_id not in users and target_id not in coins and not orders and not transactions and not snapshot:
+        _assistant_log_tool(context, user_id, canonical_text, "user_lookup + backup", "failed", "לא נמצא תיעוד נוכחי או גיבוי בטיחות עבור המשתמש", {"target_user_id": target_id})
+        await update.message.reply_text(
+            "ℹ️ לא נמצא למשתמש זה תיעוד פעיל, היסטוריית מטבעות או גיבוי בטיחות אוטומטי זמין. לכן הבוט לא יכול לקבוע מה הייתה יתרתו בעבר.",
+            reply_markup=_assistant_navigation_keyboard(),
+        )
+        return True
+
+    lines = [f"🕓 *מצב היסטורי של משתמש*\n\n🆔 `{target_id}`"]
+    if target_id in users or target_id in coins:
+        lines.append(f"\n*נתונים פעילים כרגע:*\n🪙 יתרה נוכחית: {int(coins.get(target_id, 0) or 0)}\n🧾 הזמנות פעילות: {len(orders)}")
+    else:
+        lines.append("\n⚠️ המשתמש אינו רשום כרגע בנתונים הפעילים; ייתכן שהנתונים אופסו.")
+    if transactions:
+        lines.append("\n*תנועות מטבעות מתועדות:*\n" + "\n".join(_format_coin_history_entry(row) for row in reversed(transactions[-10:])))
+    if snapshot:
+        saved_at = snapshot["saved_at"].strftime("%d/%m/%Y %H:%M")
+        lines.append(f"\n*נתונים מגיבוי בטיחות אוטומטי מ־{saved_at}:*")
+        if snapshot["coins"] is not None:
+            lines.append(f"🪙 יתרה שנשמרה: {int(snapshot['coins'] or 0)}")
+        lines.append(f"🧾 הזמנות שנשמרו: {len(snapshot['orders'])}")
+        if snapshot["transactions"]:
+            lines.append("תנועות אחרונות בגיבוי:\n" + "\n".join(_format_coin_history_entry(row) for row in reversed(snapshot["transactions"][-5:])))
+    _assistant_log_tool(context, user_id, canonical_text, "user_lookup + backup", "success", "הוצג מצב היסטורי של משתמש", {"target_user_id": target_id, "has_backup_snapshot": bool(snapshot)})
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown", reply_markup=_assistant_navigation_keyboard())
+    return True
+
+
 async def _assistant_apply_runtime_command(
     update: Update, context: ContextTypes.DEFAULT_TYPE, canonical_text: str, user_id: int
 ) -> bool:
@@ -3283,8 +3446,11 @@ async def _assistant_apply_runtime_command(
     user_match = re.fullmatch(r"GET_USER:(\d+)", canonical_text)
     balance_match = re.fullmatch(r"GET_USER_BALANCE:(\d+)", canonical_text)
     history_match = re.fullmatch(r"GET_USER_COIN_HISTORY:(\d+)", canonical_text)
+    historical_match = re.fullmatch(r"GET_USER_HISTORY:(\d+)", canonical_text)
     orders_match = re.fullmatch(r"GET_USER_ORDERS:(\d+)", canonical_text)
-    if user_match or balance_match or history_match or orders_match:
+    if user_match or balance_match or history_match or historical_match or orders_match:
+        if historical_match:
+            return await _assistant_show_historical_user_state(update, context, canonical_text, user_id, historical_match.group(1))
         required_permission = "order_view" if orders_match else "user_lookup"
         if not has_assistant_capability(user_id, "users", required_permission):
             _assistant_log_tool(context, user_id, canonical_text, required_permission, "blocked", "אין הרשאה מתאימה לעוזר")
@@ -3302,10 +3468,9 @@ async def _assistant_apply_runtime_command(
                 if isinstance(row, dict) and str(row.get("user_id")) == target_id
             ][-5:]
             if transactions:
-                lines = ["🪙 *חמש תנועות המטבעות האחרונות:*"]
+                lines = ["🪙 *תנועות המטבעות האחרונות:*"]
                 for row in reversed(transactions):
-                    at = str(row.get("at", ""))[:19].replace("T", " ")
-                    lines.append(f"• `{at}` — {int(row.get('change', 0)):+d} | {row.get('reason', 'לא צוין')} | יתרה: {row.get('amount_after', 0)}")
+                    lines.append(_format_coin_history_entry(row))
                 reply = "\n".join(lines)
             else:
                 reply = "🪙 אין עדיין תנועות מטבעות מתועדות למשתמש זה."
