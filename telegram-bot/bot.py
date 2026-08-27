@@ -599,7 +599,7 @@ def callback_permission(callback_data: str) -> str | None:
         return "users"
     if callback_data.startswith(("admin_send", "admin_approve")):
         return "user_messages"
-    if callback_data.startswith("admin_broadcast"):
+    if callback_data.startswith(("admin_broadcast", "broadcast_")):
         return "broadcast"
     if callback_data.startswith(("admin_coins", "admin_coupons", "coupon_", "admin_vip", "admin_multiplier", "admin_coin_control", "admin_coin_set_")):
         return "coins"
@@ -628,7 +628,7 @@ async def admin_callback_gate(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
     data = query.data or ""
     permission = callback_permission(data)
-    private_callback = data.startswith(("admin_", "cat_", "dup_", "vid_", "trash_", "del_", "maint_", "support_reply"))
+    private_callback = data.startswith(("admin_", "broadcast_", "cat_", "dup_", "vid_", "trash_", "del_", "maint_", "support_reply"))
     allowed = is_owner(query.from_user.id)
     if not allowed and permission == "panel":
         allowed = is_admin(query.from_user.id)
@@ -2665,6 +2665,19 @@ def _assistant_ai_payload_result(payload: dict) -> tuple[str | None, str | None]
     return None, None
 
 
+def _assistant_parse_structured_response(content: str) -> dict | None:
+    """Parse a structured response even when a model wraps its JSON in a Markdown fence."""
+    candidate = str(content or "").strip()
+    fenced = re.fullmatch(r"```(?:json)?\s*(.*?)\s*```", candidate, flags=re.IGNORECASE | re.DOTALL)
+    if fenced:
+        candidate = fenced.group(1).strip()
+    try:
+        payload = json.loads(candidate)
+    except json.JSONDecodeError:
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
 def _assistant_history_context(context: ContextTypes.DEFAULT_TYPE) -> str:
     """Return a short, per-chat conversation window without persisting it to disk."""
     history = context.user_data.get("assistant_ai_history", [])
@@ -3313,13 +3326,18 @@ def _assistant_gemini_payload(text: str) -> dict:
     content = "".join(str(part.get("text", "")) for part in parts if isinstance(part, dict)).strip()
     if not content:
         raise RuntimeError("Gemini returned no usable text content")
-    try:
-        payload = json.loads(content)
-    except json.JSONDecodeError:
-        return {"kind": "answer", "canonical_text": None, "reply": content[:4000]}
-    if not isinstance(payload, dict):
-        raise RuntimeError("Gemini returned a JSON value instead of an object")
-    return payload
+    payload = _assistant_parse_structured_response(content)
+    if payload is not None:
+        return payload
+    # A code fence is a structured-response formatting failure, never user-facing content.
+    # Do not leak raw provider JSON into the Telegram chat.
+    if content.lstrip().startswith("```") or re.match(r'^\{\s*"kind"\s*:', content):
+        return {
+            "kind": "clarification",
+            "canonical_text": None,
+            "reply": "🤖 לא התקבלה תשובה ברורה לבקשה. אפשר לנסות שוב או לבחור את הפעולה מהכפתורים.",
+        }
+    return {"kind": "answer", "canonical_text": None, "reply": content[:4000]}
 
 
 async def _assistant_ai_rewrite(
@@ -3584,6 +3602,14 @@ async def admin_assistant_command(update: Update, context: ContextTypes.DEFAULT_
             reply_markup=_assistant_navigation_keyboard(),
         )
         return ADMIN_ASSISTANT_COMMAND
+    if has_assistant_capability(user_id, "broadcast") and (
+        "הודעה לכולם" in text or "שלח לכולם" in text or "פרסם" in text
+    ):
+        await update.message.reply_text(
+            "🤖 פותח הודעה לכל המשתמשים.",
+            reply_markup=_assistant_action_button("📢 הודעה לכולם", "admin_broadcast"),
+        )
+        return ConversationHandler.END
     # Telegram displays this animation briefly while Gemini is preparing an answer.
     # It is sent only for external-AI processing and never changes bot permissions.
     chat_id = getattr(getattr(update, "effective_chat", None), "id", None)
@@ -3763,10 +3789,6 @@ async def admin_assistant_command(update: Update, context: ContextTypes.DEFAULT_
         if "שלח" in text and "משתמש" in text:
             await update.message.reply_text("🤖 פותח שליחה למשתמש.", reply_markup=_assistant_action_button("📩 שלח למשתמש", "admin_send"))
             return ConversationHandler.END
-
-    if has_assistant_capability(user_id, "broadcast") and ("הודעה לכולם" in text or "שלח לכולם" in text or "פרסם" in text):
-        await update.message.reply_text("🤖 פותח הודעה לכל המשתמשים.", reply_markup=_assistant_action_button("📢 הודעה לכולם", "admin_broadcast"))
-        return ConversationHandler.END
 
     if has_assistant_capability(user_id, "coins"):
         if "שליטה במטבעות" in text or "מתנה יומית" in text or "תגמול הפניה" in text or "תגמול הפניות" in text:
@@ -6626,14 +6648,15 @@ async def _show_broadcast_preview(message, context: ContextTypes.DEFAULT_TYPE):
     if markup and markup.inline_keyboard:
         link_label = markup.inline_keyboard[0][0].text
     preview = (
-        "📢 *תצוגה מקדימה של הודעה לכולם*\n\n"
-        f"*טקסט:*\n{text}\n\n"
-        f"*מדיה:* {media_label}\n"
-        f"*קישור:* {link_label}\n"
-        f"*השהיה:* {delay} דקות\n\n"
-        "בדוק את הפרטים. אפשר לערוך, לבטל או לאשר שליחה."
+        "📢 תצוגה מקדימה של הודעה לכולם\n\n"
+        f"טקסט:\n{text}\n\n"
+        f"מדיה: {media_label}\n"
+        f"קישור: {link_label}\n"
+        f"שליחה: {'מיידית ללא המתנה' if delay == 0 else f'בעוד {delay} דקות'}\n\n"
+        "בדוק את הפרטים. אפשר לערוך, לבטל או לאשר את השליחה."
     )
-    await message.reply_text(preview, parse_mode="Markdown", reply_markup=_broadcast_preview_markup())
+    # The manager's text may contain arbitrary Markdown characters, so do not parse it as Markdown.
+    await message.reply_text(preview, reply_markup=_broadcast_preview_markup())
 
 
 async def admin_broadcast_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -6702,7 +6725,7 @@ async def admin_broadcast_get_btn(update: Update, context: ContextTypes.DEFAULT_
         await _show_broadcast_preview(update.message, context)
         return ADMIN_BROADCAST_PREVIEW
     await update.message.reply_text(
-        "⏰ *השהיית שליחה (בדקות)*\n\nשלח `0` לשליחה מיידית, או מספר דקות להשהיה:",
+        "⏰ *השהיית שליחה (בדקות)*\n\nשלח `0` לשליחה מיידית ללא המתנה, או מספר דקות להשהיה. אחר כך תופיע תצוגה מקדימה לאישור:",
         parse_mode="Markdown",
         reply_markup=_flow_back_markup(),
     )

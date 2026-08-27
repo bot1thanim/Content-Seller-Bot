@@ -118,6 +118,18 @@ async def run() -> None:
         rewritten, reply = await bot._assistant_ai_rewrite("תעשה מתנות 3 והפניות 2", 1)
         assert rewritten == "SET_REWARDS:3,2"
         assert reply is None
+        def fake_fenced_reward_urlopen(request, timeout):
+            return FakeGeminiResponse({
+                "candidates": [{
+                    "content": {"parts": [{"text": "```json\n{\"kind\": \"rewrite\", \"canonical_text\": \"SET_DAILY_GIFT:4\", \"reply\": null}\n```"}]}
+                }]
+            })
+
+        bot.urllib.request.urlopen = fake_fenced_reward_urlopen
+        rewritten, reply = await bot._assistant_ai_rewrite("שנה את המתנה ל-4", 1)
+        assert rewritten == "SET_DAILY_GIFT:4" and reply is None
+        malformed = bot._assistant_parse_structured_response("```json\n{not valid}\n```")
+        assert malformed is None
         assert bot._assistant_action_steps("SET_REWARDS:3,2;;ADJUST_COINS:5:+1") == ["SET_REWARDS:3,2", "ADJUST_COINS:5:+1"]
         function_payload = bot._assistant_function_call_payload({"name": "set_rewards", "args": {"daily_gift": 3, "referral_reward": 2}})
         assert function_payload == {"kind": "rewrite", "canonical_text": "SET_REWARDS:3,2"}

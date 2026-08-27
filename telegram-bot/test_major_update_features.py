@@ -161,6 +161,27 @@ async def run():
                 os.environ.pop("GEMINI_API_KEY", None)
             else:
                 os.environ["GEMINI_API_KEY"] = previous_reward_key
+        broadcast_context = SimpleNamespace(user_data={
+            "broadcast_msg": "מבצע *חדש* [בדיקה]",
+            "broadcast_media": None,
+            "broadcast_markup": None,
+        })
+        immediate_message = FakeMessage("0")
+        immediate_update = SimpleNamespace(effective_user=SimpleNamespace(id=owner), message=immediate_message)
+        assert await bot.admin_broadcast_get_delay(immediate_update, broadcast_context) == bot.ADMIN_BROADCAST_PREVIEW
+        assert broadcast_context.user_data["broadcast_delay"] == 0
+        assert "מיידית ללא המתנה" in immediate_message.replies[-1][0]
+        assert "parse_mode" not in immediate_message.replies[-1][1]
+        delayed_message = FakeMessage("1")
+        delayed_update = SimpleNamespace(effective_user=SimpleNamespace(id=owner), message=delayed_message)
+        assert await bot.admin_broadcast_get_delay(delayed_update, broadcast_context) == bot.ADMIN_BROADCAST_PREVIEW
+        assert broadcast_context.user_data["broadcast_delay"] == 1
+        assert "בעוד 1 דקות" in delayed_message.replies[-1][0]
+        invalid_delay_message = FakeMessage("-1")
+        invalid_delay_update = SimpleNamespace(effective_user=SimpleNamespace(id=owner), message=invalid_delay_message)
+        assert await bot.admin_broadcast_get_delay(invalid_delay_update, broadcast_context) == bot.ADMIN_BROADCAST_DELAY
+        assert "מספר לא תקין" in invalid_delay_message.replies[-1][0]
+        assert bot.callback_permission("broadcast_confirm_send") == "broadcast"
         write(bot.USERS_FILE, {"77": {"first_name": "Dana", "username": "dana_admin", "joined": "today"}})
         write(bot.COINS_FILE, {"77": 42})
         write(bot.REFERRALS_FILE, {"77": {"count": 3}})
@@ -199,6 +220,8 @@ async def run():
         settings = bot.load_settings()
         settings["admin_managers"] = {"88": {"permissions": ["assistant", "users"], "assistant_capabilities": ["users"]}}
         bot.save_settings(settings)
+        assert await gate_allows("broadcast_confirm_send", owner)
+        assert not await gate_allows("broadcast_confirm_send", 88)
         denied_message = FakeMessage("הוסף מטבעות")
         denied_context = SimpleNamespace(user_data={"assistant_audit_request": {"request_id": "audit-denied", "request": "הוסף מטבעות"}})
         assert await bot._assistant_apply_runtime_command(SimpleNamespace(effective_user=SimpleNamespace(id=88), message=denied_message), denied_context, "ADJUST_COINS:77:+2", 88)
