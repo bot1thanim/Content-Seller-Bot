@@ -453,15 +453,15 @@ def _quick_category_markup(entry_id: str, menu_open: bool = False) -> InlineKeyb
     return InlineKeyboardMarkup(rows)
 
 
-async def send_admin_video_with_delete_button(bot, file_id, entry_id, max_attempts=5, include_category_assignment=False):
-    """Send one video with a unique delete button and optional direct category controls."""
+async def send_admin_video_with_delete_button(bot, file_id, entry_id, chat_id: int, max_attempts=5, include_category_assignment=False):
+    """Send one admin preview video only to the chat that initiated the management action."""
     markup = _quick_category_markup(entry_id) if include_category_assignment else InlineKeyboardMarkup([[InlineKeyboardButton(
         "🗑 מחק סרטון זה", callback_data=f"del_eid_{entry_id}"
     )]])
 
     for attempt in range(1, max_attempts + 1):
         try:
-            return await bot.send_video(chat_id=ADMIN_ID, video=file_id, reply_markup=markup)
+            return await bot.send_video(chat_id=int(chat_id), video=file_id, reply_markup=markup)
         except BadRequest as e:
             if "Wrong file identifier" in str(e) or "file_id" in str(e).lower():
                 logger.error(f"Invalid file_id detected for entry_id {entry_id}")
@@ -4901,10 +4901,11 @@ async def admin_gallery_page(update: Update, context: ContextTypes.DEFAULT_TYPE,
         pass
     
     sent_msg = await send_admin_video_with_delete_button(
-        context.bot, v["file_id"], v["entry_id"], include_category_assignment=True
+        context.bot, v["file_id"], v["entry_id"], query.message.chat_id, include_category_assignment=True
     )
     if sent_msg and sent_msg != "INVALID_FILE_ID":
         context.user_data["dup_sent_media_message_ids"] = [sent_msg.message_id]
+        context.user_data["admin_preview_chat_id"] = int(query.message.chat_id)
 
 
 async def admin_favorite_toggle(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -5054,10 +5055,13 @@ async def clear_sent_duplicate_group_media(context: ContextTypes.DEFAULT_TYPE) -
     if not isinstance(user_data, dict):
         return 0
     message_ids = user_data.pop("dup_sent_media_message_ids", [])
+    chat_id = user_data.get("admin_preview_chat_id")
+    if not isinstance(chat_id, int):
+        return 0
     removed_count = 0
     for message_id in message_ids:
         try:
-            await context.bot.delete_message(chat_id=ADMIN_ID, message_id=message_id)
+            await context.bot.delete_message(chat_id=chat_id, message_id=message_id)
             removed_count += 1
         except Exception as exc:
             # A video may already have been deleted manually; this must not block navigation.
@@ -5071,10 +5075,11 @@ async def clear_duplicate_review_control_message(context: ContextTypes.DEFAULT_T
     if not isinstance(user_data, dict):
         return False
     message_id = user_data.pop("dup_review_control_message_id", None)
-    if not message_id:
+    chat_id = user_data.get("admin_preview_chat_id")
+    if not message_id or not isinstance(chat_id, int):
         return False
     try:
-        await context.bot.delete_message(chat_id=ADMIN_ID, message_id=message_id)
+        await context.bot.delete_message(chat_id=chat_id, message_id=message_id)
         return True
     except Exception as exc:
         logger.info(f"Could not remove prior duplicate-review control message {message_id}: {exc}")
@@ -5092,7 +5097,7 @@ async def admin_dup_back_to_gallery(update: Update, context: ContextTypes.DEFAUL
     await admin_gallery(update, context)
 
 
-async def send_duplicate_group_media(context: ContextTypes.DEFAULT_TYPE, group: list[dict]) -> tuple[int, int]:
+async def send_duplicate_group_media(context: ContextTypes.DEFAULT_TYPE, group: list[dict], chat_id: int) -> tuple[int, int]:
     """Send one review group immediately and remember only its media for clean navigation."""
     await clear_sent_duplicate_group_media(context)
     success_count = 0
@@ -5103,7 +5108,7 @@ async def send_duplicate_group_media(context: ContextTypes.DEFAULT_TYPE, group: 
         if not entry_id:
             failed_count += 1
             continue
-        sent_message = await send_admin_video_with_delete_button(context.bot, video["file_id"], entry_id)
+        sent_message = await send_admin_video_with_delete_button(context.bot, video["file_id"], entry_id, chat_id)
         if sent_message and sent_message != "INVALID_FILE_ID":
             success_count += 1
             sent_message_ids.append(sent_message.message_id)
@@ -5111,6 +5116,7 @@ async def send_duplicate_group_media(context: ContextTypes.DEFAULT_TYPE, group: 
             failed_count += 1
         await asyncio.sleep(0.2)
     context.user_data["dup_sent_media_message_ids"] = sent_message_ids
+    context.user_data["admin_preview_chat_id"] = int(chat_id)
     return success_count, failed_count
 
 
@@ -5132,7 +5138,7 @@ async def admin_dup_page(update: Update, context: ContextTypes.DEFAULT_TYPE, pag
     if page >= total:
         completion_markup = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 חזרה", callback_data="dup_back_gallery")]])
         if had_lower_control:
-            await context.bot.send_message(chat_id=ADMIN_ID, text="✅ סיימת לעבור על כל הכפילויות!", reply_markup=completion_markup)
+            await context.bot.send_message(chat_id=query.message.chat_id, text="✅ סיימת לעבור על כל הכפילויות!", reply_markup=completion_markup)
         else:
             await query.edit_message_text("✅ סיימת לעבור על כל הכפילויות!", reply_markup=completion_markup)
         return
@@ -5146,7 +5152,7 @@ async def admin_dup_page(update: Update, context: ContextTypes.DEFAULT_TYPE, pag
             parse_mode="Markdown",
         )
 
-    success_count, failed_count = await send_duplicate_group_media(context, group)
+    success_count, failed_count = await send_duplicate_group_media(context, group, query.message.chat_id)
     status = (
         f"✅ נשלחו אוטומטית {success_count}/{len(group)} סרטונים חשודים. "
         "אפשר למחוק סרטון, לסמן כלא כפול או לעבור לקבוצה הבאה."
@@ -5154,12 +5160,13 @@ async def admin_dup_page(update: Update, context: ContextTypes.DEFAULT_TYPE, pag
     if failed_count:
         status += f"\n⚠️ {failed_count} סרטונים לא נשלחו וסומנו לבדיקה."
     lower_control = await context.bot.send_message(
-        chat_id=ADMIN_ID,
+        chat_id=query.message.chat_id,
         text=status,
         reply_markup=duplicate_group_keyboard(page, total),
     )
     if lower_control:
         context.user_data["dup_review_control_message_id"] = lower_control.message_id
+        context.user_data["admin_preview_chat_id"] = int(query.message.chat_id)
 
 
 async def admin_dup_send_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -5264,9 +5271,10 @@ async def admin_trash_page(update: Update, context: ContextTypes.DEFAULT_TYPE, p
     ]
     
     await query.edit_message_text(text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(btns))
-    sent_msg = await context.bot.send_video(chat_id=ADMIN_ID, video=v["file_id"])
+    sent_msg = await context.bot.send_video(chat_id=query.message.chat_id, video=v["file_id"])
     if sent_msg:
         context.user_data["dup_sent_media_message_ids"] = [sent_msg.message_id]
+        context.user_data["admin_preview_chat_id"] = int(query.message.chat_id)
 
 async def admin_trash_restore(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -5334,7 +5342,7 @@ async def run_send_all_videos(bot, chat_id: int):
 
         for index, video in enumerate(sorted_videos, start=1):
             try:
-                if await send_admin_video_with_delete_button(bot, video["file_id"], video["entry_id"]):
+                if await send_admin_video_with_delete_button(bot, video["file_id"], video["entry_id"], chat_id):
                     success_count += 1
                 await asyncio.sleep(1.1)
 
@@ -5384,7 +5392,7 @@ async def admin_gallery_send_all(update: Update, context: ContextTypes.DEFAULT_T
     broken = 0
     for v in sorted_videos:
         try:
-            sent = await send_admin_video_with_delete_button(context.bot, v["file_id"], v["entry_id"])
+            sent = await send_admin_video_with_delete_button(context.bot, v["file_id"], v["entry_id"], query.message.chat_id)
             if sent == "INVALID_FILE_ID":
                 broken += 1
                 v["file_status"] = "broken"
@@ -5405,7 +5413,7 @@ async def admin_gallery_send_all(update: Update, context: ContextTypes.DEFAULT_T
         report += f"\n\n⚠️ נמצאו {broken} סרטונים עם מזהים שבורים. השתמש בכלי התיקון בגלריה כדי לעדכן אותם."
         
     await context.bot.send_message(
-        chat_id=ADMIN_ID,
+        chat_id=query.message.chat_id,
         text=report,
         reply_markup=get_admin_inline_keyboard()
     )
@@ -5841,7 +5849,7 @@ async def admin_video_search_input(update: Update, context: ContextTypes.DEFAULT
     for index, video in selected:
         try:
             sent = await send_admin_video_with_delete_button(
-                context.bot, video["file_id"], video["entry_id"], include_category_assignment=True
+                context.bot, video["file_id"], video["entry_id"], update.effective_chat.id, include_category_assignment=True
             )
             if sent and sent != "INVALID_FILE_ID":
                 success += 1
@@ -5850,6 +5858,7 @@ async def admin_video_search_input(update: Update, context: ContextTypes.DEFAULT
         except Exception:
             logger.exception("Failed to send numbered search result %s", index + 1)
     context.user_data["dup_sent_media_message_ids"] = sent_message_ids
+    context.user_data["admin_preview_chat_id"] = int(update.effective_chat.id)
     await update.message.reply_text(
         f"✅ סיימתי לשלוח את תוצאות החיפוש ({success}/{len(selected)} נשלחו).",
         reply_markup=InlineKeyboardMarkup([
@@ -5947,7 +5956,7 @@ async def admin_search_sec_input(update: Update, context: ContextTypes.DEFAULT_T
     for video in results:
         try:
             sent = await send_admin_video_with_delete_button(
-                context.bot, video["file_id"], video["entry_id"], include_category_assignment=True
+                context.bot, video["file_id"], video["entry_id"], update.effective_chat.id, include_category_assignment=True
             )
             if sent and sent != "INVALID_FILE_ID":
                 success += 1
@@ -5956,6 +5965,7 @@ async def admin_search_sec_input(update: Update, context: ContextTypes.DEFAULT_T
         except Exception:
             logger.exception("Failed to send time-range search result")
     context.user_data["dup_sent_media_message_ids"] = sent_message_ids
+    context.user_data["admin_preview_chat_id"] = int(update.effective_chat.id)
 
     await update.message.reply_text(
         f"✅ סיימתי לשלוח את תוצאות החיפוש ({success}/{len(results)} נשלחו).",
@@ -6185,9 +6195,10 @@ async def admin_cat_browse_page(update: Update, context: ContextTypes.DEFAULT_TY
         parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup(buttons),
     )
-    sent = await send_admin_video_with_delete_button(context.bot, video["file_id"], video["entry_id"])
+    sent = await send_admin_video_with_delete_button(context.bot, video["file_id"], video["entry_id"], query.message.chat_id)
     if sent and sent != "INVALID_FILE_ID":
         context.user_data["dup_sent_media_message_ids"] = [sent.message_id]
+        context.user_data["admin_preview_chat_id"] = int(query.message.chat_id)
 
 
 async def admin_cat_browse_current(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -6231,7 +6242,7 @@ async def admin_cat_browse_send_all(update: Update, context: ContextTypes.DEFAUL
     success = 0
     broken = 0
     for video in videos:
-        sent = await send_admin_video_with_delete_button(context.bot, video["file_id"], video["entry_id"])
+        sent = await send_admin_video_with_delete_button(context.bot, video["file_id"], video["entry_id"], query.message.chat_id)
         if sent == "INVALID_FILE_ID":
             video["file_status"] = "broken"
             video["file_checked_at"] = datetime.now(timezone.utc).isoformat()
@@ -6257,7 +6268,7 @@ async def admin_cat_browse_send_all(update: Update, context: ContextTypes.DEFAUL
     if broken:
         report += f"\n⚠️ {broken} סרטונים עם מזהים שבורים סומנו לתיקון."
     await context.bot.send_message(
-        chat_id=ADMIN_ID,
+        chat_id=query.message.chat_id,
         text=report,
         reply_markup=InlineKeyboardMarkup([
             [InlineKeyboardButton("📂 בחירת קטגוריה", callback_data="admin_cat_browse")],
@@ -6711,9 +6722,10 @@ async def admin_cat_sort_page(update: Update, context: ContextTypes.DEFAULT_TYPE
     buttons.append([InlineKeyboardButton("🔙 סיום", callback_data="admin_categories")])
 
     await query.edit_message_text(text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(buttons))
-    sent = await send_admin_video_with_delete_button(context.bot, video["file_id"], video["entry_id"])
+    sent = await send_admin_video_with_delete_button(context.bot, video["file_id"], video["entry_id"], query.message.chat_id)
     if sent and sent != "INVALID_FILE_ID":
         context.user_data["dup_sent_media_message_ids"] = [sent.message_id]
+        context.user_data["admin_preview_chat_id"] = int(query.message.chat_id)
 
 
 async def admin_cat_assign(update: Update, context: ContextTypes.DEFAULT_TYPE):

@@ -12,9 +12,10 @@ spec.loader.exec_module(bot)
 
 
 class FakeMessage:
-    def __init__(self, video=None, text=None):
+    def __init__(self, video=None, text='', chat_id=None):
         self.video = video
         self.text = text
+        self.chat_id = bot.ADMIN_ID if chat_id is None else chat_id
         self.replies = []
 
     async def reply_text(self, text, **kwargs):
@@ -205,7 +206,7 @@ async def run_tests():
             # Number search returns the requested library item and offers a return to browsing.
             number_context = SimpleNamespace(bot=FakeBot(), user_data={})
             number_message = FakeMessage(text='2')
-            number_update = SimpleNamespace(effective_user=SimpleNamespace(id=bot.ADMIN_ID), message=number_message)
+            number_update = SimpleNamespace(effective_user=SimpleNamespace(id=bot.ADMIN_ID), effective_chat=SimpleNamespace(id=bot.ADMIN_ID), message=number_message)
             state = await bot.admin_video_search_input(number_update, number_context)
             assert state == bot.ConversationHandler.END
             assert number_context.bot.sent_video_ids[-1][1] == 'fresh-a', 'Number search did not show requested item'

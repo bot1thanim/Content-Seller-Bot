@@ -59,6 +59,7 @@ class FakeQuery:
     def __init__(self, data, user_id):
         self.data = data
         self.from_user = SimpleNamespace(id=user_id)
+        self.message = SimpleNamespace(chat_id=user_id)
         self.edits = []
         self.answers = []
     async def answer(self, *args, **kwargs):
@@ -380,6 +381,15 @@ async def run():
         await bot.admin_gallery(FakeUpdate("admin_gallery", owner), preview_context)
         assert len(fake_bot.deleted) == deleted_before_gallery_back + 1
 
+        # A second manager's gallery preview must stay in that manager's own chat.
+        manager_chat_id = 88
+        manager_preview_context = SimpleNamespace(bot=fake_bot, user_data={})
+        manager_gallery_preview = FakeUpdate("vid_page_0", manager_chat_id)
+        await bot.admin_gallery_page(manager_gallery_preview, manager_preview_context, 0)
+        assert fake_bot.sent_videos[-1][0] == manager_chat_id
+        await bot.admin_gallery(FakeUpdate("admin_gallery", manager_chat_id), manager_preview_context)
+        assert fake_bot.deleted[-1][0] == manager_chat_id
+
         # A trash preview follows the same clean-up rule on the Back button.
         write(bot.TRASH_FILE, [{"file_id": "t1", "duration": 12, "entry_id": "trash-a", "deleted_at": "today"}])
         trash_preview = FakeUpdate("admin_trash_page_0", owner)
@@ -435,17 +445,19 @@ async def run():
         write(bot.VIDEOS_FILE, range_videos)
         time_range_bot = FakeBot()
         time_range_message = FakeMessage("10-13")
-        time_range_update = SimpleNamespace(effective_user=SimpleNamespace(id=owner), message=time_range_message)
+        time_range_update = SimpleNamespace(effective_user=SimpleNamespace(id=owner), effective_chat=SimpleNamespace(id=owner), message=time_range_message)
         await bot.admin_search_sec_input(time_range_update, SimpleNamespace(bot=time_range_bot, user_data={}))
         assert [video for _, video, _ in time_range_bot.sent_videos] == ["r10a", "r10b", "r11", "r12", "r13"]
+        assert {chat_id for chat_id, _, _ in time_range_bot.sent_videos} == {owner}
         assert "5 סרטונים" in time_range_message.replies[0][0]
 
         # Number-range results preserve the exact library order between the chosen endpoints.
         number_range_bot = FakeBot()
         number_range_message = FakeMessage("2-4")
-        number_range_update = SimpleNamespace(effective_user=SimpleNamespace(id=owner), message=number_range_message)
+        number_range_update = SimpleNamespace(effective_user=SimpleNamespace(id=owner), effective_chat=SimpleNamespace(id=owner), message=number_range_message)
         await bot.admin_video_search_input(number_range_update, SimpleNamespace(bot=number_range_bot, user_data={}))
         assert [video for _, video, _ in number_range_bot.sent_videos] == ["r10b", "r12", "r10a"]
+        assert {chat_id for chat_id, _, _ in number_range_bot.sent_videos} == {owner}
         assert "3 סרטונים" in number_range_message.replies[0][0]
         write(bot.VIDEOS_FILE, original_videos)
 
