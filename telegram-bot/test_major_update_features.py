@@ -85,6 +85,10 @@ def button_callbacks(markup):
     return [button.callback_data for row in markup.inline_keyboard for button in row]
 
 
+def button_rows(markup):
+    return [[button.callback_data for button in row] for row in markup.inline_keyboard]
+
+
 async def gate_allows(callback_data, user_id):
     update = FakeUpdate(callback_data, user_id)
     try:
@@ -492,11 +496,17 @@ async def run():
         callback_data = [button.callback_data for row in keyboard.inline_keyboard for button in row]
         assert callback_data == ["admin_assistant", "admin_gallery", "admin_ops_dashboard"], callback_data
         # The owner retains the familiar detailed panel with direct day-to-day actions.
-        owner_callbacks = button_callbacks(bot.get_admin_inline_keyboard(owner))
+        owner_keyboard = bot.get_admin_inline_keyboard(owner)
+        owner_callbacks = button_callbacks(owner_keyboard)
         assert {"admin_stats", "admin_gallery", "admin_maintenance", "admin_menu_system"}.issubset(owner_callbacks)
         assert owner_callbacks.count("admin_gallery") == 1
         assert "admin_backup" not in owner_callbacks and "admin_actions_page_0" not in owner_callbacks
         assert "admin_menu_users" not in owner_callbacks
+        assert button_rows(owner_keyboard)[2:5] == [
+            ["admin_stats", "admin_orders_page_0"],
+            ["admin_check", "users_page_0"],
+            ["admin_send", "admin_approve"],
+        ]
         # A manager with only user messaging permission sees only that section's allowed controls.
         settings = bot.load_settings()
         settings["admin_managers"]["12345"]["permissions"] = ["user_messages"]

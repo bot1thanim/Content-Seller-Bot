@@ -1561,12 +1561,30 @@ def get_admin_inline_keyboard(user_id: int = ADMIN_ID):
     if has_admin_permission(user_id, "assistant"):
         rows.append([InlineKeyboardButton("🤖 עוזר פקודות", callback_data="admin_assistant")])
 
-    # Existing day-to-day controls stay visible on the main panel.
+    # Keep the familiar two-column day-to-day layout; partial-permission managers
+    # receive only the buttons they are permitted to use, without empty placeholders.
     add("maintenance", [InlineKeyboardButton(f"📡 סטטוס בוט: {maint_status}", callback_data="admin_maintenance")])
-    add("user_lookup", [InlineKeyboardButton("📊 סטטיסטיקה", callback_data="admin_stats"), InlineKeyboardButton("🔍 בדוק משתמש", callback_data="admin_check"), InlineKeyboardButton("👥 רשימת משתמשים", callback_data="users_page_0")])
-    add("order_view", [InlineKeyboardButton("🧾 הזמנות", callback_data="admin_orders_page_0")])
-    add("direct_message", [InlineKeyboardButton("📩 שלח למשתמש", callback_data="admin_send")])
-    add("payment_approval", [InlineKeyboardButton("✅ אישור תשלום", callback_data="admin_approve")])
+    overview_row = []
+    if has_admin_permission(user_id, "user_lookup"):
+        overview_row.append(InlineKeyboardButton("📊 סטטיסטיקה", callback_data="admin_stats"))
+    if has_admin_permission(user_id, "order_view"):
+        overview_row.append(InlineKeyboardButton("🧾 הזמנות", callback_data="admin_orders_page_0"))
+    if overview_row:
+        rows.append(overview_row)
+
+    if has_admin_permission(user_id, "user_lookup"):
+        rows.append([
+            InlineKeyboardButton("🔍 בדוק משתמש", callback_data="admin_check"),
+            InlineKeyboardButton("👥 רשימת משתמשים", callback_data="users_page_0"),
+        ])
+
+    direct_row = []
+    if has_admin_permission(user_id, "direct_message"):
+        direct_row.append(InlineKeyboardButton("📩 שלח למשתמש", callback_data="admin_send"))
+    if has_admin_permission(user_id, "payment_approval"):
+        direct_row.append(InlineKeyboardButton("✅ אישור תשלום", callback_data="admin_approve"))
+    if direct_row:
+        rows.append(direct_row)
     if has_admin_permission(user_id, "gallery") or has_admin_permission(user_id, "duplicates"):
         rows.append([InlineKeyboardButton("🎬 גלריית סרטונים", callback_data="admin_gallery")])
         rows.append([InlineKeyboardButton("🧹 סיכום וניקוי מאגר", callback_data="admin_ops_dashboard")])
