@@ -56,6 +56,9 @@ class FakeBot:
         self.sent_messages.append((chat_id, text, kwargs))
         return SimpleNamespace(message_id=self.next_message_id)
 
+    async def get_me(self):
+        return SimpleNamespace(username='test_content_bot')
+
     async def delete_message(self, chat_id, message_id):
         self.deleted_ids.append((chat_id, message_id))
         return True
@@ -98,6 +101,21 @@ async def run_tests():
             english_keyboard = bot.get_main_keyboard(100)
             english_labels = [button.text for row in english_keyboard.inline_keyboard for button in row]
             assert '🎁 Daily gift' in english_labels and '🌐 Language' in english_labels
+            settings = bot.load_settings()
+            settings.update({'daily_gift_amount': 3, 'referral_reward_amount': 2})
+            bot.save_settings(settings)
+            assert '3 coins every day' in bot._new_user_guide('en')
+            assert '2 coins for every friend' in bot._new_user_guide('en')
+            assert '3 מטבעות בכל יום' in bot._new_user_guide('he')
+            assert '2 מטבעות על כל חבר' in bot._new_user_guide('he')
+            english_referrals_query = FakeQuery('referrals')
+            english_referrals_query.from_user = SimpleNamespace(id=100, first_name='English')
+            await bot.referrals_menu(SimpleNamespace(callback_query=english_referrals_query, effective_user=english_referrals_query.from_user), SimpleNamespace(bot=FakeBot()))
+            assert 'Earn *2 coins*' in english_referrals_query.edits[-1][0]
+            hebrew_referrals_query = FakeQuery('referrals')
+            hebrew_referrals_query.from_user = SimpleNamespace(id=101, first_name='Hebrew')
+            await bot.referrals_menu(SimpleNamespace(callback_query=hebrew_referrals_query, effective_user=hebrew_referrals_query.from_user), SimpleNamespace(bot=FakeBot()))
+            assert 'תקבל *2 מטבעות*' in hebrew_referrals_query.edits[-1][0]
 
             coin_preview_query = FakeQuery('coin_0')
             coin_preview_query.from_user = SimpleNamespace(id=100, first_name='Buyer')

@@ -1301,24 +1301,33 @@ def _main_welcome(user_id: int | str, first_name: str) -> str:
     )
 
 
-def _new_user_guide(language: str) -> str:
+def _coin_word(amount: int, language: str) -> str:
     if language == "en":
-        return """📖 *Quick guide for new users:*
+        return "coin" if amount == 1 else "coins"
+    return "מטבע" if amount == 1 else "מטבעות"
+
+
+def _new_user_guide(language: str) -> str:
+    settings = load_settings()
+    daily_reward = max(0, int(settings.get("daily_gift_amount", 1) or 0))
+    referral_reward = max(0, int(settings.get("referral_reward_amount", 1) or 0))
+    if language == "en":
+        return f"""📖 *Quick guide for new users:*
 
 💰 *How do I get videos?*
-• Tap '🎁 Daily gift' for a daily bonus.
-• Invite friends through '👥 My referrals' and earn a coin for every friend.
+• Tap '🎁 Daily gift' to receive {daily_reward} {_coin_word(daily_reward, 'en')} every day.
+• Invite friends through '👥 My referrals' and earn {referral_reward} {_coin_word(referral_reward, 'en')} for every friend.
 • Buy packages through '💳 Payment'.
 
 🎬 *How do I receive content?*
 Once you have enough coins, you can purchase videos and they will be sent to you here in the chat.
 
 💬 For any question, use the Support button."""
-    return """📖 *מדריך קצר למשתמש החדש:*
+    return f"""📖 *מדריך קצר למשתמש החדש:*
 
 💰 *איך משיגים סרטונים?*
-• לוחצים על '🎁 מתנה יומית' ומקבלים בונוס כל יום!
-• מזמינים חברים דרך '👥 הפניות שלי' ומקבלים מטבע על כל חבר.
+• לוחצים על '🎁 מתנה יומית' ומקבלים {daily_reward} {_coin_word(daily_reward, 'he')} בכל יום.
+• מזמינים חברים דרך '👥 הפניות שלי' ומקבלים {referral_reward} {_coin_word(referral_reward, 'he')} על כל חבר.
 • קונים חבילות מטבעות דרך '💳 תשלום'.
 
 🎬 *איך צופים בתכנים?*
@@ -1935,10 +1944,11 @@ async def referrals_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     bot_username = (await context.bot.get_me()).username
     ref_link     = f"https://t.me/{bot_username}?start=ref_{uid}"
     english = get_user_language(uid) == "en"
+    referral_reward = max(0, int(load_settings().get("referral_reward_amount", 1) or 0))
     
     await query.edit_message_text(
-        (f"👥 *Referral program*\n\nEarn *1 coin* 🪙 for every friend who joins through your link.\n\n📈 Friends joined: *{data['count']}*\n\n🔗 Your referral link:\n`{ref_link}`"
-         if english else f"👥 *מערכת הפניות*\n\nעל כל חבר שיצטרף דרכך תקבל *1 מטבע* 🪙\n\n📈 חברים שהצטרפו: *{data['count']}*\n\n🔗 קישור ההפניה שלך:\n`{ref_link}`"),
+        (f"👥 *Referral program*\n\nEarn *{referral_reward} {_coin_word(referral_reward, 'en')}* 🪙 for every friend who joins through your link.\n\n📈 Friends joined: *{data['count']}*\n\n🔗 Your referral link:\n`{ref_link}`"
+         if english else f"👥 *מערכת הפניות*\n\nעל כל חבר שיצטרף דרכך תקבל *{referral_reward} {_coin_word(referral_reward, 'he')}* 🪙\n\n📈 חברים שהצטרפו: *{data['count']}*\n\n🔗 קישור ההפניה שלך:\n`{ref_link}`"),
         parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back" if english else "🔙 חזרה", callback_data="back_main")]]),
     )
