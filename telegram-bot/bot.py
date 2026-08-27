@@ -802,7 +802,6 @@ _ACTION_LABELS_HE = {
     "assistant_user_coin_history_viewed": "צפייה בהיסטוריית מטבעות משתמש",
     "assistant_user_message_sent": "שליחת הודעה למשתמש באמצעות העוזר",
     "broadcast_sent": "שליחת הודעה לכל המשתמשים",
-    "broadcast_translation_failed": "תרגום הודעת שידור לאנגלית נכשל",
     "assistant_user_viewed": "צפייה בפרטי משתמש באמצעות העוזר",
     "backup_restored": "שחזור גיבוי",
     "categories_merged": "מיזוג קטגוריות",
@@ -3253,10 +3252,10 @@ async def assistant_confirm_action(update: Update, context: ContextTypes.DEFAULT
         try:
             sent, failed = await _send_broadcast_payload(context, users, text, media)
         except Exception as exc:
-            _assistant_log_tool(context, query.from_user.id, "BROADCAST", "broadcast", "failed", f"תרגום או שליחת השידור נכשלה: {type(exc).__name__}")
-            await query.edit_message_text("❌ ההודעה לא נשלחה. התרגום לאנגלית אינו זמין כרגע במסגרת החינמית או שהשליחה נכשלה.", reply_markup=_assistant_navigation_keyboard())
+            _assistant_log_tool(context, query.from_user.id, "BROADCAST", "broadcast", "failed", f"שליחת השידור נכשלה: {type(exc).__name__}")
+            await query.edit_message_text("❌ ההודעה לא נשלחה בגלל שגיאת שליחה.", reply_markup=_assistant_navigation_keyboard())
             return
-        log_admin_action(query.from_user.id, "assistant_broadcast_sent", {"recipients": len(users), "sent": sent, "failed": failed, "text_length": len(text), "delay_seconds": delay_seconds, "has_media": bool(media), "translated_to_english": any(isinstance(row, dict) and row.get("language") == "en" for row in users.values())}, source="assistant")
+        log_admin_action(query.from_user.id, "assistant_broadcast_sent", {"recipients": len(users), "sent": sent, "failed": failed, "text_length": len(text), "delay_seconds": delay_seconds, "has_media": bool(media)}, source="assistant")
         _assistant_log_tool(context, query.from_user.id, "BROADCAST", "broadcast", "success", "הודעה לכל המשתמשים נשלחה", {"recipients": len(users), "sent": sent, "failed": failed, "delay_seconds": delay_seconds, "has_media": bool(media)})
         await query.edit_message_text(f"✅ השליחה הושלמה. הצליח: {sent}; נכשל: {failed}.", reply_markup=_assistant_navigation_keyboard())
         return
@@ -3444,53 +3443,6 @@ def _assistant_gemini_payload(text: str) -> dict:
             "reply": "🤖 לא התקבלה תשובה ברורה לבקשה. אפשר לנסות שוב או לבחור את הפעולה מהכפתורים.",
         }
     return {"kind": "answer", "canonical_text": None, "reply": content[:4000]}
-
-
-def _assistant_gemini_translate_to_english(text: str) -> str:
-    """Translate administrator-supplied broadcast text with the same Free Tier-only model policy."""
-    if not re.search(r"[\u0590-\u05FF]", str(text or "")):
-        return str(text or "")
-    api_key = os.environ.get("GEMINI_API_KEY", "").strip()
-    if not api_key:
-        raise GeminiFreeTierUnavailable("Translation requires the configured Free Tier Gemini model")
-    model = _assistant_gemini_model(api_key)
-    endpoint = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
-    body = {
-        "systemInstruction": {"parts": [{"text": (
-            "Translate the supplied Telegram broadcast from Hebrew to natural English. "
-            "Return only the translated message. Preserve URLs, line breaks, emoji and deliberate formatting. "
-            "Do not add explanations, titles, Markdown fences, or any text not present in the source."
-        )}]},
-        "contents": [{"role": "user", "parts": [{"text": str(text)[:3500]}]}],
-        "generationConfig": {"temperature": 0.1, "maxOutputTokens": 1200},
-    }
-    request = urllib.request.Request(
-        endpoint,
-        data=json.dumps(body, ensure_ascii=False).encode("utf-8"),
-        headers={"Content-Type": "application/json", "x-goog-api-key": api_key},
-        method="POST",
-    )
-    try:
-        with urllib.request.urlopen(request, timeout=25) as response:
-            raw = json.loads(response.read().decode("utf-8"))
-    except urllib.error.HTTPError as exc:
-        raise RuntimeError(f"Gemini translation HTTP status {exc.code}") from None
-    except (urllib.error.URLError, TimeoutError) as exc:
-        raise RuntimeError(f"Gemini translation network error: {type(exc).__name__}") from None
-    candidates = raw.get("candidates") or []
-    parts = ((candidates[0].get("content") or {}).get("parts") or []) if candidates else []
-    translated = "".join(str(part.get("text", "")) for part in parts if isinstance(part, dict)).strip()
-    if not translated:
-        raise RuntimeError("Gemini returned no broadcast translation")
-    if translated.startswith("```"):
-        translated = re.sub(r"^```(?:\w+)?\s*|\s*```$", "", translated, flags=re.DOTALL).strip()
-    return translated[:3500]
-
-
-async def _broadcast_text_for_language(text: str, language: str) -> str:
-    if language != "en":
-        return text
-    return await asyncio.to_thread(_assistant_gemini_translate_to_english, text)
 
 
 async def _assistant_ai_rewrite(
@@ -6904,27 +6856,13 @@ async def _send_message_payload(bot_client, target_id: int | str, text: str, med
     await bot_client.send_message(chat_id=int(target_id), text=text, reply_markup=markup)
 
 
-async def _broadcast_localized_texts(users: dict, source_text: str) -> dict[str, str]:
-    """Translate once, only when an English-language recipient exists; no paid fallback is permitted."""
-    has_english_recipient = any(
-        isinstance(record, dict) and record.get("language") == "en"
-        for record in users.values()
-    )
-    translations = {"he": source_text}
-    if has_english_recipient:
-        translations["en"] = await _broadcast_text_for_language(source_text, "en")
-    return translations
-
-
 async def _send_broadcast_payload(context: ContextTypes.DEFAULT_TYPE, users: dict, source_text: str, media=None, markup=None, progress=None) -> tuple[int, int]:
-    """Send a broadcast with exactly one safe localized copy per supported user language."""
-    translations = await _broadcast_localized_texts(users, source_text)
+    """Send one identical administrator-supplied broadcast to every registered user."""
     sent = 0
     failed = 0
-    for uid, record in users.items():
-        language = "en" if isinstance(record, dict) and record.get("language") == "en" else "he"
+    for uid in users:
         try:
-            await _send_message_payload(context.bot, uid, translations[language], media, markup)
+            await _send_message_payload(context.bot, uid, source_text, media, markup)
             sent += 1
         except Exception as exc:
             logger.warning("Failed to send broadcast to %s: %s", uid, type(exc).__name__)
@@ -7088,16 +7026,6 @@ async def admin_broadcast_preview_action(update: Update, context: ContextTypes.D
     users = load_json(USERS_FILE)
     if not isinstance(users, dict):
         users = {}
-    try:
-        translations = await _broadcast_localized_texts(users, msg)
-    except Exception as exc:
-        logger.warning("Broadcast translation unavailable: %s", type(exc).__name__)
-        log_admin_action(query.from_user.id, "broadcast_translation_failed", {"error_type": type(exc).__name__}, status="failed")
-        await query.edit_message_text(
-            "❌ לא נשלחה הודעה. יש משתמשים באנגלית, אבל התרגום לאנגלית אינו זמין כרגע במסגרת החינמית. נסה שוב מאוחר יותר.",
-            reply_markup=_broadcast_preview_markup(),
-        )
-        return ADMIN_BROADCAST_PREVIEW
     await query.edit_message_text(f"📤 הבוט שולח את ההודעה ל־{len(users)} משתמשים...", reply_markup=None)
     if delay_min > 0:
         await asyncio.sleep(delay_min * 60)
@@ -7105,10 +7033,9 @@ async def admin_broadcast_preview_action(update: Update, context: ContextTypes.D
     failed = 0
     progress = query.message
 
-    for uid, record in users.items():
-        language = "en" if isinstance(record, dict) and record.get("language") == "en" else "he"
+    for uid in users:
         try:
-            await _send_message_payload(context.bot, uid, translations[language], media, markup)
+            await _send_message_payload(context.bot, uid, msg, media, markup)
             sent += 1
         except Exception as exc:
             logger.warning("Failed to send broadcast to %s: %s", uid, type(exc).__name__)
@@ -7120,7 +7047,7 @@ async def admin_broadcast_preview_action(update: Update, context: ContextTypes.D
                 pass
         await asyncio.sleep(0.05)
 
-    log_admin_action(query.from_user.id, "broadcast_sent", {"recipients": len(users), "sent": sent, "failed": failed, "delay_minutes": delay_min, "translated_to_english": "en" in translations})
+    log_admin_action(query.from_user.id, "broadcast_sent", {"recipients": len(users), "sent": sent, "failed": failed, "delay_minutes": delay_min})
     _clear_broadcast_draft(context)
     await query.message.reply_text(
         f"✅ *שליחה הושלמה!*\n\n✔️ הצליח: *{sent}*\n❌ נכשל: *{failed}*",

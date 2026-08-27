@@ -269,19 +269,11 @@ async def run():
         await bot.assistant_confirm_action(SimpleNamespace(callback_query=direct_confirmation), direct_context)
         assert direct_context.bot.sent_photos[-1][:3] == (77, "photo-1", "תמונה אישית")
         localization_context = SimpleNamespace(bot=FakeBot())
-        old_translate = bot._broadcast_text_for_language
-        async def fake_translate(text, language):
-            assert text == "מבצע חדש" and language == "en"
-            return "New offer"
-        try:
-            bot._broadcast_text_for_language = fake_translate
-            sent, failed = await bot._send_broadcast_payload(
-                localization_context, bot.load_json(bot.USERS_FILE), "מבצע חדש"
-            )
-            assert (sent, failed) == (2, 0)
-            assert {(row[0], row[1]) for row in localization_context.bot.sent_texts} == {(77, "מבצע חדש"), (7706183809, "New offer")}
-        finally:
-            bot._broadcast_text_for_language = old_translate
+        sent, failed = await bot._send_broadcast_payload(
+            localization_context, bot.load_json(bot.USERS_FILE), "מבצע חדש"
+        )
+        assert (sent, failed) == (2, 0)
+        assert {(row[0], row[1]) for row in localization_context.bot.sent_texts} == {(77, "מבצע חדש"), (7706183809, "מבצע חדש")}
         settings = bot.load_settings()
         settings["admin_managers"] = {"88": {"permissions": ["assistant", "users"], "assistant_capabilities": ["users"]}}
         bot.save_settings(settings)
