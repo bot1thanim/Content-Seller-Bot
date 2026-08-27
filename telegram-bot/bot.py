@@ -161,6 +161,9 @@ VIP_LEVELS = [
 ) = range(37)
 ADMIN_VIDEO_COMBINED_SEARCH = 37
 ADMIN_AUDIT_SEARCH = 38
+ADMIN_ASSISTANT_DELIVERY_CONTENT = 39
+ADMIN_ASSISTANT_DELIVERY_DELAY = 40
+ADMIN_ASSISTANT_DELIVERY_CONFIRM = 41
 
 
 # ─── Data helpers ─────────────────────────────────────────────────────────────
@@ -795,8 +798,11 @@ _ACTION_LABELS_HE = {
     "assistant_image_generated": "יצירת תמונה באמצעות העוזר",
     "assistant_maintenance_update": "עדכון מצב תחזוקה באמצעות העוזר",
     "assistant_reward_update": "עדכון תגמולים באמצעות העוזר",
+    "assistant_broadcast_sent": "שליחת הודעה לכל המשתמשים באמצעות העוזר",
     "assistant_user_coin_history_viewed": "צפייה בהיסטוריית מטבעות משתמש",
     "assistant_user_message_sent": "שליחת הודעה למשתמש באמצעות העוזר",
+    "broadcast_sent": "שליחת הודעה לכל המשתמשים",
+    "broadcast_translation_failed": "תרגום הודעת שידור לאנגלית נכשל",
     "assistant_user_viewed": "צפייה בפרטי משתמש באמצעות העוזר",
     "backup_restored": "שחזור גיבוי",
     "categories_merged": "מיזוג קטגוריות",
@@ -1418,7 +1424,7 @@ def _clear_transient_flow_state(context: ContextTypes.DEFAULT_TYPE) -> None:
         "pending_restore", "support_reply_target", "category_rename_old",
         "broadcast_msg", "broadcast_media", "broadcast_markup", "broadcast_delay",
         "broadcast_edit_mode", "repair_list", "repair_index", "repair_scan_summary",
-        "assistant_pending_action",
+        "assistant_pending_action", "assistant_delivery_draft",
     ):
         context.user_data.pop(key, None)
 
@@ -2719,6 +2725,36 @@ def _assistant_action_steps(canonical_text: str | None) -> list[str]:
     return [part.strip() for part in canonical_text.split(";;") if part.strip()][:4]
 
 
+def _assistant_parse_delivery_delay(value: str) -> int | None:
+    """Accept a small, deterministic set of Hebrew/English delivery-time phrases."""
+    text = _assistant_normalize(value)
+    if text in {"0", "עכשיו", "מיד", "מייד", "now", "immediately", "right now"}:
+        return 0
+    if text in {"עוד דקה", "בעוד דקה", "אחרי דקה", "in a minute", "after a minute", "one minute"}:
+        return 60
+    if text in {"עוד שעה", "בעוד שעה", "אחרי שעה", "in an hour", "after an hour", "one hour"}:
+        return 3600
+    match = re.fullmatch(r"(?:עוד|בעוד|אחרי|in|after)?\s*(\d+)\s*(?:דקה|דקות|minute|minutes|min|mins)", text)
+    if match:
+        return int(match.group(1)) * 60
+    match = re.fullmatch(r"(?:עוד|בעוד|אחרי|in|after)?\s*(\d+)\s*(?:שעה|שעות|hour|hours|hr|hrs)", text)
+    if match:
+        return int(match.group(1)) * 3600
+    if re.fullmatch(r"\d+", text):
+        return int(text) * 60
+    return None
+
+
+def _assistant_delivery_delay_label(seconds: int) -> str:
+    if seconds <= 0:
+        return "מיידית ללא המתנה"
+    if seconds % 3600 == 0:
+        count = seconds // 3600
+        return f"בעוד שעה" if count == 1 else f"בעוד {count} שעות"
+    count = seconds // 60
+    return f"בעוד דקה" if count == 1 else f"בעוד {count} דקות"
+
+
 async def assistant_reset_conversation(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Forget only ephemeral assistant context; no bot data, audit data or settings are changed."""
     query = update.callback_query
@@ -3165,6 +3201,55 @@ async def assistant_confirm_action(update: Update, context: ContextTypes.DEFAULT
     if not isinstance(plan, dict) or plan.get("actor_id") != query.from_user.id:
         await query.edit_message_text("❌ אין פעולה תקפה שממתינה לאישור.", reply_markup=_assistant_navigation_keyboard())
         return
+    if plan.get("name") == "assistant_delivery":
+        kind = str(plan.get("kind") or "")
+        required_permission = "broadcast" if kind == "broadcast" else "user_messages"
+        if kind not in {"broadcast", "user"} or not has_assistant_capability(query.from_user.id, required_permission):
+            _assistant_log_tool(context, query.from_user.id, "BROADCAST" if kind == "broadcast" else "SEND_USER_MESSAGE", required_permission, "blocked", "ההרשאה השתנתה לפני האישור")
+            await query.edit_message_text("⛔ הפעולה אינה מורשית.", reply_markup=_assistant_navigation_keyboard())
+            return
+        text = str(plan.get("text") or "").strip()
+        media = plan.get("media")
+        delay_seconds = int(plan.get("delay_seconds") or 0)
+        if (not text and not media) or delay_seconds < 0 or delay_seconds > 24 * 3600:
+            await query.edit_message_text("❌ טיוטת ההודעה אינה תקינה ולכן לא נשלחה.", reply_markup=_assistant_navigation_keyboard())
+            return
+        if kind == "user":
+            target_id = str(plan.get("target_id") or "")
+            if target_id not in load_json(USERS_FILE):
+                _assistant_log_tool(context, query.from_user.id, "SEND_USER_MESSAGE", "user_messages", "failed", "המשתמש אינו קיים בעת האישור", {"target_user_id": target_id})
+                await query.edit_message_text("❌ המשתמש אינו קיים עוד בבוט.", reply_markup=_assistant_navigation_keyboard())
+                return
+            await query.edit_message_text(f"⏰ ההודעה תישלח {_assistant_delivery_delay_label(delay_seconds)}.")
+            if delay_seconds:
+                await asyncio.sleep(delay_seconds)
+            try:
+                await _send_message_payload(context.bot, target_id, text, media)
+            except Exception as exc:
+                _assistant_log_tool(context, query.from_user.id, "SEND_USER_MESSAGE", "user_messages", "failed", f"שליחת ההודעה נכשלה: {type(exc).__name__}", {"target_user_id": target_id})
+                await query.edit_message_text("❌ ההודעה לא נשלחה. לא בוצעה פעולה נוספת.", reply_markup=_assistant_navigation_keyboard())
+                return
+            log_admin_action(query.from_user.id, "assistant_user_message_sent", {"target_id": target_id, "text_length": len(text), "delay_seconds": delay_seconds, "has_media": bool(media)}, source="assistant", target_user_id=target_id)
+            _assistant_log_tool(context, query.from_user.id, "SEND_USER_MESSAGE", "user_messages", "success", "הודעה נשלחה", {"target_user_id": target_id, "text_length": len(text), "delay_seconds": delay_seconds, "has_media": bool(media)})
+            await query.edit_message_text("✅ ההודעה נשלחה למשתמש.", reply_markup=_assistant_navigation_keyboard())
+            return
+        users = load_json(USERS_FILE)
+        if not isinstance(users, dict) or not users:
+            await query.edit_message_text("❌ אין משתמשים רשומים לשליחה.", reply_markup=_assistant_navigation_keyboard())
+            return
+        await query.edit_message_text(f"⏰ ההודעה לכל המשתמשים תישלח {_assistant_delivery_delay_label(delay_seconds)}.")
+        if delay_seconds:
+            await asyncio.sleep(delay_seconds)
+        try:
+            sent, failed = await _send_broadcast_payload(context, users, text, media)
+        except Exception as exc:
+            _assistant_log_tool(context, query.from_user.id, "BROADCAST", "broadcast", "failed", f"תרגום או שליחת השידור נכשלה: {type(exc).__name__}")
+            await query.edit_message_text("❌ ההודעה לא נשלחה. התרגום לאנגלית אינו זמין כרגע במסגרת החינמית או שהשליחה נכשלה.", reply_markup=_assistant_navigation_keyboard())
+            return
+        log_admin_action(query.from_user.id, "assistant_broadcast_sent", {"recipients": len(users), "sent": sent, "failed": failed, "text_length": len(text), "delay_seconds": delay_seconds, "has_media": bool(media), "translated_to_english": any(isinstance(row, dict) and row.get("language") == "en" for row in users.values())}, source="assistant")
+        _assistant_log_tool(context, query.from_user.id, "BROADCAST", "broadcast", "success", "הודעה לכל המשתמשים נשלחה", {"recipients": len(users), "sent": sent, "failed": failed, "delay_seconds": delay_seconds, "has_media": bool(media)})
+        await query.edit_message_text(f"✅ השליחה הושלמה. הצליח: {sent}; נכשל: {failed}.", reply_markup=_assistant_navigation_keyboard())
+        return
     if plan.get("name") == "send_user_message":
         if not has_assistant_capability(query.from_user.id, "user_messages"):
             _assistant_log_tool(context, query.from_user.id, "SEND_USER_MESSAGE", "user_messages", "blocked", "ההרשאה השתנתה לפני האישור")
@@ -3206,9 +3291,20 @@ async def assistant_cancel_action(update: Update, context: ContextTypes.DEFAULT_
     query = update.callback_query
     await query.answer()
     plan = context.user_data.pop("assistant_pending_action", None)
+    context.user_data.pop("assistant_delivery_draft", None)
     if isinstance(plan, dict) and plan.get("actor_id") == query.from_user.id:
         _assistant_log_tool(context, query.from_user.id, str(plan.get("name") or "pending_action").upper(), "confirmation", "cancelled", "הפעולה בוטלה לפני ביצוע")
     await query.edit_message_text("❌ הפעולה בוטלה ולא בוצע שינוי.", reply_markup=_assistant_navigation_keyboard())
+
+
+async def admin_assistant_delivery_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await assistant_confirm_action(update, context)
+    return ConversationHandler.END
+
+
+async def admin_assistant_delivery_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await assistant_cancel_action(update, context)
+    return ConversationHandler.END
 
 
 def _assistant_live_answer(text: str, user_id: int) -> str | None:
@@ -3338,6 +3434,53 @@ def _assistant_gemini_payload(text: str) -> dict:
             "reply": "🤖 לא התקבלה תשובה ברורה לבקשה. אפשר לנסות שוב או לבחור את הפעולה מהכפתורים.",
         }
     return {"kind": "answer", "canonical_text": None, "reply": content[:4000]}
+
+
+def _assistant_gemini_translate_to_english(text: str) -> str:
+    """Translate administrator-supplied broadcast text with the same Free Tier-only model policy."""
+    if not re.search(r"[\u0590-\u05FF]", str(text or "")):
+        return str(text or "")
+    api_key = os.environ.get("GEMINI_API_KEY", "").strip()
+    if not api_key:
+        raise GeminiFreeTierUnavailable("Translation requires the configured Free Tier Gemini model")
+    model = _assistant_gemini_model(api_key)
+    endpoint = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+    body = {
+        "systemInstruction": {"parts": [{"text": (
+            "Translate the supplied Telegram broadcast from Hebrew to natural English. "
+            "Return only the translated message. Preserve URLs, line breaks, emoji and deliberate formatting. "
+            "Do not add explanations, titles, Markdown fences, or any text not present in the source."
+        )}]},
+        "contents": [{"role": "user", "parts": [{"text": str(text)[:3500]}]}],
+        "generationConfig": {"temperature": 0.1, "maxOutputTokens": 1200},
+    }
+    request = urllib.request.Request(
+        endpoint,
+        data=json.dumps(body, ensure_ascii=False).encode("utf-8"),
+        headers={"Content-Type": "application/json", "x-goog-api-key": api_key},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=25) as response:
+            raw = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        raise RuntimeError(f"Gemini translation HTTP status {exc.code}") from None
+    except (urllib.error.URLError, TimeoutError) as exc:
+        raise RuntimeError(f"Gemini translation network error: {type(exc).__name__}") from None
+    candidates = raw.get("candidates") or []
+    parts = ((candidates[0].get("content") or {}).get("parts") or []) if candidates else []
+    translated = "".join(str(part.get("text", "")) for part in parts if isinstance(part, dict)).strip()
+    if not translated:
+        raise RuntimeError("Gemini returned no broadcast translation")
+    if translated.startswith("```"):
+        translated = re.sub(r"^```(?:\w+)?\s*|\s*```$", "", translated, flags=re.DOTALL).strip()
+    return translated[:3500]
+
+
+async def _broadcast_text_for_language(text: str, language: str) -> str:
+    if language != "en":
+        return text
+    return await asyncio.to_thread(_assistant_gemini_translate_to_english, text)
 
 
 async def _assistant_ai_rewrite(
@@ -3569,6 +3712,100 @@ def _assistant_explanation(text: str, user_id: int) -> str | None:
     return None
 
 
+def _assistant_delivery_markup() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("❌ ביטול", callback_data="assistant_cancel_action")],
+        [InlineKeyboardButton("🔙 חזרה לעוזר", callback_data="admin_assistant_back")],
+    ])
+
+
+def _assistant_delivery_confirmation_markup() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ אשר ושלח", callback_data="assistant_confirm_action")],
+        [InlineKeyboardButton("❌ ביטול", callback_data="assistant_cancel_action")],
+    ])
+
+
+def _assistant_message_target_id(text: str) -> str | None:
+    match = re.search(r"(?:משתמש|user)(?:\s+(?:id|איידי|מספר))?\s*(\d{4,})", text, flags=re.IGNORECASE)
+    return match.group(1) if match else None
+
+
+async def _assistant_start_delivery_draft(update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int, kind: str, target_id: str | None = None) -> int:
+    capability = "broadcast" if kind == "broadcast" else "user_messages"
+    if not has_assistant_capability(user_id, capability):
+        await update.message.reply_text("⛔ אין לך הרשאה להשתמש בעוזר לשליחת הודעות זו.", reply_markup=_assistant_navigation_keyboard())
+        return ADMIN_ASSISTANT_COMMAND
+    if kind == "user" and (not target_id or target_id not in load_json(USERS_FILE)):
+        await update.message.reply_text(
+            "❌ מזהה המשתמש אינו תקין או שהמשתמש עדיין לא לחץ /start בבוט. נסה שוב, למשל: `שלח הודעה למשתמש 123456`.",
+            parse_mode="Markdown",
+            reply_markup=_assistant_navigation_keyboard(),
+        )
+        return ADMIN_ASSISTANT_COMMAND
+    context.user_data["assistant_delivery_draft"] = {"kind": kind, "actor_id": user_id, "target_id": target_id}
+    recipient = "לכל המשתמשים" if kind == "broadcast" else f"למשתמש `{target_id}`"
+    await update.message.reply_text(
+        f"📩 מה ההודעה שברצונך לשלוח {recipient}? אפשר לשלוח טקסט, תמונה או סרטון עם כיתוב.",
+        parse_mode="Markdown",
+        reply_markup=_assistant_delivery_markup(),
+    )
+    return ADMIN_ASSISTANT_DELIVERY_CONTENT
+
+
+async def admin_assistant_delivery_content(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    draft = context.user_data.get("assistant_delivery_draft")
+    if not isinstance(draft, dict) or draft.get("actor_id") != update.effective_user.id:
+        await update.message.reply_text("❌ לא נמצאה טיוטת הודעה פעילה. כתוב שוב את בקשת השליחה.", reply_markup=_assistant_navigation_keyboard())
+        return ConversationHandler.END
+    media = None
+    if update.message.photo:
+        media = ("photo", update.message.photo[-1].file_id)
+    elif update.message.video:
+        media = ("video", update.message.video.file_id)
+    text = str(getattr(update.message, "text", "") or getattr(update.message, "caption", "") or "").strip()
+    if not text and not media:
+        await update.message.reply_text("❌ שלח טקסט, תמונה או סרטון עם כיתוב.", reply_markup=_assistant_delivery_markup())
+        return ADMIN_ASSISTANT_DELIVERY_CONTENT
+    draft["text"] = text
+    draft["media"] = media
+    await update.message.reply_text(
+        "⏰ מתי לשלוח את ההודעה? אפשר לכתוב `עכשיו`, `עוד דקה`, `עוד שעה`, מספר דקות כמו `5`, או `2 שעות`.",
+        parse_mode="Markdown",
+        reply_markup=_assistant_delivery_markup(),
+    )
+    return ADMIN_ASSISTANT_DELIVERY_DELAY
+
+
+async def admin_assistant_delivery_delay(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    draft = context.user_data.get("assistant_delivery_draft")
+    if not isinstance(draft, dict) or draft.get("actor_id") != update.effective_user.id:
+        await update.message.reply_text("❌ לא נמצאה טיוטת הודעה פעילה.", reply_markup=_assistant_navigation_keyboard())
+        return ConversationHandler.END
+    delay_seconds = _assistant_parse_delivery_delay(str(getattr(update.message, "text", "") or ""))
+    if delay_seconds is None or delay_seconds > 24 * 3600:
+        await update.message.reply_text(
+            "❌ זמן לא תקין. כתוב עכשיו, עוד דקה, עוד שעה, מספר דקות, או עד 24 שעות.",
+            reply_markup=_assistant_delivery_markup(),
+        )
+        return ADMIN_ASSISTANT_DELIVERY_DELAY
+    draft["delay_seconds"] = delay_seconds
+    context.user_data["assistant_pending_action"] = {"name": "assistant_delivery", **draft}
+    context.user_data.pop("assistant_delivery_draft", None)
+    media_label = "ללא מדיה" if not draft.get("media") else ("תמונה" if draft["media"][0] == "photo" else "סרטון")
+    recipient = "לכל המשתמשים" if draft.get("kind") == "broadcast" else f"למשתמש {draft.get('target_id')}"
+    await update.message.reply_text(
+        "📋 סיכום לפני שליחה\n\n"
+        f"נמען: {recipient}\n"
+        f"תוכן: {str(draft.get('text') or 'ללא טקסט')[:700]}\n"
+        f"מדיה: {media_label}\n"
+        f"זמן: {_assistant_delivery_delay_label(delay_seconds)}\n\n"
+        "ההודעה תישלח רק לאחר לחיצה על אישור.",
+        reply_markup=_assistant_delivery_confirmation_markup(),
+    )
+    return ADMIN_ASSISTANT_DELIVERY_CONFIRM
+
+
 async def admin_assistant_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Deterministically parse safe Hebrew manager commands without an external AI service."""
     user_id = update.effective_user.id
@@ -3605,11 +3842,18 @@ async def admin_assistant_command(update: Update, context: ContextTypes.DEFAULT_
     if has_assistant_capability(user_id, "broadcast") and (
         "הודעה לכולם" in text or "שלח לכולם" in text or "פרסם" in text
     ):
-        await update.message.reply_text(
-            "🤖 פותח הודעה לכל המשתמשים.",
-            reply_markup=_assistant_action_button("📢 הודעה לכולם", "admin_broadcast"),
-        )
-        return ConversationHandler.END
+        return await _assistant_start_delivery_draft(update, context, user_id, "broadcast")
+    if "שלח" in text and "משתמש" in text:
+        target_id = _assistant_message_target_id(text)
+        if target_id:
+            return await _assistant_start_delivery_draft(update, context, user_id, "user", target_id)
+        if has_assistant_capability(user_id, "user_messages"):
+            await update.message.reply_text(
+                "📩 כתוב את הבקשה עם מזהה המשתמש, למשל: `שלח הודעה למשתמש 123456`.",
+                parse_mode="Markdown",
+                reply_markup=_assistant_navigation_keyboard(),
+            )
+            return ADMIN_ASSISTANT_COMMAND
     # Telegram displays this animation briefly while Gemini is preparing an answer.
     # It is sent only for external-AI processing and never changes bot permissions.
     chat_id = getattr(getattr(update, "effective_chat", None), "id", None)
@@ -6638,6 +6882,52 @@ def _broadcast_preview_markup() -> InlineKeyboardMarkup:
     ])
 
 
+async def _send_message_payload(bot_client, target_id: int | str, text: str, media=None, markup=None) -> None:
+    """Deliver only the manager-supplied payload; do not parse its formatting as Telegram Markdown."""
+    if media:
+        media_type, file_id = media
+        if media_type == "photo":
+            await bot_client.send_photo(chat_id=int(target_id), photo=file_id, caption=text, reply_markup=markup)
+            return
+        await bot_client.send_video(chat_id=int(target_id), video=file_id, caption=text, reply_markup=markup)
+        return
+    await bot_client.send_message(chat_id=int(target_id), text=text, reply_markup=markup)
+
+
+async def _broadcast_localized_texts(users: dict, source_text: str) -> dict[str, str]:
+    """Translate once, only when an English-language recipient exists; no paid fallback is permitted."""
+    has_english_recipient = any(
+        isinstance(record, dict) and record.get("language") == "en"
+        for record in users.values()
+    )
+    translations = {"he": source_text}
+    if has_english_recipient:
+        translations["en"] = await _broadcast_text_for_language(source_text, "en")
+    return translations
+
+
+async def _send_broadcast_payload(context: ContextTypes.DEFAULT_TYPE, users: dict, source_text: str, media=None, markup=None, progress=None) -> tuple[int, int]:
+    """Send a broadcast with exactly one safe localized copy per supported user language."""
+    translations = await _broadcast_localized_texts(users, source_text)
+    sent = 0
+    failed = 0
+    for uid, record in users.items():
+        language = "en" if isinstance(record, dict) and record.get("language") == "en" else "he"
+        try:
+            await _send_message_payload(context.bot, uid, translations[language], media, markup)
+            sent += 1
+        except Exception as exc:
+            logger.warning("Failed to send broadcast to %s: %s", uid, type(exc).__name__)
+            failed += 1
+        if progress and (sent + failed) % 20 == 0:
+            try:
+                await progress.edit_text(f"📤 נשלח: {sent + failed}/{len(users)}...")
+            except Exception:
+                pass
+        await asyncio.sleep(0.05)
+    return sent, failed
+
+
 async def _show_broadcast_preview(message, context: ContextTypes.DEFAULT_TYPE):
     text = context.user_data.get("broadcast_msg", "")
     media = context.user_data.get("broadcast_media")
@@ -6786,6 +7076,18 @@ async def admin_broadcast_preview_action(update: Update, context: ContextTypes.D
     markup = context.user_data.get("broadcast_markup")
     delay_min = int(context.user_data.get("broadcast_delay", 0) or 0)
     users = load_json(USERS_FILE)
+    if not isinstance(users, dict):
+        users = {}
+    try:
+        translations = await _broadcast_localized_texts(users, msg)
+    except Exception as exc:
+        logger.warning("Broadcast translation unavailable: %s", type(exc).__name__)
+        log_admin_action(query.from_user.id, "broadcast_translation_failed", {"error_type": type(exc).__name__}, status="failed")
+        await query.edit_message_text(
+            "❌ לא נשלחה הודעה. יש משתמשים באנגלית, אבל התרגום לאנגלית אינו זמין כרגע במסגרת החינמית. נסה שוב מאוחר יותר.",
+            reply_markup=_broadcast_preview_markup(),
+        )
+        return ADMIN_BROADCAST_PREVIEW
     await query.edit_message_text(f"📤 הבוט שולח את ההודעה ל־{len(users)} משתמשים...", reply_markup=None)
     if delay_min > 0:
         await asyncio.sleep(delay_min * 60)
@@ -6793,19 +7095,13 @@ async def admin_broadcast_preview_action(update: Update, context: ContextTypes.D
     failed = 0
     progress = query.message
 
-    for uid in users:
+    for uid, record in users.items():
+        language = "en" if isinstance(record, dict) and record.get("language") == "en" else "he"
         try:
-            if media:
-                m_type, f_id = media
-                if m_type == "photo":
-                    await context.bot.send_photo(chat_id=int(uid), photo=f_id, caption=msg, reply_markup=markup)
-                else:
-                    await context.bot.send_video(chat_id=int(uid), video=f_id, caption=msg, reply_markup=markup)
-            else:
-                await context.bot.send_message(chat_id=int(uid), text=msg, reply_markup=markup)
+            await _send_message_payload(context.bot, uid, translations[language], media, markup)
             sent += 1
-        except Exception as e:
-            logger.warning(f"Failed to send broadcast to {uid}: {e}")
+        except Exception as exc:
+            logger.warning("Failed to send broadcast to %s: %s", uid, type(exc).__name__)
             failed += 1
         if (sent + failed) % 20 == 0:
             try:
@@ -6814,6 +7110,7 @@ async def admin_broadcast_preview_action(update: Update, context: ContextTypes.D
                 pass
         await asyncio.sleep(0.05)
 
+    log_admin_action(query.from_user.id, "broadcast_sent", {"recipients": len(users), "sent": sent, "failed": failed, "delay_minutes": delay_min, "translated_to_english": "en" in translations})
     _clear_broadcast_draft(context)
     await query.message.reply_text(
         f"✅ *שליחה הושלמה!*\n\n✔️ הצליח: *{sent}*\n❌ נכשל: *{failed}*",
@@ -8034,11 +8331,18 @@ def main():
         states={ADMIN_ASSISTANT_COMMAND: [MessageHandler(
             filters.TEXT & ~filters.COMMAND & ~filters.Regex("^🛠 פאנל אדמין$"),
             admin_assistant_command,
-        ), CallbackQueryHandler(assistant_reset_conversation, pattern="^assistant_reset_conversation$")]},
+        ), CallbackQueryHandler(assistant_reset_conversation, pattern="^assistant_reset_conversation$")],
+        ADMIN_ASSISTANT_DELIVERY_CONTENT: [MessageHandler((filters.TEXT & ~filters.COMMAND) | filters.PHOTO | filters.VIDEO, admin_assistant_delivery_content)],
+        ADMIN_ASSISTANT_DELIVERY_DELAY: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_assistant_delivery_delay)],
+        ADMIN_ASSISTANT_DELIVERY_CONFIRM: [
+            CallbackQueryHandler(admin_assistant_delivery_confirm, pattern="^assistant_confirm_action$"),
+            CallbackQueryHandler(admin_assistant_delivery_cancel, pattern="^assistant_cancel_action$"),
+        ]},
         fallbacks=[
             CommandHandler("cancel", cancel),
             CallbackQueryHandler(admin_assistant_back, pattern="^admin_assistant_back$"),
             CallbackQueryHandler(admin_assistant_back, pattern="^back_admin$"),
+            CallbackQueryHandler(admin_assistant_delivery_cancel, pattern="^assistant_cancel_action$"),
             MessageHandler(filters.Regex("^🛠 פאנל אדמין$"), admin_assistant_exit_to_panel),
         ],
         per_message=False,

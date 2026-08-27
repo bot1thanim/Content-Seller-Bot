@@ -25,6 +25,7 @@ class FakeBot:
     def __init__(self):
         self.sent_videos = []
         self.sent_texts = []
+        self.sent_photos = []
         self.deleted = []
         self.chat_actions = []
     async def send_video(self, chat_id, video, reply_markup=None):
@@ -32,6 +33,9 @@ class FakeBot:
         return Msg()
     async def send_message(self, chat_id, text, **kwargs):
         self.sent_texts.append((chat_id, text, kwargs))
+        return Msg()
+    async def send_photo(self, chat_id, photo, caption=None, **kwargs):
+        self.sent_photos.append((chat_id, photo, caption, kwargs))
         return Msg()
     async def delete_message(self, chat_id, message_id):
         self.deleted.append((chat_id, message_id))
@@ -42,6 +46,9 @@ class FakeBot:
 class FakeMessage:
     def __init__(self, text):
         self.text = text
+        self.caption = None
+        self.photo = None
+        self.video = None
         self.replies = []
     async def reply_text(self, text, **kwargs):
         self.replies.append((text, kwargs))
@@ -182,6 +189,11 @@ async def run():
         assert await bot.admin_broadcast_get_delay(invalid_delay_update, broadcast_context) == bot.ADMIN_BROADCAST_DELAY
         assert "מספר לא תקין" in invalid_delay_message.replies[-1][0]
         assert bot.callback_permission("broadcast_confirm_send") == "broadcast"
+        assert bot._assistant_parse_delivery_delay("עכשיו") == 0
+        assert bot._assistant_parse_delivery_delay("עוד דקה") == 60
+        assert bot._assistant_parse_delivery_delay("עוד שעה") == 3600
+        assert bot._assistant_parse_delivery_delay("2 שעות") == 7200
+        assert bot._assistant_parse_delivery_delay("לא זמן") is None
         write(bot.USERS_FILE, {"77": {"first_name": "Dana", "username": "dana_admin", "joined": "today"}})
         write(bot.COINS_FILE, {"77": 42})
         write(bot.REFERRALS_FILE, {"77": {"count": 3}})
@@ -217,6 +229,59 @@ async def run():
         send_confirmation = FakeQuery("assistant_confirm_action", owner)
         await bot.assistant_confirm_action(SimpleNamespace(callback_query=send_confirmation), tool_context)
         assert tool_context.bot.sent_texts[-1][:2] == (77, "hello")
+        write(bot.USERS_FILE, {
+            "77": {"first_name": "Dana", "username": "dana_admin", "joined": "today", "language": "he"},
+            "7706183809": {"first_name": "Owner", "username": "owner", "joined": "today", "language": "en"},
+        })
+        assistant_broadcast_message = FakeMessage("שלח הודעה לכולם")
+        assistant_broadcast_context = SimpleNamespace(user_data={})
+        assistant_broadcast_update = SimpleNamespace(effective_user=SimpleNamespace(id=owner), message=assistant_broadcast_message)
+        assert await bot.admin_assistant_command(assistant_broadcast_update, assistant_broadcast_context) == bot.ADMIN_ASSISTANT_DELIVERY_CONTENT
+        assert "מה ההודעה" in assistant_broadcast_message.replies[-1][0]
+        broadcast_content_message = FakeMessage("מבצע חדש")
+        broadcast_content_update = SimpleNamespace(effective_user=SimpleNamespace(id=owner), message=broadcast_content_message)
+        assert await bot.admin_assistant_delivery_content(broadcast_content_update, assistant_broadcast_context) == bot.ADMIN_ASSISTANT_DELIVERY_DELAY
+        broadcast_delay_message = FakeMessage("עוד דקה")
+        broadcast_delay_update = SimpleNamespace(effective_user=SimpleNamespace(id=owner), message=broadcast_delay_message)
+        assert await bot.admin_assistant_delivery_delay(broadcast_delay_update, assistant_broadcast_context) == bot.ADMIN_ASSISTANT_DELIVERY_CONFIRM
+        assert assistant_broadcast_context.user_data["assistant_pending_action"]["delay_seconds"] == 60
+        direct_content_message = FakeMessage("שלום אישי")
+        direct_context = SimpleNamespace(user_data={})
+        assert await bot._assistant_start_delivery_draft(
+            SimpleNamespace(effective_user=SimpleNamespace(id=owner), message=direct_content_message),
+            direct_context, owner, "user", "77",
+        ) == bot.ADMIN_ASSISTANT_DELIVERY_CONTENT
+        assert "מה ההודעה" in direct_content_message.replies[-1][0]
+        direct_media_message = SimpleNamespace(text=None, caption="תמונה אישית", photo=[SimpleNamespace(file_id="photo-1")], video=None, replies=[])
+        async def direct_media_reply(text, **kwargs):
+            direct_media_message.replies.append((text, kwargs))
+            return Msg()
+        direct_media_message.reply_text = direct_media_reply
+        assert await bot.admin_assistant_delivery_content(
+            SimpleNamespace(effective_user=SimpleNamespace(id=owner), message=direct_media_message), direct_context
+        ) == bot.ADMIN_ASSISTANT_DELIVERY_DELAY
+        direct_delay_message = FakeMessage("עכשיו")
+        assert await bot.admin_assistant_delivery_delay(
+            SimpleNamespace(effective_user=SimpleNamespace(id=owner), message=direct_delay_message), direct_context
+        ) == bot.ADMIN_ASSISTANT_DELIVERY_CONFIRM
+        direct_context.bot = FakeBot()
+        direct_confirmation = FakeQuery("assistant_confirm_action", owner)
+        await bot.assistant_confirm_action(SimpleNamespace(callback_query=direct_confirmation), direct_context)
+        assert direct_context.bot.sent_photos[-1][:3] == (77, "photo-1", "תמונה אישית")
+        localization_context = SimpleNamespace(bot=FakeBot())
+        old_translate = bot._broadcast_text_for_language
+        async def fake_translate(text, language):
+            assert text == "מבצע חדש" and language == "en"
+            return "New offer"
+        try:
+            bot._broadcast_text_for_language = fake_translate
+            sent, failed = await bot._send_broadcast_payload(
+                localization_context, bot.load_json(bot.USERS_FILE), "מבצע חדש"
+            )
+            assert (sent, failed) == (2, 0)
+            assert {(row[0], row[1]) for row in localization_context.bot.sent_texts} == {(77, "מבצע חדש"), (7706183809, "New offer")}
+        finally:
+            bot._broadcast_text_for_language = old_translate
         settings = bot.load_settings()
         settings["admin_managers"] = {"88": {"permissions": ["assistant", "users"], "assistant_capabilities": ["users"]}}
         bot.save_settings(settings)

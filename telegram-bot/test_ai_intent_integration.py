@@ -130,6 +130,21 @@ async def run() -> None:
         assert rewritten == "SET_DAILY_GIFT:4" and reply is None
         malformed = bot._assistant_parse_structured_response("```json\n{not valid}\n```")
         assert malformed is None
+
+        translation_calls = []
+        def fake_translation_urlopen(request, timeout):
+            translation_calls.append(request.full_url)
+            if request.full_url.endswith("/v1beta/models?pageSize=100"):
+                return FakeGeminiResponse({"models": [{"name": "models/gemini-3.7-flash", "supportedGenerationMethods": ["generateContent"]}]})
+            body = json.loads(request.data.decode("utf-8"))
+            assert body["contents"][0]["parts"][0]["text"] == "מבצע חדש"
+            assert "functionDeclarations" not in body
+            return FakeGeminiResponse({"candidates": [{"content": {"parts": [{"text": "New offer"}]}}]})
+
+        bot.urllib.request.urlopen = fake_translation_urlopen
+        bot._ASSISTANT_MODEL_CACHE.clear()
+        assert bot._assistant_gemini_translate_to_english("מבצע חדש") == "New offer"
+        assert translation_calls[-1].endswith("/models/gemini-3.7-flash:generateContent")
         assert bot._assistant_action_steps("SET_REWARDS:3,2;;ADJUST_COINS:5:+1") == ["SET_REWARDS:3,2", "ADJUST_COINS:5:+1"]
         function_payload = bot._assistant_function_call_payload({"name": "set_rewards", "args": {"daily_gift": 3, "referral_reward": 2}})
         assert function_payload == {"kind": "rewrite", "canonical_text": "SET_REWARDS:3,2"}
