@@ -12,6 +12,7 @@ import sys
 import tempfile
 import zipfile
 from pathlib import Path
+from types import SimpleNamespace
 
 ROOT = Path(__file__).resolve().parent
 BOT_PATH = ROOT / "bot.py"
@@ -82,6 +83,29 @@ def main():
         bot.mark_category_sort_reviewed("a" * 32)
         assert [video["entry_id"] for video in bot._category_sort_pending_videos()] == ["b" * 32, "d" * 32, "c" * 32]
 
+        # A paused review records the last item and manager once, so another manager can resume it.
+        bot.save_shared_category_sort_progress(
+            mode="continue",
+            entry_ids=["b" * 32, "d" * 32, "c" * 32],
+            page=1,
+            actor_id=bot.ADMIN_ID,
+        )
+        category_checkpoint = bot.shared_category_sort_progress()
+        assert category_checkpoint["entry_id"] == "d" * 32
+        assert category_checkpoint["page"] == 1
+        assert category_checkpoint["actor_id"] == bot.ADMIN_ID
+        second_manager_context = SimpleNamespace(user_data={})
+        resumed_videos = bot._start_category_sort_session(second_manager_context, "continue")
+        assert [video["entry_id"] for video in resumed_videos] == ["b" * 32, "d" * 32, "c" * 32]
+        assert second_manager_context.user_data["cat_sort_shared_resume_page"] == 1
+
+        bot.save_shared_duplicate_review_progress(
+            group=changed_groups[0], include_reviewed=False, actor_id=bot.ADMIN_ID,
+        )
+        duplicate_checkpoint = bot.shared_duplicate_review_progress()
+        assert duplicate_checkpoint["signature"] == bot.duplicate_group_signature(changed_groups[0])
+        assert duplicate_checkpoint["actor_id"] == bot.ADMIN_ID
+
         settings_before_restore = bot.load_settings()
         review_file_before_restore = bot.load_json(bot.DUPLICATE_REVIEWS_FILE)
         payloads = bot.parse_restore_archive(archive_payloads({
@@ -91,6 +115,8 @@ def main():
         }))
         assert original_signature in payloads["duplicate_reviews.json"]
         assert "a" * 32 in payloads["settings.json"][bot.CATEGORY_SORT_REVIEWED_KEY]
+        assert payloads["settings.json"][bot.CATEGORY_SORT_SHARED_PROGRESS_KEY]["entry_id"] == "d" * 32
+        assert payloads["settings.json"][bot.DUPLICATE_REVIEW_SHARED_PROGRESS_KEY]["signature"] == bot.duplicate_group_signature(changed_groups[0])
 
         # Simulate a clean destination then apply the restored JSON payloads.
         bot.save_json(bot.SETTINGS_FILE, {})
@@ -100,6 +126,8 @@ def main():
             bot.save_json(root / filename, content)
         assert original_signature in bot.reviewed_non_duplicate_signatures()
         assert "a" * 32 in bot.category_sort_reviewed_entry_ids()
+        assert bot.shared_category_sort_progress()["entry_id"] == "d" * 32
+        assert bot.shared_duplicate_review_progress()["actor_id"] == bot.ADMIN_ID
 
         # Search/browse media controls must expose direct category assignment callbacks.
         markup = bot._quick_category_markup("b" * 32)

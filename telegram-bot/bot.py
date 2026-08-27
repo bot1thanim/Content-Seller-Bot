@@ -164,6 +164,7 @@ ADMIN_AUDIT_SEARCH = 38
 ADMIN_ASSISTANT_DELIVERY_CONTENT = 39
 ADMIN_ASSISTANT_DELIVERY_DELAY = 40
 ADMIN_ASSISTANT_DELIVERY_CONFIRM = 41
+ADMIN_NICKNAME = 42
 ADMIN_COUPON_EDIT_MENU = 42
 ADMIN_COUPON_EDIT_VALUE = 43
 ADMIN_COUPON_EDIT_REFERRAL_MODE = 44
@@ -493,6 +494,7 @@ def load_settings() -> dict:
     s.setdefault("referral_reward_amount", 1)
     s.setdefault("maintenance", False)
     s.setdefault("waiting_users", [])
+    s.setdefault("owner_nickname", "")
     order_mode = s.get("category_order_mode", "alphabetical")
     if order_mode not in {"alphabetical", "manual"}:
         order_mode = "alphabetical"
@@ -520,6 +522,53 @@ ADMIN_PERMISSIONS = [
 ]
 PERMISSION_LABELS = dict(ADMIN_PERMISSIONS)
 
+# Existing group permissions remain valid for backwards compatibility. New manager
+# records can instead store the smaller capabilities below and grant only one button.
+PERMISSION_GROUP_DETAILS = {
+    "assistant": [("assistant", "🤖 שימוש בעוזר פקודות")],
+    "gallery": [
+        ("gallery_browse", "🎬 עיון וחיפוש בספרייה"),
+        ("gallery_upload", "📤 העלאת סרטונים"),
+        ("category_manage", "🏷 קטגוריות ומיון"),
+        ("gallery_repair", "🛠 תיקון מזהים שבורים"),
+    ],
+    "duplicates": [
+        ("duplicate_review", "🔎 מציאת כפילויות"),
+        ("recycle_bin", "🗑 סל מיחזור ומחיקה"),
+    ],
+    "users": [
+        ("user_lookup", "👥 בדיקת משתמשים וסטטיסטיקה"),
+        ("order_view", "🧾 צפייה בהזמנות"),
+        ("support_manage", "💬 טיפול בתמיכה"),
+    ],
+    "user_messages": [
+        ("direct_message", "📩 שליחה למשתמש"),
+        ("payment_approval", "✅ אישור תשלום"),
+    ],
+    "broadcast": [("broadcast", "📢 הודעה לכל המשתמשים")],
+    "coins": [
+        ("coin_balances", "🪙 שינוי יתרות מטבעות"),
+        ("reward_settings", "🎁 מתנה יומית ותגמול הפניות"),
+        ("coupon_manage", "🎟 יצירה ועריכה של קופונים"),
+        ("vip_manage", "💎 ניהול דרגות"),
+    ],
+    "maintenance": [("maintenance", "🔧 מצב תחזוקה")],
+    "audit_log": [("audit_log", "📜 יומן פעולות")],
+    "backup": [("backup", "💾 גיבוי ושחזור")],
+    "dangerous_delete": [("dangerous_delete", "🗑 מחיקה לצמיתות ואיפוס")],
+    "media": [("media", "🎨 יצירת תמונות וקבצים עם AI")],
+}
+PERMISSION_DETAIL_TO_GROUP = {
+    detail: group
+    for group, details in PERMISSION_GROUP_DETAILS.items()
+    for detail, _ in details
+}
+PERMISSION_DETAIL_LABELS = {
+    detail: label
+    for details in PERMISSION_GROUP_DETAILS.values()
+    for detail, label in details
+}
+
 # These are a second, finer-grained permission layer for commands executed through the assistant.
 # A manager must hold both the regular permission and the matching assistant capability.
 ASSISTANT_CAPABILITIES = [
@@ -541,6 +590,21 @@ def is_owner(user_id: int) -> bool:
     return int(user_id) == ADMIN_ID
 
 
+def admin_display_name(user_id: int | str) -> str:
+    """Return an owner-managed display nickname without altering access decisions."""
+    try:
+        normalized_id = int(user_id)
+    except (TypeError, ValueError):
+        return "מנהל לא ידוע"
+    settings = load_settings()
+    if is_owner(normalized_id):
+        return str(settings.get("owner_nickname") or "הבעלים").strip() or "הבעלים"
+    record = settings.get("admin_managers", {}).get(str(normalized_id), {})
+    if not isinstance(record, dict):
+        return f"מנהל {normalized_id}"
+    return str(record.get("nickname") or record.get("name") or f"מנהל {normalized_id}").strip() or f"מנהל {normalized_id}"
+
+
 def admin_managers() -> dict:
     settings = load_settings()
     managers = settings.get("admin_managers", {})
@@ -556,11 +620,21 @@ def admin_permissions(user_id: int) -> set[str]:
         return set(PERMISSION_LABELS)
     record = admin_managers().get(str(user_id), {})
     permissions = record.get("permissions", []) if isinstance(record, dict) else []
-    return {permission for permission in permissions if permission in PERMISSION_LABELS}
+    allowed = set(PERMISSION_LABELS) | set(PERMISSION_DETAIL_LABELS)
+    return {permission for permission in permissions if permission in allowed}
 
 
 def has_admin_permission(user_id: int, permission: str) -> bool:
-    return is_owner(user_id) or permission in admin_permissions(user_id)
+    if is_owner(user_id):
+        return True
+    assigned = admin_permissions(user_id)
+    if permission in PERMISSION_DETAIL_TO_GROUP:
+        return permission in assigned or PERMISSION_DETAIL_TO_GROUP[permission] in assigned
+    if permission in PERMISSION_GROUP_DETAILS:
+        return permission in assigned or any(
+            detail in assigned for detail, _ in PERMISSION_GROUP_DETAILS[permission]
+        )
+    return permission in assigned
 
 
 def assistant_capabilities(user_id: int) -> set[str]:
@@ -572,11 +646,11 @@ def assistant_capabilities(user_id: int) -> set[str]:
     return {capability for capability in capabilities if capability in ASSISTANT_CAPABILITY_LABELS}
 
 
-def has_assistant_capability(user_id: int, capability: str) -> bool:
-    """Assistant actions require the assistant switch, normal permission, and capability switch."""
+def has_assistant_capability(user_id: int, capability: str, required_permission: str | None = None) -> bool:
+    """Assistant actions require the assistant switch, matching normal permission, and capability switch."""
     return (
         has_admin_permission(user_id, "assistant")
-        and has_admin_permission(user_id, capability)
+        and has_admin_permission(user_id, required_permission or capability)
         and capability in assistant_capabilities(user_id)
     )
 
@@ -595,21 +669,38 @@ def callback_permission(callback_data: str) -> str | None:
         return "dashboard"
     if callback_data.startswith("admin_problem"):
         return "dashboard"
-    if callback_data.startswith((
-        "vid_", "fav_", "admin_favorites", "admin_categories", "admin_cat_", "cat_", "admin_repair",
-        "admin_video_search", "admin_search_sec", "admin_combined_search",
-    )):
-        return "gallery"
-    if callback_data.startswith(("admin_dup", "dup_", "admin_trash", "trash_", "del_eid_", "del_v_")):
-        return "duplicates"
-    if callback_data.startswith(("admin_stats", "admin_orders", "users_page", "admin_check", "support_reply")):
-        return "users"
-    if callback_data.startswith(("admin_send", "admin_approve")):
-        return "user_messages"
+    if callback_data.startswith(("vid_", "fav_", "admin_favorites", "admin_video_search", "admin_search_sec", "admin_combined_search")):
+        return "gallery_browse"
+    if callback_data.startswith(("admin_categories", "admin_cat_", "cat_")):
+        return "category_manage"
+    if callback_data.startswith("admin_repair"):
+        return "gallery_repair"
+    if callback_data.startswith(("admin_dup", "dup_")):
+        return "duplicate_review"
+    if callback_data.startswith(("admin_trash", "trash_", "del_eid_", "del_v_")):
+        return "recycle_bin"
+    if callback_data.startswith(("admin_stats", "users_page", "admin_check")):
+        return "user_lookup"
+    if callback_data.startswith("admin_orders"):
+        return "order_view"
+    if callback_data.startswith("support_reply"):
+        return "support_manage"
+    if callback_data.startswith("admin_send"):
+        return "direct_message"
+    if callback_data.startswith("admin_approve"):
+        return "payment_approval"
     if callback_data.startswith(("admin_broadcast", "broadcast_")):
         return "broadcast"
-    if callback_data.startswith(("admin_coins", "admin_coupons", "coupon_", "admin_vip", "admin_multiplier", "admin_coin_control", "admin_coin_set_")):
+    if callback_data == "admin_coins_menu":
         return "coins"
+    if callback_data.startswith("admin_coins"):
+        return "coin_balances"
+    if callback_data.startswith(("admin_coin_control", "admin_coin_set_", "admin_multiplier")):
+        return "reward_settings"
+    if callback_data.startswith(("admin_coupons", "coupon_")):
+        return "coupon_manage"
+    if callback_data.startswith("admin_vip") or callback_data.startswith("set_vip_"):
+        return "vip_manage"
     if callback_data.startswith(("admin_maintenance", "maint_")):
         return "maintenance"
     if callback_data.startswith("admin_menu_users") or callback_data.startswith("admin_menu_rewards") or callback_data.startswith("admin_menu_communications"):
@@ -640,11 +731,17 @@ async def admin_callback_gate(update: Update, context: ContextTypes.DEFAULT_TYPE
     if not allowed and permission == "panel":
         allowed = is_admin(query.from_user.id)
     elif not allowed and permission == "gallery_or_duplicates":
-        allowed = is_admin(query.from_user.id) and bool({"gallery", "duplicates"} & admin_permissions(query.from_user.id))
+        allowed = is_admin(query.from_user.id) and (
+            has_admin_permission(query.from_user.id, "gallery") or has_admin_permission(query.from_user.id, "duplicates")
+        )
     elif not allowed and permission == "dashboard":
-        allowed = is_admin(query.from_user.id) and bool({"gallery", "duplicates", "users"} & admin_permissions(query.from_user.id))
+        allowed = is_admin(query.from_user.id) and any(
+            has_admin_permission(query.from_user.id, group) for group in ("gallery", "duplicates", "users")
+        )
     elif not allowed and permission == "system":
-        allowed = is_admin(query.from_user.id) and bool({"audit_log", "backup", "dangerous_delete"} & admin_permissions(query.from_user.id))
+        allowed = is_admin(query.from_user.id) and any(
+            has_admin_permission(query.from_user.id, group) for group in ("audit_log", "backup", "dangerous_delete")
+        )
     elif not allowed and permission:
         allowed = is_admin(query.from_user.id) and has_admin_permission(query.from_user.id, permission)
 
@@ -820,6 +917,8 @@ _ACTION_LABELS_HE = {
     "manager_added": "הוספת מנהל",
     "manager_assistant_capability_changed": "עדכון יכולת עוזר למנהל",
     "manager_permission_changed": "עדכון הרשאת מנהל",
+    "manager_nickname_changed": "עדכון כינוי מנהל",
+    "owner_nickname_changed": "עדכון כינוי בעלים",
     "manager_removed": "הסרת מנהל",
     "manual_backup_created": "יצירת גיבוי ידני",
     "trash_emptied": "ריקון סל המיחזור",
@@ -1021,6 +1120,8 @@ def record_system_alert(kind: str, message: str, *, level: str = "warning", deta
 
 DUPLICATE_REVIEWED_KEY = "reviewed_non_duplicate_groups"
 CATEGORY_SORT_REVIEWED_KEY = "category_sort_reviewed_entry_ids"
+CATEGORY_SORT_SHARED_PROGRESS_KEY = "category_sort_shared_progress"
+DUPLICATE_REVIEW_SHARED_PROGRESS_KEY = "duplicate_review_shared_progress"
 
 
 def duplicate_group_signature(group: list[dict]) -> str:
@@ -1102,6 +1203,66 @@ def clear_not_duplicate_marks() -> int:
     count = len(reviewed_non_duplicate_signatures())
     save_reviewed_non_duplicate_signatures([])
     return count
+
+
+def shared_category_sort_progress() -> dict:
+    """Read a recoverable, non-sensitive shared category-sort checkpoint."""
+    value = load_settings().get(CATEGORY_SORT_SHARED_PROGRESS_KEY, {})
+    return value if isinstance(value, dict) else {}
+
+
+def save_shared_category_sort_progress(*, mode: str, entry_ids: list[str], page: int, actor_id: int) -> None:
+    """Persist the current shared checkpoint without copying video payloads to settings."""
+    safe_ids = [str(entry_id) for entry_id in entry_ids if str(entry_id)]
+    if not safe_ids:
+        clear_shared_category_sort_progress()
+        return
+    page = max(0, min(int(page), len(safe_ids) - 1))
+    settings = load_settings()
+    settings[CATEGORY_SORT_SHARED_PROGRESS_KEY] = {
+        "mode": "rescan" if mode == "rescan" else "continue",
+        "entry_ids": safe_ids,
+        "page": page,
+        "entry_id": safe_ids[page],
+        "actor_id": int(actor_id),
+        "actor_name": admin_display_name(actor_id)[:32],
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
+    save_settings(settings)
+
+
+def clear_shared_category_sort_progress() -> None:
+    settings = load_settings()
+    settings.pop(CATEGORY_SORT_SHARED_PROGRESS_KEY, None)
+    save_settings(settings)
+
+
+def shared_duplicate_review_progress() -> dict:
+    """Read the active duplicate-review checkpoint, if a manager paused one."""
+    value = load_settings().get(DUPLICATE_REVIEW_SHARED_PROGRESS_KEY, {})
+    return value if isinstance(value, dict) else {}
+
+
+def save_shared_duplicate_review_progress(*, group: list[dict], include_reviewed: bool, actor_id: int) -> None:
+    if not group:
+        clear_shared_duplicate_review_progress()
+        return
+    settings = load_settings()
+    settings[DUPLICATE_REVIEW_SHARED_PROGRESS_KEY] = {
+        "signature": duplicate_group_signature(group),
+        "duration": int(group[0].get("duration", 0) or 0),
+        "include_reviewed": bool(include_reviewed),
+        "actor_id": int(actor_id),
+        "actor_name": admin_display_name(actor_id)[:32],
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
+    save_settings(settings)
+
+
+def clear_shared_duplicate_review_progress() -> None:
+    settings = load_settings()
+    settings.pop(DUPLICATE_REVIEW_SHARED_PROGRESS_KEY, None)
+    save_settings(settings)
 
 def is_maintenance() -> bool:
     return load_settings().get("maintenance", False)
@@ -1402,9 +1563,10 @@ def get_admin_inline_keyboard(user_id: int = ADMIN_ID):
 
     # Existing day-to-day controls stay visible on the main panel.
     add("maintenance", [InlineKeyboardButton(f"📡 סטטוס בוט: {maint_status}", callback_data="admin_maintenance")])
-    add("users", [InlineKeyboardButton("📊 סטטיסטיקה", callback_data="admin_stats"), InlineKeyboardButton("🧾 הזמנות", callback_data="admin_orders_page_0")])
-    add("users", [InlineKeyboardButton("🔍 בדוק משתמש", callback_data="admin_check"), InlineKeyboardButton("👥 רשימת משתמשים", callback_data="users_page_0")])
-    add("user_messages", [InlineKeyboardButton("📩 שלח למשתמש", callback_data="admin_send"), InlineKeyboardButton("✅ אישור תשלום", callback_data="admin_approve")])
+    add("user_lookup", [InlineKeyboardButton("📊 סטטיסטיקה", callback_data="admin_stats"), InlineKeyboardButton("🔍 בדוק משתמש", callback_data="admin_check"), InlineKeyboardButton("👥 רשימת משתמשים", callback_data="users_page_0")])
+    add("order_view", [InlineKeyboardButton("🧾 הזמנות", callback_data="admin_orders_page_0")])
+    add("direct_message", [InlineKeyboardButton("📩 שלח למשתמש", callback_data="admin_send")])
+    add("payment_approval", [InlineKeyboardButton("✅ אישור תשלום", callback_data="admin_approve")])
     if has_admin_permission(user_id, "gallery") or has_admin_permission(user_id, "duplicates"):
         rows.append([InlineKeyboardButton("🎬 גלריית סרטונים", callback_data="admin_gallery")])
         rows.append([InlineKeyboardButton("🧹 סיכום וניקוי מאגר", callback_data="admin_ops_dashboard")])
@@ -1439,6 +1601,7 @@ def _clear_transient_flow_state(context: ContextTypes.DEFAULT_TYPE) -> None:
         "broadcast_edit_mode", "repair_list", "repair_index", "repair_scan_summary",
         "assistant_pending_action", "assistant_delivery_draft", "coupon_edit_code",
         "coupon_edit_field", "coupon_edit_referral_mode",
+        "nickname_edit_target", "cat_sort_shared_resume_page",
     ):
         context.user_data.pop(key, None)
 
@@ -1478,14 +1641,20 @@ async def admin_menu_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     user_id = query.from_user.id
     rows = []
+    if has_admin_permission(user_id, "user_lookup"):
+        rows.append([InlineKeyboardButton("📊 סטטיסטיקה", callback_data="admin_stats"), InlineKeyboardButton("🔍 בדוק משתמש", callback_data="admin_check")])
+        rows.append([InlineKeyboardButton("👥 רשימת משתמשים", callback_data="users_page_0")])
+    if has_admin_permission(user_id, "order_view"):
+        rows.append([InlineKeyboardButton("🧾 הזמנות", callback_data="admin_orders_page_0")])
     if has_admin_permission(user_id, "users"):
-        rows.extend([
-            [InlineKeyboardButton("📊 סטטיסטיקה", callback_data="admin_stats"), InlineKeyboardButton("🧾 הזמנות", callback_data="admin_orders_page_0")],
-            [InlineKeyboardButton("🔍 בדוק משתמש", callback_data="admin_check"), InlineKeyboardButton("👥 רשימת משתמשים", callback_data="users_page_0")],
-            [InlineKeyboardButton("📋 סיכום מנהל מהיר", callback_data="admin_ops_dashboard")],
-        ])
-    if has_admin_permission(user_id, "user_messages"):
-        rows.append([InlineKeyboardButton("📩 שלח למשתמש", callback_data="admin_send"), InlineKeyboardButton("✅ אישור תשלום", callback_data="admin_approve")])
+        rows.append([InlineKeyboardButton("📋 סיכום מנהל מהיר", callback_data="admin_ops_dashboard")])
+    direct_rows = []
+    if has_admin_permission(user_id, "direct_message"):
+        direct_rows.append(InlineKeyboardButton("📩 שלח למשתמש", callback_data="admin_send"))
+    if has_admin_permission(user_id, "payment_approval"):
+        direct_rows.append(InlineKeyboardButton("✅ אישור תשלום", callback_data="admin_approve"))
+    if direct_rows:
+        rows.append(direct_rows)
     rows.append(_back_to_admin_row())
     await query.edit_message_text("👥 *משתמשים ומכירות*\n\nבחר פעולה:", parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(rows))
 
@@ -2125,10 +2294,11 @@ async def admin_managers_menu(update: Update, context: ContextTypes.DEFAULT_TYPE
     managers = admin_managers()
     buttons = [
         [InlineKeyboardButton("➕ הוסף מנהל", callback_data="admin_mgr_add")],
+        [InlineKeyboardButton(f"✏️ הכינוי שלי: {admin_display_name(ADMIN_ID)}", callback_data="admin_owner_nickname")],
         [InlineKeyboardButton("🤖 הגדרות עוזר למנהלים", callback_data="admin_mgr_assistant_list")],
     ]
     for manager_id, record in managers.items():
-        label = record.get("name") or f"מנהל {manager_id}"
+        label = record.get("nickname") or record.get("name") or f"מנהל {manager_id}"
         buttons.append([InlineKeyboardButton(f"👤 {label} ({manager_id})", callback_data=f"admin_mgr_pick_{manager_id}")])
     buttons.append([InlineKeyboardButton("🔙 חזרה לפאנל", callback_data="back_admin")])
     await query.edit_message_text(
@@ -2167,6 +2337,7 @@ async def admin_manager_add_input(update: Update, context: ContextTypes.DEFAULT_
     record.setdefault("permissions", [])
     record.setdefault("assistant_capabilities", [])
     record.setdefault("name", "")
+    record.setdefault("nickname", "")
     managers[str(manager_id)] = record
     save_settings(settings)
     context.user_data["selected_manager_id"] = str(manager_id)
@@ -2184,14 +2355,113 @@ def _manager_permissions_keyboard(manager_id: str) -> InlineKeyboardMarkup:
     assigned = set(record.get("permissions", [])) if isinstance(record, dict) else set()
     buttons = []
     for permission, label in ADMIN_PERMISSIONS:
-        mark = "✅" if permission in assigned else "⬜"
-        buttons.append([InlineKeyboardButton(f"{mark} {label}", callback_data=f"admin_mgr_toggle_{permission}")])
+        details = [detail for detail, _ in PERMISSION_GROUP_DETAILS[permission]]
+        active_count = len(details) if permission in assigned else sum(detail in assigned for detail in details)
+        mark = "✅" if active_count == len(details) else "◐" if active_count else "⬜"
+        buttons.append([InlineKeyboardButton(f"{mark} {label}", callback_data=f"admin_mgr_group_{permission}")])
     buttons.extend([
+        [InlineKeyboardButton("✏️ שינוי כינוי", callback_data="admin_mgr_nickname")],
         [InlineKeyboardButton("🤖 הגדרות עוזר", callback_data="admin_mgr_assistant")],
         [InlineKeyboardButton("🗑 הסר מנהל", callback_data="admin_mgr_remove")],
         [InlineKeyboardButton("🔙 חזרה לרשימה", callback_data="admin_managers")],
     ])
     return InlineKeyboardMarkup(buttons)
+
+
+def _manager_permission_group_keyboard(manager_id: str, group: str) -> InlineKeyboardMarkup:
+    """Show one permission group with an explicit all-or-individual selection."""
+    record = admin_managers().get(manager_id, {})
+    assigned = set(record.get("permissions", [])) if isinstance(record, dict) else set()
+    details = PERMISSION_GROUP_DETAILS.get(group, [])
+    all_enabled = group in assigned or all(detail in assigned for detail, _ in details)
+    buttons = [[InlineKeyboardButton(
+        f"{'✅' if all_enabled else '⬜'} כל ההרשאות בקבוצה",
+        callback_data=f"admin_mgr_group_all_{group}",
+    )]]
+    for detail, label in details:
+        enabled = group in assigned or detail in assigned
+        buttons.append([InlineKeyboardButton(
+            f"{'✅' if enabled else '⬜'} {label}",
+            callback_data=f"admin_mgr_detail_{detail}",
+        )])
+    buttons.append([InlineKeyboardButton("🔙 חזרה לכל ההרשאות", callback_data=f"admin_mgr_pick_{manager_id}")])
+    return InlineKeyboardMarkup(buttons)
+
+
+async def admin_manager_permission_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Open one permission group for precise owner-only selection."""
+    query = update.callback_query
+    await query.answer()
+    if not is_owner(query.from_user.id):
+        return
+    group = query.data.removeprefix("admin_mgr_group_")
+    manager_id = context.user_data.get("selected_manager_id")
+    if group not in PERMISSION_GROUP_DETAILS or not manager_id or manager_id not in admin_managers():
+        await query.answer("בחר מנהל והרשאה מחדש.", show_alert=True)
+        return
+    await query.edit_message_text(
+        f"⚙️ *{PERMISSION_LABELS[group]}*\n\nאפשר לסמן את כל הקבוצה, או לבחור רק את הפעולות הרצויות.",
+        parse_mode="Markdown",
+        reply_markup=_manager_permission_group_keyboard(str(manager_id), group),
+    )
+
+
+async def _update_manager_permission_selection(update: Update, context: ContextTypes.DEFAULT_TYPE, group: str, detail: str | None) -> None:
+    """Persist a group or individual permission without widening any other access."""
+    query = update.callback_query
+    manager_id = context.user_data.get("selected_manager_id")
+    if not is_owner(query.from_user.id) or not manager_id or group not in PERMISSION_GROUP_DETAILS:
+        await query.answer("בחר מנהל והרשאה מחדש.", show_alert=True)
+        return
+    settings = load_settings()
+    record = settings.get("admin_managers", {}).get(str(manager_id))
+    if not isinstance(record, dict):
+        await query.answer("המנהל אינו קיים יותר.", show_alert=True)
+        return
+    permissions = set(record.get("permissions", []))
+    details = {item for item, _ in PERMISSION_GROUP_DETAILS[group]}
+    if detail is None:
+        enabled = group in permissions or details.issubset(permissions)
+        permissions.discard(group)
+        if enabled:
+            permissions.difference_update(details)
+        else:
+            permissions.update(details)
+        changed = group
+        enabled_after = not enabled
+    else:
+        permissions.discard(group)
+        if detail in permissions:
+            permissions.remove(detail)
+            enabled_after = False
+        else:
+            permissions.add(detail)
+            enabled_after = True
+        changed = detail
+    record["permissions"] = sorted(permissions)
+    settings["admin_managers"][str(manager_id)] = record
+    save_settings(settings)
+    log_admin_action(query.from_user.id, "manager_permission_changed", {
+        "manager_id": str(manager_id), "permission": changed, "enabled": enabled_after,
+    })
+    await query.edit_message_reply_markup(reply_markup=_manager_permission_group_keyboard(str(manager_id), group))
+
+
+async def admin_manager_permission_group_all_toggle(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    await _update_manager_permission_selection(update, context, query.data.removeprefix("admin_mgr_group_all_"), None)
+
+
+async def admin_manager_permission_detail_toggle(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    detail = query.data.removeprefix("admin_mgr_detail_")
+    group = PERMISSION_DETAIL_TO_GROUP.get(detail)
+    if not group:
+        await query.answer("ההרשאה אינה זמינה.", show_alert=True)
+        return
+    await _update_manager_permission_selection(update, context, group, detail)
 
 
 def _manager_assistant_keyboard(manager_id: str) -> InlineKeyboardMarkup:
@@ -2216,7 +2486,7 @@ async def admin_manager_assistant_list(update: Update, context: ContextTypes.DEF
     )]]
     buttons.extend([
         [InlineKeyboardButton(
-            f"🤖 {record.get('name') or manager_id} ({manager_id})",
+            f"🤖 {record.get('nickname') or record.get('name') or manager_id} ({manager_id})",
             callback_data=f"admin_mgr_assistant_pick_{manager_id}",
         )]
         for manager_id, record in managers.items()
@@ -2280,7 +2550,7 @@ async def admin_manager_assistant_menu(update: Update, context: ContextTypes.DEF
         await admin_managers_menu(update, context)
         return
     record = admin_managers()[manager_id]
-    title = record.get("name") or manager_id
+    title = record.get("nickname") or record.get("name") or manager_id
     await query.edit_message_text(
         f"🤖 *הגדרות עוזר — {title}*\n\n"
         "סמן מה העוזר רשאי לעשות עבור המנהל. פעולה תעבוד רק אם קיימת גם ההרשאה הרגילה המתאימה.",
@@ -2334,7 +2604,7 @@ async def admin_manager_pick(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return
     context.user_data["selected_manager_id"] = manager_id
     record = admin_managers()[manager_id]
-    title = record.get("name") or manager_id
+    title = record.get("nickname") or record.get("name") or manager_id
     await query.edit_message_text(
         f"👤 *מנהל: {title}*\n🆔 `{manager_id}`\n\nסמן או הסר הרשאות. השינויים נשמרים מיד.",
         parse_mode="Markdown", reply_markup=_manager_permissions_keyboard(manager_id),
@@ -2368,6 +2638,67 @@ async def admin_manager_toggle(update: Update, context: ContextTypes.DEFAULT_TYP
     save_settings(settings)
     log_admin_action(query.from_user.id, "manager_permission_changed", {"manager_id": manager_id, "permission": permission, "enabled": permission in permissions})
     await query.edit_message_reply_markup(reply_markup=_manager_permissions_keyboard(manager_id))
+
+
+async def admin_nickname_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Start owner-only nickname editing for the owner or the selected manager."""
+    query = update.callback_query
+    await query.answer()
+    if not is_owner(query.from_user.id):
+        return ConversationHandler.END
+    if query.data == "admin_owner_nickname":
+        context.user_data["nickname_edit_target"] = "owner"
+        current = admin_display_name(ADMIN_ID)
+        label = "שלך"
+    else:
+        manager_id = context.user_data.get("selected_manager_id")
+        if not manager_id or manager_id not in admin_managers():
+            await query.answer("בחר מנהל מחדש.", show_alert=True)
+            await admin_managers_menu(update, context)
+            return ConversationHandler.END
+        context.user_data["nickname_edit_target"] = str(manager_id)
+        current = admin_display_name(manager_id)
+        label = "של המנהל"
+    await query.edit_message_text(
+        f"✏️ *כינוי {label}*\n\nהכינוי הנוכחי: *{current}*\n\nשלח כינוי חדש באורך של עד 32 תווים.",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ ביטול", callback_data="admin_managers")]]),
+    )
+    return ADMIN_NICKNAME
+
+
+async def admin_nickname_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Save a display-only nickname while preserving every permission field unchanged."""
+    if not is_owner(update.effective_user.id):
+        return ConversationHandler.END
+    nickname = str(update.message.text or "").strip()
+    target = context.user_data.get("nickname_edit_target")
+    if not nickname or len(nickname) > 32 or "\n" in nickname:
+        await update.message.reply_text("❌ הכינוי חייב להכיל בין 1 ל־32 תווים בשורה אחת.")
+        return ADMIN_NICKNAME
+    settings = load_settings()
+    if target == "owner":
+        settings["owner_nickname"] = nickname
+        action = "owner_nickname_changed"
+        target_label = "שלך"
+    elif target and isinstance(settings.get("admin_managers", {}).get(str(target)), dict):
+        settings["admin_managers"][str(target)]["nickname"] = nickname
+        action = "manager_nickname_changed"
+        target_label = "של המנהל"
+    else:
+        context.user_data.pop("nickname_edit_target", None)
+        await update.message.reply_text("❌ המנהל אינו קיים יותר. בחר אותו מחדש.")
+        return ConversationHandler.END
+    save_settings(settings)
+    log_admin_action(update.effective_user.id, action, {"target": str(target), "nickname": nickname})
+    context.user_data.pop("nickname_edit_target", None)
+    await update.message.reply_text(
+        f"✅ הכינוי {target_label} עודכן ל־{nickname}.",
+        reply_markup=_manager_permissions_keyboard(str(target)) if target != "owner" else InlineKeyboardMarkup([
+            [InlineKeyboardButton("👑 חזרה לניהול מנהלים", callback_data="admin_managers")],
+        ]),
+    )
+    return ConversationHandler.END
 
 
 async def admin_manager_remove(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2848,8 +3179,8 @@ async def _assistant_apply_reward_command(
                 values = [int(match.group(1)), int(match.group(2))]
     if not values:
         return False
-    if not has_assistant_capability(user_id, "coins"):
-        _assistant_log_tool(context, user_id, canonical_text, "coins", "blocked", "אין הרשאת מטבעות לעוזר")
+    if not has_assistant_capability(user_id, "coins", "reward_settings"):
+        _assistant_log_tool(context, user_id, canonical_text, "reward_settings", "blocked", "אין הרשאת תגמולים לעוזר")
         await update.message.reply_text(
             "⛔ אין לך הרשאה לעדכן מתנות או תגמולי הפניה דרך העוזר.",
             reply_markup=_assistant_navigation_keyboard(),
@@ -2865,7 +3196,7 @@ async def _assistant_apply_reward_command(
     elif reward_kind == "both":
         settings["referral_reward_amount"] = values[1]
     save_settings(settings)
-    _assistant_log_tool(context, user_id, canonical_text, "coins", "success", "תגמולי העתיד עודכנו", {
+    _assistant_log_tool(context, user_id, canonical_text, "reward_settings", "success", "תגמולי העתיד עודכנו", {
         "daily_gift_before": old_daily_gift, "daily_gift_after": settings["daily_gift_amount"],
         "referral_reward_before": old_referral_reward, "referral_reward_after": settings["referral_reward_amount"],
     })
@@ -2936,8 +3267,9 @@ async def _assistant_apply_runtime_command(
     history_match = re.fullmatch(r"GET_USER_COIN_HISTORY:(\d+)", canonical_text)
     orders_match = re.fullmatch(r"GET_USER_ORDERS:(\d+)", canonical_text)
     if user_match or balance_match or history_match or orders_match:
-        if not has_assistant_capability(user_id, "users"):
-            _assistant_log_tool(context, user_id, canonical_text, "users", "blocked", "אין הרשאת משתמשים לעוזר")
+        required_permission = "order_view" if orders_match else "user_lookup"
+        if not has_assistant_capability(user_id, "users", required_permission):
+            _assistant_log_tool(context, user_id, canonical_text, required_permission, "blocked", "אין הרשאה מתאימה לעוזר")
             await update.message.reply_text("⛔ אין לך הרשאה לצפות בפרטי משתמשים דרך העוזר.", reply_markup=_assistant_navigation_keyboard())
             return True
         target_id = (user_match or balance_match or history_match or orders_match).group(1)
@@ -2994,8 +3326,8 @@ async def _assistant_apply_runtime_command(
         return True
 
     if canonical_text == "GET_SYSTEM_STATUS":
-        if not has_assistant_capability(user_id, "users"):
-            _assistant_log_tool(context, user_id, canonical_text, "users", "blocked", "אין הרשאת נתוני מערכת לעוזר")
+        if not has_assistant_capability(user_id, "users", "user_lookup"):
+            _assistant_log_tool(context, user_id, canonical_text, "user_lookup", "blocked", "אין הרשאת נתוני מערכת לעוזר")
             await update.message.reply_text("⛔ אין לך הרשאה לראות נתוני מערכת דרך העוזר.", reply_markup=_assistant_navigation_keyboard())
             return True
         metrics = _dashboard_metrics()
@@ -3024,7 +3356,7 @@ async def _assistant_apply_runtime_command(
 
     coin_match = re.fullmatch(r"ADJUST_COINS:(\d+):([+-]?\d+)", canonical_text)
     if coin_match:
-        if not has_assistant_capability(user_id, "coins"):
+        if not has_assistant_capability(user_id, "coins", "coin_balances"):
             await update.message.reply_text("⛔ אין לך הרשאה לעדכן יתרות מטבעות דרך העוזר.", reply_markup=_assistant_navigation_keyboard())
             return True
         target_id, amount_text = coin_match.groups()
@@ -4722,13 +5054,13 @@ async def admin_actions_page(update: Update, context: ContextTypes.DEFAULT_TYPE)
 async def admin_send_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    if not is_admin(query.from_user.id):
+    if not has_admin_permission(query.from_user.id, "direct_message"):
         return ConversationHandler.END
     await query.edit_message_text("📩 *שליחת הודעה למשתמש*\n\nרשום את ההודעה שברצונך לשלוח:", parse_mode="Markdown", reply_markup=_flow_back_markup())
     return ADMIN_SEND_MSG
 
 async def admin_send_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
+    if not has_admin_permission(update.effective_user.id, "direct_message"):
         return ConversationHandler.END
     msg = update.message.text.strip()
     context.user_data["admin_msg_text"] = msg
@@ -4736,7 +5068,7 @@ async def admin_send_msg(update: Update, context: ContextTypes.DEFAULT_TYPE):
     return ADMIN_SEND_ID
 
 async def admin_send_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
+    if not has_admin_permission(update.effective_user.id, "direct_message"):
         return ConversationHandler.END
     uid   = update.message.text.strip()
     msg   = context.user_data.get("admin_msg_text", "")
@@ -4754,13 +5086,13 @@ async def admin_send_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def admin_approve_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    if not is_admin(query.from_user.id):
+    if not has_admin_permission(query.from_user.id, "payment_approval"):
         return ConversationHandler.END
     await query.edit_message_text("✅ *אישור תשלום ידני*\n\nכמה סרטונים לשלוח למשתמש?", parse_mode="Markdown", reply_markup=_flow_back_markup())
     return ADMIN_APPROVE_COUNT
 
 async def admin_approve_count(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
+    if not has_admin_permission(update.effective_user.id, "payment_approval"):
         return ConversationHandler.END
     try:
         count = int(update.message.text.strip())
@@ -4772,7 +5104,7 @@ async def admin_approve_count(update: Update, context: ContextTypes.DEFAULT_TYPE
     return ADMIN_APPROVE_ID
 
 async def admin_approve_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
+    if not has_admin_permission(update.effective_user.id, "payment_approval"):
         return ConversationHandler.END
     uid   = update.message.text.strip()
     count = context.user_data.get("approve_v_count", 0)
@@ -4822,22 +5154,23 @@ async def admin_gallery(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     keyboard = []
-    if can_manage_gallery:
+    if has_admin_permission(user_id, "gallery_browse"):
         keyboard.extend([
             [InlineKeyboardButton("🎬 עיון בספריה", callback_data="vid_page_0")],
-            [InlineKeyboardButton("🏷 קטגוריות", callback_data="admin_categories")],
             [InlineKeyboardButton("⭐ מועדפים למנהל", callback_data="admin_favorites")],
             [InlineKeyboardButton("📤 שלח את כל הסרטונים", callback_data="vid_send_all")],
-            [InlineKeyboardButton("🛠 תיקון מזהים שבורים", callback_data="admin_repair_start")],
         ])
-    if can_manage_duplicates:
-        keyboard.extend([
-            [
-                InlineKeyboardButton("🔎 מצא כפילויות", callback_data="admin_dup_scan"),
-                InlineKeyboardButton("🔄 מצא כפילויות מחדש", callback_data="admin_dup_rescan"),
-            ],
-            [InlineKeyboardButton("🗑 סל מיחזור", callback_data="admin_trash_page_0")],
+    if has_admin_permission(user_id, "category_manage"):
+        keyboard.append([InlineKeyboardButton("🏷 קטגוריות", callback_data="admin_categories")])
+    if has_admin_permission(user_id, "gallery_repair"):
+        keyboard.append([InlineKeyboardButton("🛠 תיקון מזהים שבורים", callback_data="admin_repair_start")])
+    if has_admin_permission(user_id, "duplicate_review"):
+        keyboard.append([
+            InlineKeyboardButton("🔎 מצא כפילויות", callback_data="admin_dup_scan"),
+            InlineKeyboardButton("🔄 מצא כפילויות מחדש", callback_data="admin_dup_rescan"),
         ])
+    if has_admin_permission(user_id, "recycle_bin"):
+        keyboard.append([InlineKeyboardButton("🗑 סל מיחזור", callback_data="admin_trash_page_0")])
     keyboard.append([InlineKeyboardButton("🔙 חזור לפאנל", callback_data="back_admin")])
 
     text = """🎬 *ניהול גלריה ומדיה*
@@ -4970,8 +5303,10 @@ async def show_duplicate_scan(update: Update, context: ContextTypes.DEFAULT_TYPE
     query = update.callback_query
     duplicate_groups = find_duplicate_groups(include_reviewed=include_reviewed)
     context.user_data["dup_groups"] = duplicate_groups
+    context.user_data["dup_scan_include_reviewed"] = bool(include_reviewed)
 
     if not duplicate_groups:
+        clear_shared_duplicate_review_progress()
         if include_reviewed:
             text = "✅ לא נמצאו סרטונים חשודים ככפולים לפי אורך, גם לאחר סריקה מלאה מחדש."
         else:
@@ -4983,19 +5318,27 @@ async def show_duplicate_scan(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
 
     await clear_sent_duplicate_group_media(context)
-    await admin_dup_page(update, context, 0)
+    shared = shared_duplicate_review_progress()
+    saved_signature = str(shared.get("signature") or "")
+    resume_page = next(
+        (index for index, group in enumerate(duplicate_groups) if duplicate_group_signature(group) == saved_signature),
+        0,
+    ) if bool(shared.get("include_reviewed")) == bool(include_reviewed) else 0
+    await admin_dup_page(update, context, resume_page)
 
 
 async def admin_dup_scan(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    await show_duplicate_scan(update, context, include_reviewed=False)
+    shared = shared_duplicate_review_progress()
+    await show_duplicate_scan(update, context, include_reviewed=bool(shared.get("include_reviewed", False)))
 
 
 async def admin_dup_rescan(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     cleared_count = clear_not_duplicate_marks()
+    clear_shared_duplicate_review_progress()
     await show_duplicate_scan(update, context, include_reviewed=True)
     if cleared_count:
         logger.info(f"Full duplicate rescan cleared {cleared_count} manual non-duplicate marks")
@@ -5024,6 +5367,7 @@ async def admin_dup_mark_not_duplicate(update: Update, context: ContextTypes.DEF
         return
 
     await clear_sent_duplicate_group_media(context)
+    clear_shared_duplicate_review_progress()
     context.user_data.pop("dup_review_control_message_id", None)
     await query.edit_message_text(
         "✅ הקבוצה סומנה כלא כפולה. אין עוד חשדות פתוחים בסריקה זו.",
@@ -5144,6 +5488,12 @@ async def admin_dup_page(update: Update, context: ContextTypes.DEFAULT_TYPE, pag
         return
 
     group = groups[page]
+    previous_progress = shared_duplicate_review_progress()
+    save_shared_duplicate_review_progress(
+        group=group,
+        include_reviewed=bool(context.user_data.get("dup_scan_include_reviewed", False)),
+        actor_id=query.from_user.id,
+    )
     duration = group[0].get("duration", 0)
     if not had_lower_control:
         await query.edit_message_text(
@@ -5157,6 +5507,11 @@ async def admin_dup_page(update: Update, context: ContextTypes.DEFAULT_TYPE, pag
         f"✅ נשלחו אוטומטית {success_count}/{len(group)} סרטונים חשודים. "
         "אפשר למחוק סרטון, לסמן כלא כפול או לעבור לקבוצה הבאה."
     )
+    if (
+        str(previous_progress.get("signature") or "") == duplicate_group_signature(group)
+        and int(previous_progress.get("actor_id", 0) or 0) != int(query.from_user.id)
+    ):
+        status = f"⏸ ממשיך מהקבוצה שבה עצר *{str(previous_progress.get('actor_name') or 'מנהל')}*.\n\n" + status
     if failed_count:
         status += f"\n⚠️ {failed_count} סרטונים לא נשלחו וסומנו לבדיקה."
     lower_control = await context.bot.send_message(
@@ -6015,6 +6370,12 @@ async def admin_categories_menu(update: Update, context: ContextTypes.DEFAULT_TY
     text = "🏷 *קטגוריות — כלי ניהול פרטי*\n\n"
     text += f"סדר נוכחי: *{order_label}*\n\nהקטגוריות הקיימות:\n" + "\n".join(f"• {category}" for category in categories)
     text += "\n\nהקטגוריות אינן מוצגות למשתמשים כרגע. בעתיד, בחירה ב׳רנדומלי׳ תבחר סרטון מתוך קטגוריה זו באופן אקראי."
+    shared_progress = shared_category_sort_progress()
+    if shared_progress.get("entry_ids"):
+        text += (
+            f"\n\n⏸ מיון משותף נעצר בסרטון *{int(shared_progress.get('page', 0)) + 1}* "
+            f"על ידי *{str(shared_progress.get('actor_name') or 'מנהל')}*. אפשר להמשיך מאותו מקום."
+        )
     buttons = [
         [InlineKeyboardButton("📂 עיון ושליחה לפי קטגוריה", callback_data="admin_cat_browse")],
         [InlineKeyboardButton("↕️ סדר קטגוריות", callback_data="admin_cat_order")],
@@ -6635,7 +6996,16 @@ def _category_sort_context_videos(context: ContextTypes.DEFAULT_TYPE) -> list[di
 
 def _start_category_sort_session(context: ContextTypes.DEFAULT_TYPE, mode: str) -> list[dict]:
     """Freeze a deterministic category-sort session so navigation never skips videos."""
-    videos = _category_sort_videos() if mode == "rescan" else _category_sort_pending_videos()
+    shared = shared_category_sort_progress() if mode == "continue" else {}
+    saved_ids = shared.get("entry_ids") if isinstance(shared.get("entry_ids"), list) else []
+    if saved_ids:
+        available = {str(video.get("entry_id", "")): video for video in load_videos_with_entry_ids()}
+        videos = [available[str(entry_id)] for entry_id in saved_ids if str(entry_id) in available]
+        saved_page = int(shared.get("page", 0) or 0)
+        context.user_data["cat_sort_shared_resume_page"] = max(0, min(saved_page, max(0, len(videos) - 1)))
+    else:
+        videos = _category_sort_videos() if mode == "rescan" else _category_sort_pending_videos()
+        context.user_data["cat_sort_shared_resume_page"] = 0
     context.user_data["cat_sort_mode"] = mode
     context.user_data["cat_sort_entry_ids"] = [str(video.get("entry_id", "")) for video in videos]
     return videos
@@ -6654,13 +7024,14 @@ async def admin_cat_sort_continue(update: Update, context: ContextTypes.DEFAULT_
             ]),
         )
         return
-    await admin_cat_sort_page(update, context, 0)
+    await admin_cat_sort_page(update, context, int(context.user_data.pop("cat_sort_shared_resume_page", 0) or 0))
 
 
 async def admin_cat_sort_rescan(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     cleared = clear_category_sort_progress()
+    clear_shared_category_sort_progress()
     _start_category_sort_session(context, "rescan")
     if cleared:
         log_admin_action(query.from_user.id, "category_sort_rescan", {"cleared_progress": cleared})
@@ -6686,6 +7057,13 @@ async def admin_cat_sort_page(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     page = max(0, min(page, len(videos) - 1))
     video = videos[page]
+    previous_progress = shared_category_sort_progress()
+    save_shared_category_sort_progress(
+        mode=context.user_data.get("cat_sort_mode", "continue"),
+        entry_ids=[str(item.get("entry_id", "")) for item in videos],
+        page=page,
+        actor_id=query.from_user.id,
+    )
     await clear_sent_duplicate_group_media(context)
     current_categories = video_categories(video)
     mode = context.user_data.get("cat_sort_mode", "rescan")
@@ -6697,6 +7075,11 @@ async def admin_cat_sort_page(update: Update, context: ContextTypes.DEFAULT_TYPE
         f"📁 קטגוריות נוכחיות: *{', '.join(current_categories)}*\n\n"
         "אפשר לסמן כמה קטגוריות. לחיצה על קטגוריה שומרת את ההתקדמות; אם לא משנים קטגוריה, לחץ על ׳סיים סרטון׳ כדי לשמור את הטיפול בו."
     )
+    if (
+        str(previous_progress.get("entry_id") or "") == str(video.get("entry_id") or "")
+        and int(previous_progress.get("actor_id", 0) or 0) != int(query.from_user.id)
+    ):
+        text += f"\n\n⏸ ממשיך מהמקום שבו עצר *{str(previous_progress.get('actor_name') or 'מנהל')}*."
 
     categories = _admin_categories()
     buttons = []
@@ -6786,6 +7169,7 @@ async def admin_cat_sort_done(update: Update, context: ContextTypes.DEFAULT_TYPE
     await clear_sent_duplicate_group_media(context)
     context.user_data.pop("cat_sort_entry_ids", None)
     context.user_data.pop("cat_sort_mode", None)
+    clear_shared_category_sort_progress()
     await query.edit_message_text(
         "✅ סיימת את המיון הנוכחי. מיון המשך יציג בהמשך רק סרטונים חדשים שלא טופלו.",
         reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 חזרה לקטגוריות", callback_data="admin_categories")]]),
@@ -7085,13 +7469,13 @@ async def admin_broadcast_cancel_and_back(update: Update, context: ContextTypes.
 async def admin_vip_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    if not is_admin(query.from_user.id):
+    if not has_admin_permission(query.from_user.id, "vip_manage"):
         return ConversationHandler.END
     await query.edit_message_text("💎 *ניהול דרגות VIP*\n\nשלח את ה-ID של המשתמש:", parse_mode="Markdown", reply_markup=_flow_back_markup())
     return ADMIN_VIP_ID
 
 async def admin_vip_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
+    if not has_admin_permission(update.effective_user.id, "vip_manage"):
         return ConversationHandler.END
     try:
         uid = str(int(update.message.text.strip()))
@@ -7127,7 +7511,7 @@ async def admin_vip_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def admin_vip_level(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    if not is_admin(query.from_user.id):
+    if not has_admin_permission(query.from_user.id, "vip_manage"):
         return ConversationHandler.END
         
     try:
@@ -7167,13 +7551,22 @@ async def admin_vip_level(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ─── Admin: coins management ──────────────────────────────────────────────────
 
 
-def _coins_menu_markup() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("👤 שינוי יתרה למשתמש", callback_data="admin_coins")],
-        [InlineKeyboardButton("🪙 שליטה במטבעות", callback_data="admin_coin_control")],
-        [InlineKeyboardButton("🎟 ניהול קופונים", callback_data="admin_coupons"), InlineKeyboardButton("💎 ניהול דרגות", callback_data="admin_vip")],
-        [InlineKeyboardButton("🔙 חזרה לפאנל", callback_data="back_admin")],
-    ])
+def _coins_menu_markup(user_id: int) -> InlineKeyboardMarkup:
+    """Show only the precise reward controls assigned to this administrator."""
+    rows = []
+    if has_admin_permission(user_id, "coin_balances"):
+        rows.append([InlineKeyboardButton("👤 שינוי יתרה למשתמש", callback_data="admin_coins")])
+    if has_admin_permission(user_id, "reward_settings"):
+        rows.append([InlineKeyboardButton("🪙 שליטה במטבעות", callback_data="admin_coin_control")])
+    grouped = []
+    if has_admin_permission(user_id, "coupon_manage"):
+        grouped.append(InlineKeyboardButton("🎟 ניהול קופונים", callback_data="admin_coupons"))
+    if has_admin_permission(user_id, "vip_manage"):
+        grouped.append(InlineKeyboardButton("💎 ניהול דרגות", callback_data="admin_vip"))
+    if grouped:
+        rows.append(grouped)
+    rows.append([InlineKeyboardButton("🔙 חזרה לפאנל", callback_data="back_admin")])
+    return InlineKeyboardMarkup(rows)
 
 
 async def admin_coins_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -7189,14 +7582,14 @@ async def admin_coins_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"👥 תגמול הפניה: *{settings['referral_reward_amount']} מטבעות*\n\n"
         "בחר פעולה:",
         parse_mode="Markdown",
-        reply_markup=_coins_menu_markup(),
+        reply_markup=_coins_menu_markup(user_id),
     )
 
 
 async def admin_coins_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    if not has_admin_permission(query.from_user.id, "coins"):
+    if not has_admin_permission(query.from_user.id, "coin_balances"):
         return ConversationHandler.END
     context.user_data.pop("coins_target_id", None)
     await query.edit_message_text(
@@ -7209,7 +7602,7 @@ async def admin_coins_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def admin_coins_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    if not has_admin_permission(user_id, "coins"):
+    if not has_admin_permission(user_id, "coin_balances"):
         return ConversationHandler.END
     try:
         uid = str(int((update.message.text or "").strip()))
@@ -7239,7 +7632,7 @@ async def admin_coins_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def admin_coins_amount(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    if not has_admin_permission(user_id, "coins"):
+    if not has_admin_permission(user_id, "coin_balances"):
         return ConversationHandler.END
     uid = context.user_data.get("coins_target_id")
     users = load_json(USERS_FILE)
@@ -7358,7 +7751,7 @@ def _coupon_edit_markup() -> InlineKeyboardMarkup:
 async def admin_coupons_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query   = update.callback_query
     await query.answer()
-    if not has_admin_permission(query.from_user.id, "coins"):
+    if not has_admin_permission(query.from_user.id, "coupon_manage"):
         return
     coupons = load_json(COUPONS_FILE)
     try:
@@ -7399,7 +7792,7 @@ async def admin_coupons_menu(update: Update, context: ContextTypes.DEFAULT_TYPE)
 async def admin_coupon_delete(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    if not has_admin_permission(query.from_user.id, "coins"):
+    if not has_admin_permission(query.from_user.id, "coupon_manage"):
         return
     code    = query.data.replace("coupon_del_", "")
     coupons = load_json(COUPONS_FILE)
@@ -7412,7 +7805,7 @@ async def admin_coupon_delete(update: Update, context: ContextTypes.DEFAULT_TYPE
 async def admin_coupon_edit_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    if not has_admin_permission(query.from_user.id, "coins"):
+    if not has_admin_permission(query.from_user.id, "coupon_manage"):
         return ConversationHandler.END
     try:
         _, _, _, page_text, index_text = (query.data or "").split("_", 4)
@@ -7445,7 +7838,7 @@ async def _admin_coupon_edit_show(update: Update, context: ContextTypes.DEFAULT_
 async def admin_coupon_edit_field(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    if not has_admin_permission(query.from_user.id, "coins"):
+    if not has_admin_permission(query.from_user.id, "coupon_manage"):
         return ConversationHandler.END
     field = (query.data or "").removeprefix("coupon_edit_field_")
     if field not in {"coins", "expires", "max_uses", "referrals"} or not context.user_data.get("coupon_edit_code"):
@@ -7485,7 +7878,7 @@ async def _admin_coupon_edit_save_field(update: Update, context: ContextTypes.DE
 
 
 async def admin_coupon_edit_value(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not has_admin_permission(update.effective_user.id, "coins"):
+    if not has_admin_permission(update.effective_user.id, "coupon_manage"):
         return ConversationHandler.END
     field = context.user_data.get("coupon_edit_field")
     raw = (update.message.text or "").strip()
@@ -7528,7 +7921,7 @@ async def admin_coupon_edit_value(update: Update, context: ContextTypes.DEFAULT_
 
 
 async def admin_coupon_edit_referral_mode(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not has_admin_permission(update.effective_user.id, "coins"):
+    if not has_admin_permission(update.effective_user.id, "coupon_manage"):
         return ConversationHandler.END
     aliases = {
         "skip": "none", "none": "none", "0": "none", "ללא": "none",
@@ -7561,7 +7954,7 @@ async def admin_coupon_edit_referral_mode(update: Update, context: ContextTypes.
 
 
 async def admin_coupon_edit_referral_minimum(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not has_admin_permission(update.effective_user.id, "coins"):
+    if not has_admin_permission(update.effective_user.id, "coupon_manage"):
         return ConversationHandler.END
     try:
         minimum = int((update.message.text or "").strip())
@@ -7596,13 +7989,13 @@ async def admin_coupon_edit_back(update: Update, context: ContextTypes.DEFAULT_T
 async def admin_coupon_new_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    if not is_admin(query.from_user.id):
+    if not has_admin_permission(query.from_user.id, "coupon_manage"):
         return ConversationHandler.END
     await query.edit_message_text("🎟 *קופון חדש*\n\nשלח את *קוד הקופון* (אותיות/מספרים):", parse_mode="Markdown", reply_markup=_flow_back_markup())
     return ADMIN_COUPON_CODE
 
 async def admin_coupon_get_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
+    if not has_admin_permission(update.effective_user.id, "coupon_manage"):
         return ConversationHandler.END
     code = update.message.text.strip().upper()
     if not code.replace("_", "").replace("-", "").isalnum():
@@ -7617,7 +8010,7 @@ async def admin_coupon_get_code(update: Update, context: ContextTypes.DEFAULT_TY
     return ADMIN_COUPON_COINS
 
 async def admin_coupon_get_coins(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
+    if not has_admin_permission(update.effective_user.id, "coupon_manage"):
         return ConversationHandler.END
     try:
         val = int(update.message.text.strip())
@@ -7631,7 +8024,7 @@ async def admin_coupon_get_coins(update: Update, context: ContextTypes.DEFAULT_T
     return ADMIN_COUPON_EXPIRY
 
 async def admin_coupon_get_expiry(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
+    if not has_admin_permission(update.effective_user.id, "coupon_manage"):
         return ConversationHandler.END
     raw = update.message.text.strip()
     if raw.lower() == "skip":
@@ -7647,7 +8040,7 @@ async def admin_coupon_get_expiry(update: Update, context: ContextTypes.DEFAULT_
     return ADMIN_COUPON_LIMIT
 
 async def admin_coupon_get_limit(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
+    if not has_admin_permission(update.effective_user.id, "coupon_manage"):
         return ConversationHandler.END
     raw      = update.message.text.strip()
     max_uses = None
@@ -7670,7 +8063,7 @@ async def admin_coupon_get_limit(update: Update, context: ContextTypes.DEFAULT_T
 
 
 async def admin_coupon_get_referral_mode(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
+    if not has_admin_permission(update.effective_user.id, "coupon_manage"):
         return ConversationHandler.END
     raw = (update.message.text or "").strip().casefold()
     aliases = {
@@ -7695,7 +8088,7 @@ async def admin_coupon_get_referral_mode(update: Update, context: ContextTypes.D
 
 
 async def admin_coupon_get_referral_minimum(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not is_admin(update.effective_user.id):
+    if not has_admin_permission(update.effective_user.id, "coupon_manage"):
         return ConversationHandler.END
     try:
         minimum = int((update.message.text or "").strip())
@@ -7709,6 +8102,8 @@ async def admin_coupon_get_referral_minimum(update: Update, context: ContextType
 
 
 async def admin_coupon_save(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not has_admin_permission(update.effective_user.id, "coupon_manage"):
+        return ConversationHandler.END
     code = context.user_data.get("new_coupon_code")
     coins_val = context.user_data.get("new_coupon_coins")
     if not code or not isinstance(coins_val, int):
@@ -7751,7 +8146,7 @@ async def admin_coin_control_menu(update: Update, context: ContextTypes.DEFAULT_
     query = update.callback_query
     await query.answer()
     user_id = query.from_user.id
-    if not has_admin_permission(user_id, "coins"):
+    if not has_admin_permission(user_id, "reward_settings"):
         return ConversationHandler.END
     settings = load_settings()
     daily = max(0, int(settings.get("daily_gift_amount", 1)))
@@ -7771,7 +8166,7 @@ async def admin_coin_control_start(update: Update, context: ContextTypes.DEFAULT
     query = update.callback_query
     await query.answer()
     user_id = query.from_user.id
-    if not has_admin_permission(user_id, "coins"):
+    if not has_admin_permission(user_id, "reward_settings"):
         return ConversationHandler.END
     target = query.data.removeprefix("admin_coin_set_")
     if target not in {"daily", "referral", "both"}:
@@ -7793,7 +8188,7 @@ async def admin_coin_control_start(update: Update, context: ContextTypes.DEFAULT
 
 async def admin_coin_control_apply(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    if not has_admin_permission(user_id, "coins"):
+    if not has_admin_permission(user_id, "reward_settings"):
         return ConversationHandler.END
     target = context.user_data.pop("coin_control_target", "")
     parts = re.findall(r"\d+", update.message.text or "")
@@ -8532,6 +8927,16 @@ def main():
         fallbacks=[CommandHandler("cancel", cancel), CallbackQueryHandler(admin_managers_menu, pattern="^admin_managers$"), CallbackQueryHandler(back_admin, pattern="^back_admin$")],
         per_message=False, per_chat=True,
     )
+    nickname_conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(admin_nickname_start, pattern=r"^admin_(?:owner|mgr)_nickname$")],
+        states={ADMIN_NICKNAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_nickname_input)]},
+        fallbacks=[
+            CommandHandler("cancel", cancel),
+            CallbackQueryHandler(admin_managers_menu, pattern="^admin_managers$"),
+            CallbackQueryHandler(back_admin, pattern="^back_admin$"),
+        ],
+        per_message=False, per_chat=True,
+    )
     assistant_conv = ConversationHandler(
         entry_points=[CallbackQueryHandler(admin_assistant_start, pattern="^admin_assistant$")],
         states={ADMIN_ASSISTANT_COMMAND: [MessageHandler(
@@ -8589,7 +8994,7 @@ def main():
         check_conv, send_conv, approve_conv, broadcast_conv, coins_conv, vip_conv,
         coupon_new_conv, coupon_edit_conv, coin_control_conv, restore_conv, global_reset_conv,
         video_search_conv, video_search_sec_conv, video_combined_search_conv, repair_conv, support_conv, coupon_redeem_conv, support_reply_conv,
-        cat_add_conv, cat_rename_conv, manager_add_conv, assistant_conv, audit_search_conv, video_upload_conv
+        cat_add_conv, cat_rename_conv, manager_add_conv, nickname_conv, assistant_conv, audit_search_conv, video_upload_conv
     ]:
         app.add_handler(conv)
 
@@ -8625,6 +9030,9 @@ def main():
         ("^admin_menu_system$",         admin_menu_system),
         ("^admin_managers$",            admin_managers_menu),
         ("^admin_owner_assistant_settings$", admin_owner_assistant_settings),
+        (r"^admin_mgr_group_all_.+$",     admin_manager_permission_group_all_toggle),
+        (r"^admin_mgr_detail_.+$",        admin_manager_permission_detail_toggle),
+        (r"^admin_mgr_group_.+$",         admin_manager_permission_group),
         (r"^admin_mgr_assistant_pick_\d+$", admin_manager_assistant_pick),
         ("^admin_mgr_assistant_list$",    admin_manager_assistant_list),
         (r"^admin_mgr_pick_\d+$",        admin_manager_pick),

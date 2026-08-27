@@ -32,7 +32,7 @@ class FakeUpdate:
 async def run():
     saved = {}
     settings = {"daily_gift_amount": 1, "referral_reward_amount": 1}
-    bot.has_admin_permission = lambda user_id, permission: permission == "coins"
+    bot.has_admin_permission = lambda user_id, permission: permission in {"coins", "reward_settings", "coin_balances"}
     bot.load_settings = lambda: dict(settings)
     def save_settings(value):
         settings.clear()

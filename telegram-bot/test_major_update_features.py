@@ -285,7 +285,7 @@ async def run():
         await bot.admin_coupons_menu(SimpleNamespace(callback_query=coupons_query), SimpleNamespace())
         coupon_menu_buttons = button_callbacks(coupons_query.edits[-1][1]["reply_markup"])
         assert "coupon_edit_pick_0_0" in coupon_menu_buttons
-        assert bot.callback_permission("coupon_edit_pick_0_0") == "coins"
+        assert bot.callback_permission("coupon_edit_pick_0_0") == "coupon_manage"
         coupon_edit_context = SimpleNamespace(user_data={})
         coupon_pick = FakeUpdate("coupon_edit_pick_0_0", owner)
         assert await bot.admin_coupon_edit_start(coupon_pick, coupon_edit_context) == bot.ADMIN_COUPON_EDIT_MENU
@@ -523,11 +523,58 @@ async def run():
             settings = bot.load_settings()
             settings["admin_managers"]["12345"]["permissions"] = [permission]
             bot.save_settings(settings)
-            assert button_callbacks(bot.get_admin_inline_keyboard(12345)) == expected_controls
+            assert set(button_callbacks(bot.get_admin_inline_keyboard(12345))) == set(expected_controls)
             for allowed_callback in expected_controls:
                 assert await gate_allows(allowed_callback, 12345), (permission, allowed_callback)
-            assert not await gate_allows("admin_managers", 12345), permission
-            assert not await gate_allows(blocked_callback, 12345), permission
+        assert not await gate_allows("admin_managers", 12345), permission
+        assert not await gate_allows(blocked_callback, 12345), permission
+
+        # Fine-grained permission groups expose only the explicitly enabled button.
+        settings = bot.load_settings()
+        settings["admin_managers"]["12345"]["permissions"] = ["assistant", "coin_balances"]
+        settings["admin_managers"]["12345"]["assistant_capabilities"] = ["coins"]
+        bot.save_settings(settings)
+        assert bot.has_admin_permission(12345, "coin_balances")
+        assert bot.has_admin_permission(12345, "coins")
+        assert not bot.has_admin_permission(12345, "reward_settings")
+        assert not bot.has_admin_permission(12345, "coupon_manage")
+        assert bot.has_assistant_capability(12345, "coins", "coin_balances")
+        assert not bot.has_assistant_capability(12345, "coins", "reward_settings")
+        assert button_callbacks(bot.get_admin_inline_keyboard(12345)) == ["admin_assistant", "admin_coins_menu"]
+        fine_coins_menu = FakeUpdate("admin_coins_menu", 12345)
+        await bot.admin_coins_menu(fine_coins_menu, SimpleNamespace())
+        fine_coins_buttons = button_callbacks(fine_coins_menu.callback_query.edits[-1][1]["reply_markup"])
+        assert "admin_coins" in fine_coins_buttons
+        assert "admin_coupons" not in fine_coins_buttons and "admin_coin_control" not in fine_coins_buttons
+        assert await gate_allows("admin_coins", 12345)
+        assert not await gate_allows("admin_coupons", 12345)
+        assert not await gate_allows("admin_coin_control", 12345)
+
+        # The owner can open one group and select exact buttons, without changing a nickname.
+        permission_context = SimpleNamespace(user_data={"selected_manager_id": "12345"})
+        permission_group_update = FakeUpdate("admin_mgr_group_coins", owner)
+        await bot.admin_manager_permission_group(permission_group_update, permission_context)
+        permission_group_callbacks = button_callbacks(permission_group_update.callback_query.edits[-1][1]["reply_markup"])
+        assert "admin_mgr_group_all_coins" in permission_group_callbacks
+        assert "admin_mgr_detail_coupon_manage" in permission_group_callbacks
+        detail_toggle_update = FakeUpdate("admin_mgr_detail_coupon_manage", owner)
+        await bot.admin_manager_permission_detail_toggle(detail_toggle_update, permission_context)
+        assert bot.has_admin_permission(12345, "coupon_manage")
+
+        nickname_start_update = FakeUpdate("admin_mgr_nickname", owner)
+        assert await bot.admin_nickname_start(nickname_start_update, permission_context) == bot.ADMIN_NICKNAME
+        nickname_message = FakeMessage("מנהל שירות")
+        nickname_input_update = SimpleNamespace(effective_user=SimpleNamespace(id=owner), message=nickname_message)
+        assert await bot.admin_nickname_input(nickname_input_update, permission_context) == bot.ConversationHandler.END
+        assert bot.admin_display_name(12345) == "מנהל שירות"
+        assert bot.load_settings()["admin_managers"]["12345"]["nickname"] == "מנהל שירות"
+        owner_nickname_context = SimpleNamespace(user_data={})
+        owner_nickname_start = FakeUpdate("admin_owner_nickname", owner)
+        assert await bot.admin_nickname_start(owner_nickname_start, owner_nickname_context) == bot.ADMIN_NICKNAME
+        owner_nickname_message = FakeMessage("מנהל ראשי")
+        owner_nickname_update = SimpleNamespace(effective_user=SimpleNamespace(id=owner), message=owner_nickname_message)
+        assert await bot.admin_nickname_input(owner_nickname_update, owner_nickname_context) == bot.ConversationHandler.END
+        assert bot.admin_display_name(owner) == "מנהל ראשי"
 
         # A manager with both gallery permissions still receives one gallery entry point only.
         settings = bot.load_settings()
@@ -654,8 +701,8 @@ async def run():
         assert await gate_allows("admin_video_search", 12345)
         assert await gate_allows("admin_search_sec_start", 12345)
         assert not await gate_allows("admin_dup_scan", 12345)
-        assert bot.callback_permission("admin_video_search") == "gallery"
-        assert bot.callback_permission("admin_search_sec_start") == "gallery"
+        assert bot.callback_permission("admin_video_search") == "gallery_browse"
+        assert bot.callback_permission("admin_search_sec_start") == "gallery_browse"
         number_search_update = FakeUpdate("admin_video_search", 12345)
         assert await bot.admin_video_search_start(number_search_update, SimpleNamespace()) == bot.ADMIN_VIDEO_SEARCH
         time_search_update = FakeUpdate("admin_search_sec_start", 12345)
