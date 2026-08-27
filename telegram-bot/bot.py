@@ -4745,7 +4745,7 @@ def _owner_daily_report() -> str:
     orders = load_json(ORDERS_FILE)
     videos = load_videos_with_entry_ids()
     coins = load_json(COINS_FILE)
-    now = datetime.now(timezone(timedelta(hours=3)))
+    now = datetime.now(ISRAEL_TZ)
     today = now.date().isoformat()
     inventory = _admin_inventory_summary()
     new_users = sum(1 for user in users.values() if user.get("joined") == today)
@@ -4823,7 +4823,7 @@ async def daily_owner_report_loop(bot_instance) -> None:
             settings = load_settings()
             hour = int(settings.get("daily_report_hour", 20) or 20)
             hour = max(0, min(hour, 23))
-            now = datetime.now(timezone(timedelta(hours=3)))
+            now = datetime.now(ISRAEL_TZ)
             report_date = now.date().isoformat()
             if now.hour == hour and settings.get("last_daily_report_date") != report_date:
                 await send_owner_daily_report_with_backup(bot_instance)
