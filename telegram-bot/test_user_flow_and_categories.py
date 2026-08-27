@@ -27,6 +27,7 @@ class FakeQuery:
         self.data = data
         self.from_user = SimpleNamespace(id=bot.ADMIN_ID, first_name='Admin')
         self.edits = []
+        self.markup_edits = []
         self.answers = []
         self.message = FakeMessage()
 
@@ -35,6 +36,9 @@ class FakeQuery:
 
     async def edit_message_text(self, text, **kwargs):
         self.edits.append((text, kwargs))
+
+    async def edit_message_reply_markup(self, reply_markup=None, **kwargs):
+        self.markup_edits.append((reply_markup, kwargs))
 
     async def delete_message(self):
         self.deleted = True
@@ -241,7 +245,7 @@ async def run_tests():
             assert sent_category_ids[-2:] == ['israeli-b', 'fresh-a'], 'Send-all category flow must send exactly all matching videos in duration order'
             assert category_context.bot.sent_messages and 'ישראלי' in category_context.bot.sent_messages[-1][1], 'Category send-all summary is missing'
 
-            # Category sorting starts with the shortest video, marks its category, and deletes it before moving on.
+            # Category sorting starts with the shortest video. Choosing a category updates only its keyboard.
             sort_query = FakeQuery('cat_sort_page_0')
             sort_context = SimpleNamespace(bot=FakeBot(), user_data={})
             await bot.admin_cat_sort_page(SimpleNamespace(callback_query=sort_query), sort_context, 0)
@@ -250,6 +254,19 @@ async def run_tests():
             assert any(label.startswith('✅ ') for label in sort_labels), 'Current category must be visibly marked'
             assert '10 שניות' in sort_query.edits[-1][0], 'Category sorting must start from the shortest video'
             assert len(sort_context.bot.sent_video_ids) == 1, 'Sorting must send exactly one current video'
+            choose_category = next(
+                button.callback_data
+                for row in sort_markup.inline_keyboard
+                for button in row
+                if button.callback_data.startswith('cat_assign_0_') and not button.text.startswith('✅ ')
+            )
+            assign_query = FakeQuery(choose_category)
+            assign_query.message = sort_query.message
+            await bot.admin_cat_assign(SimpleNamespace(callback_query=assign_query), sort_context)
+            assign_labels = [button.text for row in assign_query.markup_edits[-1][0].inline_keyboard for button in row]
+            assert any(label.startswith('✅ ') for label in assign_labels), 'Selecting a category must mark it immediately'
+            assert len(sort_context.bot.sent_video_ids) == 1, 'Selecting a category must not resend the current video'
+            assert not sort_context.bot.deleted_ids, 'Selecting a category must not delete the current video'
             next_sort_query = FakeQuery('cat_sort_page_1')
             await bot.admin_cat_sort_navigation(SimpleNamespace(callback_query=next_sort_query), sort_context)
             assert sort_context.bot.deleted_ids, 'Moving to the next category-sort video must delete the prior preview'

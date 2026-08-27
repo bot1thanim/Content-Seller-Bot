@@ -7277,6 +7277,32 @@ async def admin_cat_sort_navigation(update: Update, context: ContextTypes.DEFAUL
     await admin_cat_sort_page(update, context, page)
 
 
+def _category_sort_markup(videos: list[dict], page: int, current_categories: list[str]) -> InlineKeyboardMarkup:
+    """Build the category selector for one displayed preview without touching its media message."""
+    buttons = []
+    row = []
+    for index, category in enumerate(_admin_categories()):
+        label = f"✅ {category}" if category in current_categories else category
+        row.append(InlineKeyboardButton(label, callback_data=f"cat_assign_{page}_{index}"))
+        if len(row) == 2:
+            buttons.append(row)
+            row = []
+    if row:
+        buttons.append(row)
+
+    navigation = []
+    if page > 0:
+        navigation.append(InlineKeyboardButton("⬅️ הקודם", callback_data=f"cat_sort_page_{page - 1}"))
+    navigation.append(InlineKeyboardButton(f"{page + 1}/{len(videos)}", callback_data="noop"))
+    if page < len(videos) - 1:
+        navigation.append(InlineKeyboardButton("הבא ➡️", callback_data=f"cat_sort_page_{page + 1}"))
+    buttons.append(navigation)
+    done_label = "✅ סיים והבא" if page < len(videos) - 1 else "✅ סיים מיון"
+    buttons.append([InlineKeyboardButton(done_label, callback_data=f"cat_sort_done_{page}")])
+    buttons.append([InlineKeyboardButton("🔙 סיום", callback_data="admin_categories")])
+    return InlineKeyboardMarkup(buttons)
+
+
 async def admin_cat_sort_page(update: Update, context: ContextTypes.DEFAULT_TYPE, page=0):
     videos = _category_sort_context_videos(context)
     query = update.callback_query
@@ -7301,8 +7327,8 @@ async def admin_cat_sort_page(update: Update, context: ContextTypes.DEFAULT_TYPE
         f"🏷 *מיון לקטגוריות ({page + 1}/{len(videos)})*\n"
         f"מצב: *{mode_label}*\n\n"
         f"⏱ אורך: *{format_duration(video.get('duration', 0))}*\n"
-        f"📁 קטגוריות נוכחיות: *{', '.join(current_categories)}*\n\n"
-        "אפשר לסמן כמה קטגוריות. לחיצה על קטגוריה שומרת את ההתקדמות; אם לא משנים קטגוריה, לחץ על ׳סיים סרטון׳ כדי לשמור את הטיפול בו."
+        "\n📁 הקטגוריות שנבחרו מסומנות ב־✅ על הכפתורים.\n\n"
+        "אפשר לסמן כמה קטגוריות. לחיצה על קטגוריה שומרת את ההתקדמות ומעדכנת מיד את הסימון; אם לא משנים קטגוריה, לחץ על ׳סיים סרטון׳ כדי לשמור את הטיפול בו."
     )
     if (
         str(previous_progress.get("entry_id") or "") == str(video.get("entry_id") or "")
@@ -7310,30 +7336,7 @@ async def admin_cat_sort_page(update: Update, context: ContextTypes.DEFAULT_TYPE
     ):
         text += f"\n\n⏸ ממשיך מהמקום שבו עצר *{str(previous_progress.get('actor_name') or 'מנהל')}*."
 
-    categories = _admin_categories()
-    buttons = []
-    row = []
-    for index, category in enumerate(categories):
-        label = f"✅ {category}" if category in current_categories else category
-        row.append(InlineKeyboardButton(label, callback_data=f"cat_assign_{page}_{index}"))
-        if len(row) == 2:
-            buttons.append(row)
-            row = []
-    if row:
-        buttons.append(row)
-
-    navigation = []
-    if page > 0:
-        navigation.append(InlineKeyboardButton("⬅️ הקודם", callback_data=f"cat_sort_page_{page - 1}"))
-    navigation.append(InlineKeyboardButton(f"{page + 1}/{len(videos)}", callback_data="noop"))
-    if page < len(videos) - 1:
-        navigation.append(InlineKeyboardButton("הבא ➡️", callback_data=f"cat_sort_page_{page + 1}"))
-    buttons.append(navigation)
-    done_label = "✅ סיים והבא" if page < len(videos) - 1 else "✅ סיים מיון"
-    buttons.append([InlineKeyboardButton(done_label, callback_data=f"cat_sort_done_{page}")])
-    buttons.append([InlineKeyboardButton("🔙 סיום", callback_data="admin_categories")])
-
-    await query.edit_message_text(text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(buttons))
+    await query.edit_message_text(text, parse_mode="Markdown", reply_markup=_category_sort_markup(videos, page, current_categories))
     sent = await send_admin_video_with_delete_button(context.bot, video["file_id"], video["entry_id"], query.message.chat_id)
     if sent and sent != "INVALID_FILE_ID":
         context.user_data["dup_sent_media_message_ids"] = [sent.message_id]
@@ -7376,7 +7379,15 @@ async def admin_cat_assign(update: Update, context: ContextTypes.DEFAULT_TYPE):
             break
     save_json(VIDEOS_FILE, all_videos)
     mark_category_sort_reviewed(str(selected_video.get("entry_id", "")))
-    await admin_cat_sort_page(update, context, page)
+    save_shared_category_sort_progress(
+        mode=context.user_data.get("cat_sort_mode", "continue"),
+        entry_ids=[str(item.get("entry_id", "")) for item in videos],
+        page=page,
+        actor_id=query.from_user.id,
+    )
+    # Preserve the current video preview. Updating markup only is noticeably faster than
+    # rebuilding the sort page and prevents the video from disappearing and reappearing.
+    await query.edit_message_reply_markup(reply_markup=_category_sort_markup(videos, page, video_categories(selected_video)))
 
 
 async def admin_cat_sort_done(update: Update, context: ContextTypes.DEFAULT_TYPE):
