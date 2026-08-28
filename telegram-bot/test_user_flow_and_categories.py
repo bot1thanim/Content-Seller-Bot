@@ -75,6 +75,7 @@ async def run_tests():
         'USERS_FILE': bot.USERS_FILE,
         'SETTINGS_FILE': bot.SETTINGS_FILE,
         'COINS_FILE': bot.COINS_FILE,
+        'USER_ACTIVITY_FILE': bot.USER_ACTIVITY_FILE,
     }
     with tempfile.TemporaryDirectory() as tempdir:
         base = Path(tempdir)
@@ -82,6 +83,7 @@ async def run_tests():
         bot.USERS_FILE = base / 'users.json'
         bot.SETTINGS_FILE = base / 'settings.json'
         bot.COINS_FILE = base / 'coins.json'
+        bot.USER_ACTIVITY_FILE = base / 'user_activity.json'
         bot.save_json(bot.SETTINGS_FILE, {'categories': ['כללי', 'ישראלי', 'חו״ל'], 'maintenance': False})
         bot.save_json(bot.USERS_FILE, {'100': {'seen_videos': ['seen-id']}, '101': {'seen_videos': []}})
         bot.save_json(bot.COINS_FILE, {'100': 100, '101': 100})

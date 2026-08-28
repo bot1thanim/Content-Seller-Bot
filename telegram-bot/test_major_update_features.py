@@ -123,12 +123,14 @@ async def run():
         bot.ADMIN_ACTIONS_FILE = data / "admin_actions.json"
         bot.COIN_TRANSACTIONS_FILE = data / "coin_transactions.json"
         bot.AI_AUDIT_FILE = data / "ai_audit.json"
+        bot.USER_ACTIVITY_FILE = data / "user_activity.json"
         bot.ALERTS_FILE = data / "alerts.json"
         bot.DUPLICATE_REVIEWS_FILE = data / "duplicate_reviews.json"
         bot.AUTO_BACKUPS_DIR = data / "auto_backups"
         owner = bot.ADMIN_ID
         bot.ensure_data_files()
         write(bot.SETTINGS_FILE, {"categories": ["כללי", "ישראלי", "קצר"], "admin_managers": {}})
+        bot.log_user_activity(owner, "daily_gift", {"amount": 2, "amount_before": 14, "amount_after": 16, "reason": "daily_gift"})
         write(bot.VIDEOS_FILE, [
             {"file_id": "f1", "duration": 10, "entry_id": "a", "category": "ישראלי"},
             {"file_id": "f2", "duration": 10, "entry_id": "b", "category": "ישראלי"},
@@ -137,6 +139,26 @@ async def run():
         ])
         assert bot._assistant_live_answer("כמה סרטונים יש במאגר?", owner) == "🎬 כרגע יש *4* סרטונים במאגר."
         assert bot._assistant_live_answer("כמה סרטונים יש במאגר?", 12345) is None
+
+        # The unified activity center exposes every required log family and human-readable user events.
+        owner_markup = bot.get_admin_inline_keyboard(owner)
+        assert "admin_activity_center" in button_callbacks(owner_markup), "Owner panel must expose unified activity logs"
+        center_query = FakeQuery("admin_activity_center", owner)
+        await bot.admin_activity_center(FakeUpdate("admin_activity_center", owner), SimpleNamespace())
+        center_buttons = button_callbacks(center_query) if hasattr(center_query, "inline_keyboard") else []
+        activity_update = FakeUpdate("admin_activity_center", owner)
+        await bot.admin_activity_center(activity_update, SimpleNamespace())
+        center_markup = activity_update.callback_query.edits[-1][1]["reply_markup"]
+        center_callbacks = button_callbacks(center_markup)
+        for kind in ("users", "admins", "ai", "coins", "audit", "blocked", "system"):
+            assert f"admin_activity_{kind}_0" in center_callbacks, f"Missing unified activity log: {kind}"
+        users_activity_update = FakeUpdate("admin_activity_users_0", owner)
+        await bot.admin_activity_page(users_activity_update, SimpleNamespace())
+        users_activity_text = users_activity_update.callback_query.edits[-1][0]
+        assert "פעילות משתמשים" in users_activity_text and "משתמש:" in users_activity_text
+        event_update = FakeUpdate("admin_activity_event_users_0_0", owner)
+        await bot.admin_activity_event(event_update, SimpleNamespace())
+        assert "מתי:" in event_update.callback_query.edits[-1][0] and "קבלת מתנה יומית" in event_update.callback_query.edits[-1][0]
         write(bot.TRASH_FILE, [{"entry_id": "trash-entry", "file_id": "old-file"}])
         write(bot.COUPONS_FILE, {"OLD": {"coins": 1, "expires": "2020-01-01", "used_by": []}})
         bot.save_json(bot.ALERTS_FILE, [{"kind": "test_alert"}])
@@ -565,7 +587,7 @@ async def run():
             "broadcast": (["admin_broadcast"], "admin_backup"),
             "coins": (["admin_coins_menu"], "admin_backup"),
             "maintenance": (["admin_maintenance"], "admin_backup"),
-            "audit_log": (["admin_menu_system"], "admin_backup"),
+            "audit_log": (["admin_activity_center", "admin_menu_system"], "admin_backup"),
             "backup": (["admin_menu_system"], "admin_delete"),
             "dangerous_delete": (["admin_menu_system"], "admin_backup"),
             "assistant": (["admin_assistant"], "admin_backup"),

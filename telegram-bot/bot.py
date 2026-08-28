@@ -73,6 +73,7 @@ TRASH_FILE     = DATA_DIR / "trash.json"
 ADMIN_ACTIONS_FILE = DATA_DIR / "admin_actions.json"
 COIN_TRANSACTIONS_FILE = DATA_DIR / "coin_transactions.json"
 AI_AUDIT_FILE = DATA_DIR / "ai_audit.json"
+USER_ACTIVITY_FILE = DATA_DIR / "user_activity.json"
 ALERTS_FILE = DATA_DIR / "alerts.json"
 DUPLICATE_REVIEWS_FILE = DATA_DIR / "duplicate_reviews.json"
 AUTO_BACKUPS_DIR = DATA_DIR / "auto_backups"
@@ -91,6 +92,7 @@ BACKUP_ALLOWED_FILES = {
     "admin_actions.json": list,
     "coin_transactions.json": list,
     "ai_audit.json": list,
+    "user_activity.json": list,
     "alerts.json": list,
     "duplicate_reviews.json": list,
 }
@@ -187,6 +189,7 @@ def ensure_data_files():
         (ADMIN_ACTIONS_FILE, []),
         (COIN_TRANSACTIONS_FILE, []),
         (AI_AUDIT_FILE, []),
+        (USER_ACTIVITY_FILE, []),
         (ALERTS_FILE, []),
         (DUPLICATE_REVIEWS_FILE, []),
     ]
@@ -715,6 +718,8 @@ def callback_permission(callback_data: str) -> str | None:
         return "backup"
     if callback_data.startswith(("admin_delete", "admin_global_reset")):
         return "dangerous_delete"
+    if callback_data.startswith("admin_activity"):
+        return "audit_log"
     if callback_data.startswith("admin_managers") or callback_data.startswith("admin_mgr_"):
         return None
     return None
@@ -820,6 +825,30 @@ def log_admin_action(
     save_json(ADMIN_ACTIONS_FILE, records)
 
 
+def log_user_activity(
+    user_id: int | str,
+    action: str,
+    details: dict | None = None,
+    *,
+    status: str = "success",
+    source: str = "user",
+) -> None:
+    """Persist meaningful user events without storing message bodies, secrets, or raw payloads."""
+    records = load_json(USER_ACTIVITY_FILE)
+    if not isinstance(records, list):
+        records = []
+    safe_details = details if isinstance(details, dict) else {}
+    records.append({
+        "at": datetime.now(timezone.utc).isoformat(),
+        "user_id": str(user_id),
+        "action": str(action),
+        "details": safe_details,
+        "source": str(source),
+        "status": str(status),
+    })
+    save_json(USER_ACTIVITY_FILE, records)
+
+
 def log_coin_transaction(
     user_id: int | str,
     balance_before: int,
@@ -845,6 +874,12 @@ def log_coin_transaction(
         "actor_id": int(actor_id) if actor_id is not None else None,
     })
     save_json(COIN_TRANSACTIONS_FILE, records)
+    log_user_activity(
+        user_id,
+        "coin_transaction",
+        {"amount_before": int(balance_before), "change": int(change), "amount_after": int(balance_after), "reason": str(reason)},
+        source=source,
+    )
 
 
 def _redact_sensitive_audit_text(value: str) -> str:
@@ -891,6 +926,21 @@ def log_ai_audit(
 
 
 ISRAEL_TZ = ZoneInfo("Asia/Jerusalem")
+
+_USER_ACTIVITY_LABELS_HE = {
+    "start": "הפעלת הבוט או כניסה מחדש",
+    "language_changed": "שינוי שפה",
+    "daily_gift": "קבלת מתנה יומית",
+    "coin_transaction": "פעולת ארנק ומטבעות",
+    "referral_reward": "קבלת תגמול הפניה",
+    "coupon_redeemed": "מימוש קופון",
+    "purchase_started": "התחלת רכישה",
+    "purchase_completed": "רכישה אושרה",
+    "payment_submitted": "שליחת תשלום לתמיכה",
+    "video_received": "קבלת סרטונים",
+    "vip_viewed": "צפייה בדרגת VIP",
+    "support_message": "שליחת הודעה לתמיכה",
+}
 
 _ACTION_LABELS_HE = {
     "all_videos_deleted": "מחיקת כל הסרטונים",
@@ -1628,6 +1678,9 @@ def get_admin_inline_keyboard(user_id: int = ADMIN_ID):
     add("broadcast", [InlineKeyboardButton("📢 הודעה לכולם", callback_data="admin_broadcast")])
     add("coins", [InlineKeyboardButton("🪙 מטבעות", callback_data="admin_coins_menu")])
 
+    if has_admin_permission(user_id, "audit_log"):
+        rows.append([InlineKeyboardButton("📋 יומני פעילות", callback_data="admin_activity_center")])
+
     # Advanced tools added after the original panel are kept together here.
     advanced_permissions = {"audit_log", "backup", "dangerous_delete"}
     if is_owner(user_id) or bool(advanced_permissions & admin_permissions(user_id)):
@@ -1790,6 +1843,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     users_before = load_json(USERS_FILE)
     is_new_user = str(user.id) not in users_before
     register_user(user, ref_id)
+    log_user_activity(user.id, "start", {"new_user": bool(is_new_user)})
 
     # Welcome guide for new users
     users = load_json(USERS_FILE)
@@ -1851,6 +1905,7 @@ async def language_set(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if uid not in users:
         return
     users[uid]["language"] = language
+    log_user_activity(uid, "language_changed", {"language": language})
     if not users[uid].get("seen_guide"):
         users[uid]["seen_guide"] = True
         save_json(USERS_FILE, users)
@@ -1901,6 +1956,7 @@ async def daily_bonus(update: Update, context: ContextTypes.DEFAULT_TYPE):
     coins[uid] = new_balance
     save_json(COINS_FILE, coins)
     log_coin_transaction(uid, old_balance, bonus_amount, new_balance, reason="daily_gift", source="system_daily_gift")
+    log_user_activity(uid, "daily_gift", {"amount": bonus_amount, "amount_before": old_balance, "amount_after": new_balance}, source="system")
     
     await query.answer(
         f"🎁 You received {bonus_amount} coins. Your total is now {new_balance}." if english
@@ -2146,10 +2202,12 @@ async def coin_package_confirm(update: Update, context: ContextTypes.DEFAULT_TYP
     coins[uid] = bal - cost
     save_json(COINS_FILE, coins)
     log_coin_transaction(uid, bal, -cost, bal - cost, reason="video_purchase", source="user_coin_purchase")
+    log_user_activity(uid, "purchase_started", {"videos_requested": int(pkg["videos"]), "cost": cost, "balance_after": bal - cost}, source="user")
     
     sent = await send_videos_to_user(context, query.from_user.id, pkg["videos"])
     if sent > 0:
         record_order(query.from_user.id, 0, sent, "coins")
+        log_user_activity(uid, "purchase_completed", {"videos_sent": int(sent), "cost": cost}, source="user")
         await query.message.reply_text(f"✅ Purchase complete! {sent} videos were sent to you." if english else f"✅ רכישה הושלמה! {sent} סרטונים נשלחו אליך. תהנה!")
         await alert_admin(context, f"🪙 *רכישה במטבעות*\n👤 {query.from_user.first_name} (`{uid}`)\n🎬 סרטונים: {sent}\n💰 עלות: {cost}")
     else:
@@ -2273,6 +2331,7 @@ async def coupon_redeem_input(update: Update, context: ContextTypes.DEFAULT_TYPE
     coins[user_id] = after
     save_json(COINS_FILE, coins)
     log_coin_transaction(user_id, before, reward, after, reason="coupon_redeemed", source="user_coupon")
+    log_user_activity(user_id, "coupon_redeemed", {"reward": int(reward), "amount_before": before, "amount_after": after}, source="user")
 
     await update.message.reply_text(
         (f"✅ *Coupon redeemed!*\n\n🪙 You received *{reward} coins*\n💰 Current balance: *{coins[user_id]}*" if english else f"✅ *קופון מומש!*\n\n🪙 קיבלת *{reward} מטבעות*\n💰 יתרה כעת: *{coins[user_id]}*"),
@@ -5013,6 +5072,160 @@ async def admin_check_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=get_admin_inline_keyboard()
     )
     return ConversationHandler.END
+
+# ─── Admin: unified activity center ─────────────────────────────────────────
+
+ACTIVITY_CENTER_LABELS = {
+    "users": "👥 פעילות משתמשים",
+    "admins": "👨‍💼 פעילות מנהלים",
+    "ai": "🤖 פעילות עוזר AI",
+    "coins": "💰 היסטוריית מטבעות",
+    "audit": "🛡️ Audit",
+    "blocked": "🚨 פעולות שנחסמו / בעיות",
+    "system": "⚙️ פעילות מערכת",
+}
+
+
+def _activity_access(user_id: int) -> bool:
+    return is_owner(user_id) or has_admin_permission(user_id, "audit_log")
+
+
+def _activity_records(kind: str) -> list[dict]:
+    if kind == "users":
+        records = load_json(USER_ACTIVITY_FILE)
+        return records if isinstance(records, list) else []
+    if kind == "admins":
+        records = load_json(ADMIN_ACTIONS_FILE)
+        return records if isinstance(records, list) else []
+    if kind == "ai":
+        return _ai_audit_as_records()
+    if kind == "coins":
+        records = load_json(COIN_TRANSACTIONS_FILE)
+        return records if isinstance(records, list) else []
+    if kind == "blocked":
+        combined = _activity_records("admins") + _activity_records("ai") + _activity_records("users")
+        return [record for record in combined if str(record.get("status")) in {"blocked", "failed", "cancelled"}]
+    if kind == "system":
+        admin_records = [record for record in _activity_records("admins") if str(record.get("source")) == "system"]
+        alerts = load_json(ALERTS_FILE)
+        return admin_records + (alerts if isinstance(alerts, list) else [])
+    return _activity_records("admins") + _activity_records("ai")
+
+
+def _format_user_activity_record(record: dict) -> str:
+    details = record.get("details") if isinstance(record.get("details"), dict) else {}
+    user_id = str(record.get("user_id") or "לא ידוע")
+    action = _USER_ACTIVITY_LABELS_HE.get(str(record.get("action")), "פעילות משתמש")
+    lines = [
+        "━━━━━━━━━━━━━━━━━━━━",
+        f"👤 משתמש: `{user_id}`",
+        f"🕐 מתי: {_hebrew_timestamp(record.get('at'))}",
+        f"📌 פעולה: {action}",
+        f"📍 תוצאה: {_hebrew_status(record.get('status'))}",
+    ]
+    if details.get("change") is not None:
+        lines.append(f"💰 שינוי: {details.get('change')} מטבעות")
+    if details.get("amount_before") is not None:
+        lines.append(f"💰 יתרה לפני: {details.get('amount_before')}")
+    if details.get("amount_after") is not None:
+        lines.append(f"💰 יתרה אחרי: {details.get('amount_after')}")
+    if details.get("reason"):
+        reason = {"daily_gift": "מתנה יומית", "manual_admin": "עדכון מנהל", "purchase": "רכישה", "referral": "הפניה"}.get(str(details["reason"]), str(details["reason"]))
+        lines.append(f"📝 סיבה: {reason}")
+    return "\n".join(lines)
+
+
+def _format_coin_activity_record(record: dict) -> str:
+    return "\n".join([
+        "━━━━━━━━━━━━━━━━━━━━",
+        f"👤 משתמש: `{record.get('user_id', 'לא ידוע')}`",
+        f"🕐 מתי: {_hebrew_timestamp(record.get('at'))}",
+        "📌 פעולה: פעולת מטבעות",
+        f"💰 יתרה לפני: {record.get('amount_before', 'לא ידוע')}",
+        f"➕/➖ שינוי: {record.get('change', 'לא ידוע')}",
+        f"💰 יתרה אחרי: {record.get('amount_after', 'לא ידוע')}",
+        f"📝 סיבה: {record.get('reason', 'לא צוין')}",
+    ])
+
+
+def _format_activity_record(kind: str, record: dict) -> str:
+    if kind == "users":
+        return _format_user_activity_record(record)
+    if kind == "coins":
+        return _format_coin_activity_record(record)
+    if record.get("_ai_record") or kind == "ai":
+        return _format_ai_audit_record(record)
+    if kind == "system" and not record.get("action"):
+        return "━━━━━━━━━━━━━━━━━━━━\n⚙️ פעילות מערכת\n" + str(record.get("message") or record.get("type") or "אירוע מערכת")
+    return _format_admin_action_record(record)
+
+
+async def admin_activity_center(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if not _activity_access(query.from_user.id):
+        return
+    counts = {kind: len(_activity_records(kind)) for kind in ACTIVITY_CENTER_LABELS}
+    rows = [[InlineKeyboardButton(f"{label} ({counts[kind]})", callback_data=f"admin_activity_{kind}_0")] for kind, label in ACTIVITY_CENTER_LABELS.items()]
+    rows.append([InlineKeyboardButton("🔙 חזרה לפאנל", callback_data="back_admin")])
+    await query.edit_message_text(
+        "📋 *יומני פעילות*\n\nמרכז מאוחד להצגת פעילות חשובה. בחר סוג יומן להצגה.\n\nהרשומות מוצגות בעברית ואינן כוללות סודות או payload גולמי.",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(rows),
+    )
+
+
+async def admin_activity_page(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if not _activity_access(query.from_user.id):
+        return
+    match = re.fullmatch(r"admin_activity_(users|admins|ai|coins|audit|blocked|system)_(\d+)", query.data or "")
+    if not match:
+        await admin_activity_center(update, context)
+        return
+    kind, raw_page = match.groups()
+    records = list(reversed(_activity_records(kind)))
+    per_page = 6
+    pages = max(1, (len(records) + per_page - 1) // per_page)
+    page = max(0, min(int(raw_page), pages - 1))
+    batch = records[page * per_page:(page + 1) * per_page]
+    lines = [f"{ACTIVITY_CENTER_LABELS[kind]}\n"]
+    if not batch:
+        lines.append("אין רשומות ביומן הזה כרגע.")
+    else:
+        lines.extend(_format_activity_record(kind, record) for record in batch)
+    navigation = []
+    if page > 0:
+        navigation.append(InlineKeyboardButton("⬅️ קודם", callback_data=f"admin_activity_{kind}_{page - 1}"))
+    navigation.append(InlineKeyboardButton(f"{page + 1}/{pages}", callback_data="noop"))
+    if page < pages - 1:
+        navigation.append(InlineKeyboardButton("הבא ➡️", callback_data=f"admin_activity_{kind}_{page + 1}"))
+    rows = [navigation]
+    rows.extend([[InlineKeyboardButton(f"🔎 פתיחת אירוע {page * per_page + index + 1}", callback_data=f"admin_activity_event_{kind}_{page}_{index}")] for index, _ in enumerate(batch)])
+    rows.append([InlineKeyboardButton("🔙 חזרה ליומני פעילות", callback_data="admin_activity_center")])
+    await query.edit_message_text("\n\n".join(lines), parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(rows))
+
+
+async def admin_activity_event(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if not _activity_access(query.from_user.id):
+        return
+    match = re.fullmatch(r"admin_activity_event_(users|admins|ai|coins|audit|blocked|system)_(\d+)_(\d+)", query.data or "")
+    if not match:
+        await admin_activity_center(update, context)
+        return
+    kind, raw_page, raw_index = match.groups()
+    records = list(reversed(_activity_records(kind)))
+    index = int(raw_page) * 6 + int(raw_index)
+    if index >= len(records):
+        await query.edit_message_text("❌ האירוע כבר אינו זמין.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 חזרה ליומני פעילות", callback_data="admin_activity_center")]]))
+        return
+    record = records[index]
+    text = f"{ACTIVITY_CENTER_LABELS[kind]}\n\n{_format_activity_record(kind, record)}"
+    await query.edit_message_text(text, parse_mode="Markdown", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 חזרה ליומן", callback_data=f"admin_activity_{kind}_{raw_page}")]]))
+
 
 # ─── Admin: activity log ─────────────────────────────────────────────────────
 
@@ -9279,6 +9492,9 @@ def main():
         ("^admin_mgr_remove$",           admin_manager_remove),
         ("^admin_stats$",               admin_stats),
         ("^admin_daily_report$",        send_owner_daily_report),
+        ("^admin_activity_center$",     admin_activity_center),
+        (r"^admin_activity_(users|admins|ai|coins|audit|blocked|system)_\d+$", admin_activity_page),
+        (r"^admin_activity_event_(users|admins|ai|coins|audit|blocked|system)_\d+_\d+$", admin_activity_event),
         ("^admin_ops_dashboard$",       admin_ops_dashboard),
         ("^admin_problem_center$",      admin_problem_center),
         (r"^admin_problem_show_(videos|categories|duplicates|coupons|data|trash)_\d+$", admin_problem_show),
