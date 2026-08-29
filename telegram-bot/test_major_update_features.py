@@ -595,7 +595,27 @@ async def run():
         bad_update = RestoreUpdate(owner, b"not-a-zip")
         bad_context = SimpleNamespace(bot=RestoreBot(b"not-a-zip"), user_data={})
         assert await bot.admin_restore_receive(bad_update, bad_context) == bot.ADMIN_RESTORE
-        assert any("ZIP פגום" in text for text, _ in bad_update.message.replies)
+        assert any("לא ניתן לבדוק את הגיבוי" in text and "ZIP תקין" in text for text, _ in bad_update.message.replies)
+        special_archive = io.BytesIO()
+        with zipfile.ZipFile(special_archive, "w", zipfile.ZIP_DEFLATED) as archive:
+            archive.writestr("settings.json", json.dumps({"label": "_*[]<> שלום", "categories": []}, ensure_ascii=False))
+        special_update = RestoreUpdate(owner, special_archive.getvalue())
+        special_context = SimpleNamespace(bot=RestoreBot(special_archive.getvalue()), user_data={})
+        assert await bot.admin_restore_receive(special_update, special_context) == bot.ADMIN_RESTORE_CONFIRM
+        preview_kwargs = special_update.message.replies[-1][1]
+        assert preview_kwargs.get("parse_mode") is None
+        original_parse = bot.parse_restore_archive
+        try:
+            bot.parse_restore_archive = lambda _raw: (_ for _ in ()).throw(RuntimeError("bad_*_[<" + ("x" * 700)))
+            exception_update = RestoreUpdate(owner, special_archive.getvalue())
+            exception_context = SimpleNamespace(bot=RestoreBot(special_archive.getvalue()), user_data={})
+            assert await bot.admin_restore_receive(exception_update, exception_context) == bot.ADMIN_RESTORE
+            error_text, error_kwargs = exception_update.message.replies[-1]
+            assert "לא ניתן לבדוק את הגיבוי" in error_text and "bad_*_[<" in error_text
+            assert error_kwargs.get("parse_mode") is None
+            assert len(error_text) < 800
+        finally:
+            bot.parse_restore_archive = original_parse
 
         # A cancelled restore clears pending state and does not write data.
         cancel_context = SimpleNamespace(user_data={"pending_restore": full_payloads})

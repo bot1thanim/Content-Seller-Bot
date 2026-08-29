@@ -8851,28 +8851,40 @@ async def admin_restore_receive(update: Update, context: ContextTypes.DEFAULT_TY
         if not raw_archive:
             raise ValueError("קובץ הגיבוי שהתקבל ריק.")
         payloads = parse_restore_archive(raw_archive)
-        context.user_data["pending_restore"] = payloads
+    except zipfile.BadZipFile:
+        await update.message.reply_text("❌ לא ניתן לבדוק את הגיבוי. הגיבוי אינו קובץ ZIP תקין. הנתונים הקיימים בבוט לא שונו.", parse_mode=None)
+        return ADMIN_RESTORE
+    except ValueError as exc:
+        safe_reason = str(exc).strip() or "מבנה הגיבוי אינו תקין"
+        await update.message.reply_text(f"❌ לא ניתן לבדוק את הגיבוי. סיבה: {safe_reason}. הנתונים הקיימים בבוט לא שונו.", parse_mode=None)
+        return ADMIN_RESTORE
+    except Exception as exc:
+        logger.exception("Backup validation failed")
+        safe_reason = str(exc).strip() or "שגיאה לא ידועה בבדיקת הגיבוי"
+        safe_reason = re.sub(r"(?:/|\\\\)[^\\s]+", "<נתיב>", safe_reason)[:500]
+        await update.message.reply_text(f"❌ לא ניתן לבדוק את הגיבוי. סיבה: {safe_reason}. הנתונים הקיימים בבוט לא שונו.", parse_mode=None)
+        return ADMIN_RESTORE
+
+    context.user_data["pending_restore"] = payloads
+    try:
         await update.message.reply_text(
-            "🔎 *תצוגה מקדימה של הגיבוי*\n\n"
+            "🔎 תצוגה מקדימה של הגיבוי\n\n"
             f"{restore_summary(payloads)}\n\n"
-            "הנתונים עדיין לא שונו. לחץ על *אשר שחזור* כדי לבצע החלפה, או על ביטול.",
-            parse_mode="Markdown",
+            "הנתונים עדיין לא שונו. לחץ על אשר שחזור כדי לבצע החלפה, או על ביטול.",
+            parse_mode=None,
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("✅ אשר שחזור", callback_data="admin_restore_apply")],
                 [InlineKeyboardButton("❌ ביטול / חזור", callback_data="back_admin")],
             ]),
         )
         return ADMIN_RESTORE_CONFIRM
-    except zipfile.BadZipFile:
-        await update.message.reply_text("❌ קובץ ZIP פגום.")
-    except ValueError as exc:
-        await update.message.reply_text(f"❌ הגיבוי לא התקבל: {exc}")
     except Exception as exc:
-        logger.exception("Backup preview failed")
-        safe_reason = str(exc).strip() or "סיבה לא ידועה"
-        safe_reason = re.sub(r"(?:/|\\\\)[^\\s]+", "<נתיב>", safe_reason)
-        await update.message.reply_text(f"❌ לא ניתן לבדוק את הגיבוי: {safe_reason}. הנתונים לא שונו.")
-    return ADMIN_RESTORE
+        logger.exception("Backup preview display failed after successful validation")
+        await update.message.reply_text(
+            "⚠️ הגיבוי עבר את בדיקת התקינות, אך Telegram לא הצליח להציג את תצוגת התוצאה. הנתונים הקיימים בבוט לא שונו. שלח את הקובץ מחדש.",
+            parse_mode=None,
+        )
+        return ADMIN_RESTORE
 
 
 async def admin_restore_apply(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -8918,10 +8930,10 @@ async def admin_restore_apply(update: Update, context: ContextTypes.DEFAULT_TYPE
         log_admin_action(query.from_user.id, "backup_restored", {"files": sorted(payloads.keys())})
         context.user_data.pop("pending_restore", None)
         await query.edit_message_text(
-            "✅ *השחזור הושלם בהצלחה!*\n\n"
+            "✅ השחזור הושלם בהצלחה!\n\n"
             f"{restore_summary(payloads)}\n\n"
             "נשלח אליך גם גיבוי חירום של המצב שהיה לפני השחזור.",
-            parse_mode="Markdown",
+            parse_mode=None,
             reply_markup=get_admin_inline_keyboard(),
         )
     except Exception as exc:
@@ -8935,9 +8947,10 @@ async def admin_restore_apply(update: Update, context: ContextTypes.DEFAULT_TYPE
                 logger.exception("Backup rollback failed")
         logger.exception("Backup restore failed")
         safe_reason = str(exc).strip() or "סיבה לא ידועה"
-        safe_reason = re.sub(r"(?:/|\\\\)[^\\s]+", "<נתיב>", safe_reason)
+        safe_reason = re.sub(r"(?:/|\\\\)[^\\s]+", "<נתיב>", safe_reason)[:500]
         await query.edit_message_text(
             f"❌ השחזור נכשל: {safe_reason}. הנתונים הוחזרו למצב שהיה לפני ניסיון השחזור; השתמש בגיבוי החירום שנשלח לפני הפעולה אם נדרש.",
+            parse_mode=None,
             reply_markup=get_admin_inline_keyboard(),
         )
     return ConversationHandler.END
