@@ -3263,7 +3263,7 @@ def _assistant_explicit_reward_command(text: str) -> str | None:
     kind = "daily" if any(marker in text for marker in daily_markers) else "referral" if any(marker in text for marker in referral_markers) else None
     if not kind:
         return None
-    amount_match = re.search(r"(?:ל|יהיה|יהיו|שים|תשים|קבל|יקבל|מקבל|קיבלו|ב-?)\s*(\d{1,4})\b", text)
+    amount_match = re.search(r"(?:ל|יהיה|יהיו|תהיה|תיהיה|שים|תשים|קבל|יקבל|מקבל|קיבלו|ב-?)\s*(\d{1,4})\b", text)
     amount = int(amount_match.group(1)) if amount_match else None
     if amount is None:
         for word, value in _HEBREW_NUMBER_WORDS.items():
@@ -4635,7 +4635,8 @@ async def admin_assistant_command(update: Update, context: ContextTypes.DEFAULT_
             return ConversationHandler.END
 
     if has_assistant_capability(user_id, "coins"):
-        if "שליטה במטבעות" in text or "מתנה יומית" in text or "תגמול הפניה" in text or "תגמול הפניות" in text:
+        explicit_coin_navigation = any(marker in text for marker in ("פתח", "להיכנס", "היכנס", "עבור", "מסך", "ניהול", "הגדרות"))
+        if "שליטה במטבעות" in text or (explicit_coin_navigation and any(marker in text for marker in ("מתנה יומית", "תגמול הפניה", "תגמול הפניות"))):
             await update.message.reply_text("🤖 פותח שליטה במטבעות.", reply_markup=_assistant_action_button("🪙 שליטה במטבעות", "admin_coin_control"))
             return ConversationHandler.END
         if "קופון" in text:

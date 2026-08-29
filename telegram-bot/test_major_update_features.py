@@ -204,6 +204,34 @@ async def run():
                 os.environ.pop("GEMINI_API_KEY", None)
             else:
                 os.environ["GEMINI_API_KEY"] = previous_reward_key
+
+        write(bot.USERS_FILE, {"77": {"first_name": "Dana", "username": "dana_admin", "joined": "today"}})
+        write(bot.COINS_FILE, {"77": 42})
+        write(bot.REFERRALS_FILE, {"77": {"count": 3}})
+        write(bot.ORDERS_FILE, [{"user_id": "77", "type": "coins"}])
+
+        # Acceptance-style sequence: every natural request stays in the assistant state.
+        sequence_context = SimpleNamespace(user_data={})
+        sequence_requests = [
+            ("מעכשיו הפרס היומי יהיה 5", "SET_DAILY_GIFT:5"),
+            ("תעשה שהמתנה היומית תהיה 7 מטבעות", "SET_DAILY_GIFT:7"),
+            ("עכשיו תשים 3 על כל הזמנה", "SET_REFERRAL_REWARD:3"),
+        ]
+        for request_text, expected_command in sequence_requests:
+            sequence_message = FakeMessage(request_text)
+            sequence_update = SimpleNamespace(effective_user=SimpleNamespace(id=owner), message=sequence_message)
+            assert await bot.admin_assistant_command(sequence_update, sequence_context) == bot.ADMIN_ASSISTANT_COMMAND
+            assert expected_command.split(":", 1)[0] not in "".join(reply[0] for reply in sequence_message.replies)
+            assert "פותח ניהול מטבעות" not in sequence_message.replies[-1][0]
+        lookup_message = FakeMessage("תבדוק את המשתמש 77")
+        assert await bot.admin_assistant_command(SimpleNamespace(effective_user=SimpleNamespace(id=owner), message=lookup_message), sequence_context) == bot.ADMIN_ASSISTANT_COMMAND
+        balance_followup = FakeMessage("וכמה מטבעות יש לו?")
+        assert bot._assistant_contextual_user_command(bot._assistant_normalize(balance_followup.text), sequence_context) == "GET_USER_BALANCE:77"
+        assert await bot.admin_assistant_command(SimpleNamespace(effective_user=SimpleNamespace(id=owner), message=balance_followup), sequence_context) == bot.ADMIN_ASSISTANT_COMMAND
+        assert "42" in balance_followup.replies[-1][0], balance_followup.replies
+        unclear_message = FakeMessage("תעזור לי בבקשה")
+        assert await bot.admin_assistant_command(SimpleNamespace(effective_user=SimpleNamespace(id=owner), message=unclear_message), sequence_context) == bot.ADMIN_ASSISTANT_COMMAND
+
         broadcast_context = SimpleNamespace(user_data={
             "broadcast_msg": "מבצע *חדש* [בדיקה]",
             "broadcast_media": None,
