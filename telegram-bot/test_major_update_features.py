@@ -238,6 +238,33 @@ async def run():
             "at": "2026-08-26T12:00:00+00:00", "user_id": "77", "amount_before": 40,
             "change": 2, "amount_after": 42, "reason": "test", "source": "test", "actor_id": owner,
         }])
+        coin_rows = [{
+            "at": f"2026-08-26T12:{index:02d}:00+00:00", "user_id": "77", "amount_before": index, "change": 1, "amount_after": index + 1, "reason": "daily_gift", "source": "daily_gift", "actor_id": owner, "id": f"coin-event-{index}"
+        } for index in range(6)] + [{
+            "at": "2026-08-26T12:00:00+00:00", "user_id": "77", "amount_before": 40,
+            "change": 2, "amount_after": 42, "reason": "test", "source": "test", "actor_id": owner, "id": "coin-event-original",
+        }]
+        bot.save_json(bot.COIN_TRANSACTIONS_FILE, coin_rows)
+        coins_page = FakeUpdate("admin_activity_coins_0", owner)
+        await bot.admin_activity_page(coins_page, SimpleNamespace())
+        coins_page_markup = coins_page.callback_query.edits[-1][1]["reply_markup"]
+        coins_page_callbacks = button_callbacks(coins_page_markup)
+        assert "admin_activity_coins_1" in coins_page_callbacks
+        coin_event_callback = "admin_activity_event_coins_0_1"
+        coin_event = FakeUpdate(coin_event_callback, owner)
+        await bot.admin_activity_event(coin_event, SimpleNamespace())
+        coin_event_text, coin_event_kwargs = coin_event.callback_query.edits[-1]
+        assert "משתמש שהושפע" in coin_event_text
+        assert "יתרה לפני" in coin_event_text and "שינוי" in coin_event_text and "יתרה אחרי" in coin_event_text
+        assert "סיבת השינוי: מתנה יומית" in coin_event_text
+        assert "מקור הפעולה" in coin_event_text and "מנהל מבצע" in coin_event_text
+        assert "מזהה אירוע" in coin_event_text and "הצליחה" in coin_event_text
+        assert coin_event_kwargs["reply_markup"].inline_keyboard[0][0].callback_data == "admin_activity_coins_0"
+        coins_second_page = FakeUpdate("admin_activity_coins_1", owner)
+        await bot.admin_activity_page(coins_second_page, SimpleNamespace())
+        second_callbacks = button_callbacks(coins_second_page.callback_query.edits[-1][1]["reply_markup"])
+        assert "admin_activity_coins_0" in second_callbacks
+
         assistant_user_message = FakeMessage("בדוק משתמש 77")
         assistant_user_update = SimpleNamespace(effective_user=SimpleNamespace(id=owner), message=assistant_user_message)
         assert await bot._assistant_apply_runtime_command(assistant_user_update, SimpleNamespace(user_data={}), "GET_USER:77", owner)

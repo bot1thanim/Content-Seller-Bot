@@ -2977,8 +2977,9 @@ _ASSISTANT_AI_PROMPT = """אתה Gemini, עוזר AI חכם, ידידותי ומ
 אם אין Function Call מתאים אך אפשר לתרגם לפקודה קצרה שהמערכת מבינה, החזר JSON עם kind="rewrite"
 ו־canonical_text. עבור שינוי תגמולים, השתמש רק באחת מהצורות המדויקות הבאות:
 SET_DAILY_GIFT:<מספר שלם אי-שלילי>, SET_REFERRAL_REWARD:<מספר שלם אי-שלילי>,
-או SET_REWARDS:<מתנה יומית>,<תגמול הפניה>. לדוגמה, "שנה את המתנה היומית ל-3" צריך להחזיר
-SET_DAILY_GIFT:3, ו"תעשה מתנות 3 והפניות 2" צריך להחזיר SET_REWARDS:3,2.
+או SET_REWARDS:<מתנה יומית>,<תגמול הפניה>. גם ניסוחים טבעיים כמו "מעכשיו הפרס היומי יהיה 5",
+"שים 5 מטבעות במתנה היומית" ו"תעדכן את הפרס היומי לחמישה" הם שינוי מתנה יומית ל־5.
+לדוגמה, "שנה את המתנה היומית ל-3" צריך להחזיר SET_DAILY_GIFT:3, ו"תעשה מתנות 3 והפניות 2" צריך להחזיר SET_REWARDS:3,2.
 פעולות אלו קיימות במערכת, לכן אל תסמן אותן כלא נתמכות. אם המשתמש שואל שאלה, מבקש הסבר כללי או מנהל שיחה, החזר kind="answer" ו-reply מועיל,
 קצר וישיר. אל תטען שביצעת פעולה. אם הפעולה המבוקשת אינה קיימת, החזר kind="unsupported" והסבר זאת ב-reply.
 
@@ -3248,11 +3249,56 @@ def _assistant_explicit_coin_command(text: str) -> str | None:
     return f"ADJUST_COINS:{target_match.group(1)}:{amount:+d}"
 
 
+_HEBREW_NUMBER_WORDS = {
+    "אפס": 0, "אחת": 1, "אחד": 1, "שתיים": 2, "שניים": 2, "שלוש": 3, "שלושה": 3,
+    "ארבע": 4, "ארבעה": 4, "חמש": 5, "חמישה": 5, "שש": 6, "שישה": 6,
+    "שבע": 7, "שבעה": 7, "שמונה": 8, "תשע": 9, "תשעה": 9, "עשר": 10,
+}
+
+
+def _assistant_explicit_reward_command(text: str) -> str | None:
+    """Handle unambiguous reward phrasing as a safe fallback; general language still goes to Gemini."""
+    daily_markers = ("מתנה יומית", "פרס יומי", "הפרס היומי", "המתנה היומית", "מתנה של היום")
+    referral_markers = ("תגמול הפניה", "תגמול הפניות", "תגמול הזמנה", "תגמול הזמנות", "על כל הפניה", "על כל הזמנה")
+    kind = "daily" if any(marker in text for marker in daily_markers) else "referral" if any(marker in text for marker in referral_markers) else None
+    if not kind:
+        return None
+    amount_match = re.search(r"(?:ל|יהיה|יהיו|שים|תשים|קבל|יקבל|מקבל|קיבלו|ב-?)\s*(\d{1,4})\b", text)
+    amount = int(amount_match.group(1)) if amount_match else None
+    if amount is None:
+        for word, value in _HEBREW_NUMBER_WORDS.items():
+            if re.search(rf"(?:^|\s)(?:ל|ב)?{re.escape(word)}(?=$|[\s?.!,])", text):
+                amount = value
+                break
+    if amount is None or amount < 0:
+        return None
+    return f"SET_DAILY_GIFT:{amount}" if kind == "daily" else f"SET_REFERRAL_REWARD:{amount}"
+
+
+def _assistant_contextual_user_command(text: str, context: ContextTypes.DEFAULT_TYPE) -> str | None:
+    """Resolve pronouns only when the preceding conversation stored one unambiguous user ID."""
+    target_id = str(context.user_data.get("assistant_last_target_id") or "")
+    if not target_id or not any(marker in text for marker in ("הוא", "לו", "אותו", "הזה", "his", "him", "that user")):
+        return None
+    if any(marker in text for marker in ("היסטור", "קיבל", "received", "history", "לפני", "היה")):
+        return f"GET_USER_HISTORY:{target_id}"
+    if any(marker in text for marker in ("מטבע", "יתרה", "balance", "coins")):
+        return f"GET_USER_BALANCE:{target_id}"
+    if any(marker in text for marker in ("הזמנ", "רכיש", "orders", "purchases")):
+        return f"GET_USER_ORDERS:{target_id}"
+    if any(marker in text for marker in ("פרטים", "מצב", "details", "check", "show")):
+        return f"GET_USER:{target_id}"
+    return None
+
+
 def _assistant_explicit_user_lookup_command(text: str) -> str | None:
     """Resolve explicit user-inspection requests before a model can omit the requested ID."""
-    if not any(marker in text for marker in ("משתמש", "user")):
-        return None
     match = re.search(r"(?:משתמש|user)\s*(\d+)", text, flags=re.IGNORECASE)
+    if not match:
+        # Safe, explicit natural-language variants such as "תבדוק לי את 123456".
+        match = re.search(r"(?:בדוק|תבדוק|תביא|פרטים\s+על|מצב\s+של|check|show)\D{0,35}(\d{5,})", text, flags=re.IGNORECASE)
+    if not match and any(marker in text for marker in ("מטבע", "יתרה", "balance", "coins", "הזמנ", "רכיש")):
+        match = re.search(r"(?:ל|של|for)\s*[-:]?\s*(\d{5,})", text, flags=re.IGNORECASE)
     if not match:
         return None
     target_id = match.group(1)
@@ -4367,8 +4413,16 @@ async def admin_assistant_command(update: Update, context: ContextTypes.DEFAULT_
         log_ai_audit(user_id, raw_request, "deterministic_tool_selected", canonical_text=explicit_image_command, status="planned", details={"request_id": request_id})
         if await _assistant_apply_runtime_command(update, context, explicit_image_command, user_id):
             return ADMIN_ASSISTANT_COMMAND
-    explicit_user_command = _assistant_explicit_user_lookup_command(text)
+    explicit_reward_command = _assistant_explicit_reward_command(text)
+    if explicit_reward_command:
+        log_ai_audit(user_id, raw_request, "deterministic_tool_selected", canonical_text=explicit_reward_command, status="planned", details={"request_id": request_id})
+        if await _assistant_apply_reward_command(update, context, explicit_reward_command, user_id):
+            return ADMIN_ASSISTANT_COMMAND
+    explicit_user_command = _assistant_explicit_user_lookup_command(text) or _assistant_contextual_user_command(text, context)
     if explicit_user_command:
+        target_match = re.search(r":(\d+)$", explicit_user_command)
+        if target_match:
+            context.user_data["assistant_last_target_id"] = target_match.group(1)
         log_ai_audit(user_id, raw_request, "deterministic_tool_selected", canonical_text=explicit_user_command, status="planned", details={"request_id": request_id})
         if await _assistant_apply_runtime_command(update, context, explicit_user_command, user_id):
             return ADMIN_ASSISTANT_COMMAND
@@ -4426,6 +4480,9 @@ async def admin_assistant_command(update: Update, context: ContextTypes.DEFAULT_
         action_steps = _assistant_action_steps(ai_rewrite)
         handled_actions = 0
         for action in action_steps:
+            target_match = re.search(r":(\d+)(?::|$)", action)
+            if target_match:
+                context.user_data["assistant_last_target_id"] = target_match.group(1)
             if await _assistant_apply_reward_command(update, context, action, user_id):
                 handled_actions += 1
                 continue
@@ -5136,16 +5193,37 @@ def _format_user_activity_record(record: dict) -> str:
 
 
 def _format_coin_activity_record(record: dict) -> str:
-    return "\n".join([
+    reason_labels = {
+        "daily_gift": "מתנה יומית", "referral": "תגמול הפניה", "referral_reward": "תגמול הפניה",
+        "coupon_redeemed": "מימוש קופון", "video_purchase": "רכישת סרטונים",
+        "purchase_refund_no_delivery": "החזר על רכישה שלא נשלחה", "manual_admin": "עדכון ידני של מנהל",
+        "assistant": "עדכון דרך העוזר", "system_refund": "החזר מערכת",
+    }
+    source_labels = {
+        "user_coin_purchase": "רכישה על ידי המשתמש", "user_coupon": "מימוש קופון על ידי המשתמש",
+        "referral": "מערכת הפניות", "daily_gift": "מתנה יומית", "manual_admin": "מנהל",
+        "assistant": "עוזר הבוט", "system_refund": "המערכת",
+    }
+    reason = str(record.get("reason") or "לא צוין")
+    source = str(record.get("source") or "לא צוין")
+    status = str(record.get("status") or "success")
+    result = "✅ הצליחה" if status in {"success", "recorded"} else f"❌ {_hebrew_status(status)}"
+    actor = record.get("actor_id")
+    event_id = record.get("id") or record.get("event_id")
+    lines = [
         "━━━━━━━━━━━━━━━━━━━━",
-        f"👤 משתמש: `{record.get('user_id', 'לא ידוע')}`",
-        f"🕐 מתי: {_hebrew_timestamp(record.get('at'))}",
-        "📌 פעולה: פעולת מטבעות",
+        f"👤 משתמש שהושפע: `{record.get('user_id', 'לא ידוע')}`",
+        f"🕐 תאריך ושעה: {_hebrew_timestamp(record.get('at') or record.get('timestamp'))}",
         f"💰 יתרה לפני: {record.get('amount_before', 'לא ידוע')}",
         f"➕/➖ שינוי: {record.get('change', 'לא ידוע')}",
         f"💰 יתרה אחרי: {record.get('amount_after', 'לא ידוע')}",
-        f"📝 סיבה: {record.get('reason', 'לא צוין')}",
-    ])
+        f"📝 סיבת השינוי: {reason_labels.get(reason, reason)}",
+        f"👤/🤖 מקור הפעולה: {source_labels.get(source, source)}",
+        f"👨‍💼 מנהל מבצע: `{actor}`" if actor is not None else "👨‍💼 מנהל מבצע: לא רלוונטי",
+        f"🔗 מזהה אירוע: `{event_id}`" if event_id else "🔗 מזהה אירוע: לא קיים",
+        f"📍 תוצאה: {result}",
+    ]
+    return "\n".join(lines)
 
 
 def _format_activity_record(kind: str, record: dict) -> str:

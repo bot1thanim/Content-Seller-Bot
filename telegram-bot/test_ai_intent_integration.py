@@ -48,6 +48,14 @@ class FakeGeminiResponse:
 
 
 async def run() -> None:
+    assert bot._assistant_explicit_reward_command(bot._assistant_normalize("מעכשיו הפרס היומי יהיה 5")) == "SET_DAILY_GIFT:5"
+    assert bot._assistant_explicit_reward_command(bot._assistant_normalize("תעדכן את הפרס היומי לחמישה")) == "SET_DAILY_GIFT:5"
+    assert bot._assistant_explicit_reward_command(bot._assistant_normalize("שים 3 מטבעות על כל הזמנה")) == "SET_REFERRAL_REWARD:3"
+    assert bot._assistant_explicit_user_lookup_command(bot._assistant_normalize("תבדוק לי את 123456")) == "GET_USER:123456"
+    assert bot._assistant_explicit_user_lookup_command(bot._assistant_normalize("כמה מטבעות יש ל-123456?")) == "GET_USER_BALANCE:123456"
+    contextual = SimpleNamespace(user_data={"assistant_last_target_id": "123456"})
+    assert bot._assistant_contextual_user_command(bot._assistant_normalize("וכמה הוא קיבל לאחרונה?"), contextual) == "GET_USER_HISTORY:123456"
+
     old_key = os.environ.get("OPENAI_API_KEY")
     old_gemini_key = os.environ.get("GEMINI_API_KEY")
     old_urlopen = bot.urllib.request.urlopen
