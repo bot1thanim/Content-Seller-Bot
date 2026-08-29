@@ -52,6 +52,21 @@ class FailingDocumentBot(FakeBot):
         raise RuntimeError("document delivery failed")
 
 
+class FakeDownloadedFile:
+    def __init__(self, payload):
+        self.payload = payload
+    async def download_to_memory(self, out):
+        out.write(self.payload)
+
+
+class RestoreBot(FakeBot):
+    def __init__(self, payload):
+        super().__init__()
+        self.payload = payload
+    async def get_file(self, file_id):
+        return FakeDownloadedFile(self.payload)
+
+
 class FakeMessage:
     def __init__(self, text):
         self.text = text
@@ -83,6 +98,14 @@ class FakeQuery:
 class FakeUpdate:
     def __init__(self, data, user_id):
         self.callback_query = FakeQuery(data, user_id)
+        self.effective_user = SimpleNamespace(id=user_id)
+
+
+class RestoreUpdate:
+    def __init__(self, user_id, payload, file_name="backup.zip"):
+        message = FakeMessage("")
+        message.document = SimpleNamespace(file_id="restore-file", file_name=file_name, file_size=len(payload))
+        self.message = message
         self.effective_user = SimpleNamespace(id=user_id)
 
 
@@ -528,6 +551,56 @@ async def run():
         assert restore_payloads["videos.json"][0]["category"] == "רנדומלי"
         assert "רנדומלי" in restore_payloads["settings.json"]["categories"]
         assert "כללי" not in restore_payloads["settings.json"]["categories"]
+
+        # Full backup -> validation -> restore is exercised on temporary data only.
+        write(bot.USERS_FILE, {"77": {"first_name": "Before"}})
+        full_backup = bot.build_zip_of_data().getvalue()
+        full_payloads = bot.parse_restore_archive(full_backup)
+        write(bot.USERS_FILE, {"77": {"first_name": "Changed"}, "88": {"first_name": "Extra"}})
+        bot.apply_restore_payloads(full_payloads)
+        assert bot.load_json(bot.USERS_FILE) == full_payloads["users.json"]
+        assert bot.restore_summary(full_payloads)
+        try:
+            bot.parse_restore_archive(b"not-a-zip")
+        except zipfile.BadZipFile:
+            pass
+        else:
+            raise AssertionError("corrupt ZIP must be rejected")
+        invalid_archive = io.BytesIO()
+        with zipfile.ZipFile(invalid_archive, "w", zipfile.ZIP_DEFLATED) as archive:
+            archive.writestr("videos.json", "not-json")
+        try:
+            bot.parse_restore_archive(invalid_archive.getvalue())
+        except ValueError as exc:
+            assert "videos.json" in str(exc) and "JSON" in str(exc)
+        else:
+            raise AssertionError("invalid JSON backup must be rejected")
+
+        # Telegram download/preview path accepts a valid ZIP and keeps data untouched.
+        restore_update = RestoreUpdate(owner, full_backup)
+        restore_update.message = FakeMessage("")
+        restore_update.message.document = SimpleNamespace(file_id="restore-file", file_name="backup.zip", file_size=len(full_backup))
+        restore_context = SimpleNamespace(bot=RestoreBot(full_backup), user_data={})
+        assert await bot.admin_restore_receive(restore_update, restore_context) == bot.ADMIN_RESTORE_CONFIRM
+        assert restore_context.user_data["pending_restore"]
+        assert any("תצוגה מקדימה" in text for text, _ in restore_update.message.replies)
+        write(bot.USERS_FILE, {"77": {"first_name": "Changed after preview"}, "88": {"first_name": "Extra"}})
+        apply_update = FakeUpdate("admin_restore_apply", owner)
+        apply_context = SimpleNamespace(bot=RestoreBot(full_backup), user_data={"pending_restore": full_payloads})
+        assert await bot.admin_restore_apply(apply_update, apply_context) == bot.ConversationHandler.END
+        assert bot.load_json(bot.USERS_FILE) == full_payloads["users.json"]
+        assert "השחזור הושלם בהצלחה" in apply_update.callback_query.edits[-1][0]
+        assert apply_context.user_data.get("pending_restore") is None
+        assert apply_context.bot.sent_documents, "Restore must deliver the emergency backup before writing"
+        bad_update = RestoreUpdate(owner, b"not-a-zip")
+        bad_context = SimpleNamespace(bot=RestoreBot(b"not-a-zip"), user_data={})
+        assert await bot.admin_restore_receive(bad_update, bad_context) == bot.ADMIN_RESTORE
+        assert any("ZIP פגום" in text for text, _ in bad_update.message.replies)
+
+        # A cancelled restore clears pending state and does not write data.
+        cancel_context = SimpleNamespace(user_data={"pending_restore": full_payloads})
+        await bot.admin_restore_start(FakeUpdate("admin_restore", owner), cancel_context)
+        assert "pending_restore" not in cancel_context.user_data
 
         # Duplicate-review marks are preserved both in old settings and in the dedicated backup file.
         reviewed_signature = "reviewed-group-signature"

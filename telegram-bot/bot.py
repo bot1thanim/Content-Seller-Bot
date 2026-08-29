@@ -386,7 +386,7 @@ def restore_summary(payloads: dict) -> str:
     parts = []
     for filename, data in payloads.items():
         count = len(data) if isinstance(data, (list, dict)) else 0
-        parts.append(f"• {labels[filename]}: {count}")
+        parts.append(f"• {labels.get(filename, filename)}: {count}")
     return "\n".join(parts)
 
 
@@ -8846,7 +8846,11 @@ async def admin_restore_receive(update: Update, context: ContextTypes.DEFAULT_TY
         tg_file = await context.bot.get_file(doc.file_id)
         buf = io.BytesIO()
         await tg_file.download_to_memory(buf)
-        payloads = parse_restore_archive(buf.getvalue())
+        buf.seek(0)
+        raw_archive = buf.read()
+        if not raw_archive:
+            raise ValueError("קובץ הגיבוי שהתקבל ריק.")
+        payloads = parse_restore_archive(raw_archive)
         context.user_data["pending_restore"] = payloads
         await update.message.reply_text(
             "🔎 *תצוגה מקדימה של הגיבוי*\n\n"
@@ -8865,7 +8869,9 @@ async def admin_restore_receive(update: Update, context: ContextTypes.DEFAULT_TY
         await update.message.reply_text(f"❌ הגיבוי לא התקבל: {exc}")
     except Exception as exc:
         logger.exception("Backup preview failed")
-        await update.message.reply_text("❌ אירעה שגיאה בבדיקת הגיבוי. הנתונים לא שונו.")
+        safe_reason = str(exc).strip() or "סיבה לא ידועה"
+        safe_reason = re.sub(r"(?:/|\\\\)[^\\s]+", "<נתיב>", safe_reason)
+        await update.message.reply_text(f"❌ לא ניתן לבדוק את הגיבוי: {safe_reason}. הנתונים לא שונו.")
     return ADMIN_RESTORE
 
 
@@ -8882,6 +8888,15 @@ async def admin_restore_apply(update: Update, context: ContextTypes.DEFAULT_TYPE
         )
         return ConversationHandler.END
 
+    original_payloads = {}
+    missing_before_restore = set()
+    for filename in payloads:
+        filepath = DATA_DIR / filename
+        if filepath.exists():
+            original_payloads[filename] = load_json(filepath)
+        else:
+            missing_before_restore.add(filename)
+    restore_started = False
     try:
         auto_snapshot = create_auto_backup("restore_data", query.from_user.id)
         if not auto_snapshot:
@@ -8894,7 +8909,12 @@ async def admin_restore_apply(update: Update, context: ContextTypes.DEFAULT_TYPE
             filename=f"before_restore_{stamp}.zip",
             caption="💾 גיבוי חירום אוטומטי לפני שחזור",
         )
+        restore_started = True
         apply_restore_payloads(payloads)
+        for filename, expected in payloads.items():
+            actual = load_json(DATA_DIR / filename)
+            if actual != expected:
+                raise RuntimeError(f"אימות השחזור נכשל בקובץ {filename}.")
         log_admin_action(query.from_user.id, "backup_restored", {"files": sorted(payloads.keys())})
         context.user_data.pop("pending_restore", None)
         await query.edit_message_text(
@@ -8904,10 +8924,20 @@ async def admin_restore_apply(update: Update, context: ContextTypes.DEFAULT_TYPE
             parse_mode="Markdown",
             reply_markup=get_admin_inline_keyboard(),
         )
-    except Exception:
+    except Exception as exc:
+        if restore_started:
+            try:
+                for filename, previous in original_payloads.items():
+                    save_json(DATA_DIR / filename, previous)
+                for filename in missing_before_restore:
+                    (DATA_DIR / filename).unlink(missing_ok=True)
+            except Exception:
+                logger.exception("Backup rollback failed")
         logger.exception("Backup restore failed")
+        safe_reason = str(exc).strip() or "סיבה לא ידועה"
+        safe_reason = re.sub(r"(?:/|\\\\)[^\\s]+", "<נתיב>", safe_reason)
         await query.edit_message_text(
-            "❌ אירעה שגיאה בשחזור. הנתונים לא אושרו כהושלמו; השתמש בגיבוי החירום שנשלח לפני הפעולה אם נדרש.",
+            f"❌ השחזור נכשל: {safe_reason}. הנתונים הוחזרו למצב שהיה לפני ניסיון השחזור; השתמש בגיבוי החירום שנשלח לפני הפעולה אם נדרש.",
             reply_markup=get_admin_inline_keyboard(),
         )
     return ConversationHandler.END
