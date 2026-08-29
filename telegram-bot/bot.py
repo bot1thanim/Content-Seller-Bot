@@ -662,6 +662,8 @@ def callback_permission(callback_data: str) -> str | None:
     """Map private callback data to its required permission; None means owner-only/unknown."""
     if callback_data in {"admin_panel", "back_admin"}:
         return "panel"
+    if callback_data == "admin_logs_menu":
+        return "audit_log"
     if callback_data in {"admin_owner_assistant_settings", "admin_daily_report"}:
         return "owner"
     if callback_data in {"admin_assistant", "admin_assistant_back"} or callback_data.startswith("assistant_"):
@@ -1679,7 +1681,7 @@ def get_admin_inline_keyboard(user_id: int = ADMIN_ID):
     add("coins", [InlineKeyboardButton("🪙 מטבעות", callback_data="admin_coins_menu")])
 
     if has_admin_permission(user_id, "audit_log"):
-        rows.append([InlineKeyboardButton("📋 יומני פעילות", callback_data="admin_activity_center")])
+        rows.append([InlineKeyboardButton("📚 יומנים", callback_data="admin_logs_menu")])
 
     # Advanced tools added after the original panel are kept together here.
     advanced_permissions = {"audit_log", "backup", "dangerous_delete"}
@@ -1785,14 +1787,11 @@ async def admin_menu_system(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await query.answer()
     user_id = query.from_user.id
     rows = []
-    if has_admin_permission(user_id, "audit_log"):
-        rows.append([InlineKeyboardButton("📜 יומן פעולות", callback_data="admin_actions_page_0")])
     if has_admin_permission(user_id, "backup"):
         rows.append([InlineKeyboardButton("💾 גיבוי ZIP", callback_data="admin_backup"), InlineKeyboardButton("📥 שחזור גיבוי", callback_data="admin_restore")])
     if has_admin_permission(user_id, "dangerous_delete"):
         rows.append([InlineKeyboardButton("🔄 איפוס נתונים", callback_data="admin_global_reset"), InlineKeyboardButton("🧹 מחק סרטונים", callback_data="admin_delete")])
     if is_owner(user_id):
-        rows.append([InlineKeyboardButton("📜 מרכז Audit", callback_data="admin_audit_center")])
         rows.append([InlineKeyboardButton("👑 ניהול מנהלים", callback_data="admin_managers")])
     rows.append(_back_to_admin_row())
     await query.edit_message_text("⚙️ *מערכת, גיבויים וכלים מתקדמים*\n\nבחר פעולה:", parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(rows))
@@ -5239,6 +5238,26 @@ def _format_activity_record(kind: str, record: dict) -> str:
     return _format_admin_action_record(record)
 
 
+async def admin_logs_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Unified entry point for the existing user activity, admin action and Audit logs."""
+    query = update.callback_query
+    await query.answer()
+    user_id = query.from_user.id
+    if not _activity_access(user_id):
+        return
+    rows = [[InlineKeyboardButton("👤 יומני פעילות", callback_data="admin_activity_center")]]
+    if has_admin_permission(user_id, "audit_log"):
+        rows.append([InlineKeyboardButton("🛡️ יומן פעולות", callback_data="admin_actions_page_0")])
+    if is_owner(user_id):
+        rows.append([InlineKeyboardButton("🔎 מרכז Audit", callback_data="admin_audit_center")])
+    rows.append([InlineKeyboardButton("🔙 חזרה לפאנל", callback_data="back_admin")])
+    await query.edit_message_text(
+        "📚 *יומנים*\n\nבחר את היומן שברצונך לפתוח. ההרשאות של כל יומן נשמרו כפי שהיו.",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(rows),
+    )
+
+
 async def admin_activity_center(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -5246,9 +5265,9 @@ async def admin_activity_center(update: Update, context: ContextTypes.DEFAULT_TY
         return
     counts = {kind: len(_activity_records(kind)) for kind in ACTIVITY_CENTER_LABELS}
     rows = [[InlineKeyboardButton(f"{label} ({counts[kind]})", callback_data=f"admin_activity_{kind}_0")] for kind, label in ACTIVITY_CENTER_LABELS.items()]
-    rows.append([InlineKeyboardButton("🔙 חזרה לפאנל", callback_data="back_admin")])
+    rows.append([InlineKeyboardButton("🔙 חזרה ליומנים", callback_data="admin_logs_menu")])
     await query.edit_message_text(
-        "📋 *יומני פעילות*\n\nמרכז מאוחד להצגת פעילות חשובה. בחר סוג יומן להצגה.\n\nהרשומות מוצגות בעברית ואינן כוללות סודות או payload גולמי.",
+        "👤 *יומני פעילות*\n\nמרכז מאוחד להצגת פעילות חשובה. בחר סוג יומן להצגה.\n\nהרשומות מוצגות בעברית ואינן כוללות סודות או payload גולמי.",
         parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup(rows),
     )
@@ -5481,7 +5500,7 @@ async def admin_audit_center(update: Update, context: ContextTypes.DEFAULT_TYPE)
         [InlineKeyboardButton(f"{AUDIT_FILTER_LABELS['dangerous']} ({counts['dangerous']})", callback_data="admin_audit_dangerous_0")],
         [InlineKeyboardButton(f"{AUDIT_FILTER_LABELS['coins']} ({counts['coins']})", callback_data="admin_audit_coins_0"), InlineKeyboardButton(f"{AUDIT_FILTER_LABELS['messages']} ({counts['messages']})", callback_data="admin_audit_messages_0")],
         [InlineKeyboardButton("🔎 חיפוש וסינון מתקדם", callback_data="admin_audit_search")],
-        [_back_to_admin_row()[0]],
+        [InlineKeyboardButton("🔙 חזרה ליומנים", callback_data="admin_logs_menu")],
     ]
     await query.edit_message_text(
         "📜 *מרכז Audit*\n\nבחר סוג פעילות להצגה. הרשומות נשמרות בנתוני הבוט ואינן נמחקות בניקוי רגיל.",
@@ -5543,7 +5562,7 @@ async def admin_actions_page(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if not isinstance(records, list) or not records:
         await query.edit_message_text(
             "📜 יומן הפעולות עדיין ריק.",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 חזרה", callback_data="back_admin")]]),
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 חזרה ליומנים", callback_data="admin_logs_menu")]]),
         )
         return
     newest_first = list(reversed(records))
@@ -5566,7 +5585,7 @@ async def admin_actions_page(update: Update, context: ContextTypes.DEFAULT_TYPE)
         parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup([
             navigation,
-            [InlineKeyboardButton("🔙 חזרה", callback_data="back_admin")],
+            [InlineKeyboardButton("🔙 חזרה ליומנים", callback_data="admin_logs_menu")],
         ]),
     )
 
@@ -9571,6 +9590,7 @@ def main():
         ("^admin_mgr_remove$",           admin_manager_remove),
         ("^admin_stats$",               admin_stats),
         ("^admin_daily_report$",        send_owner_daily_report),
+        ("^admin_logs_menu$",            admin_logs_menu),
         ("^admin_activity_center$",     admin_activity_center),
         (r"^admin_activity_(users|admins|ai|coins|audit|blocked|system)_\d+$", admin_activity_page),
         (r"^admin_activity_event_(users|admins|ai|coins|audit|blocked|system)_\d+_\d+$", admin_activity_event),

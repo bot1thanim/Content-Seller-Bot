@@ -140,16 +140,19 @@ async def run():
         assert bot._assistant_live_answer("כמה סרטונים יש במאגר?", owner) == "🎬 כרגע יש *4* סרטונים במאגר."
         assert bot._assistant_live_answer("כמה סרטונים יש במאגר?", 12345) is None
 
-        # The unified activity center exposes every required log family and human-readable user events.
+        # The unified logs menu exposes the three existing journals without creating a new log.
         owner_markup = bot.get_admin_inline_keyboard(owner)
-        assert "admin_activity_center" in button_callbacks(owner_markup), "Owner panel must expose unified activity logs"
-        center_query = FakeQuery("admin_activity_center", owner)
-        await bot.admin_activity_center(FakeUpdate("admin_activity_center", owner), SimpleNamespace())
-        center_buttons = button_callbacks(center_query) if hasattr(center_query, "inline_keyboard") else []
+        assert "admin_logs_menu" in button_callbacks(owner_markup), "Owner panel must expose the unified logs menu"
+        logs_update = FakeUpdate("admin_logs_menu", owner)
+        await bot.admin_logs_menu(logs_update, SimpleNamespace())
+        logs_markup = logs_update.callback_query.edits[-1][1]["reply_markup"]
+        assert button_callbacks(logs_markup)[:3] == ["admin_activity_center", "admin_actions_page_0", "admin_audit_center"]
+        assert button_callbacks(logs_markup)[-1] == "back_admin"
         activity_update = FakeUpdate("admin_activity_center", owner)
         await bot.admin_activity_center(activity_update, SimpleNamespace())
         center_markup = activity_update.callback_query.edits[-1][1]["reply_markup"]
         center_callbacks = button_callbacks(center_markup)
+        assert center_callbacks[-1] == "admin_logs_menu"
         for kind in ("users", "admins", "ai", "coins", "audit", "blocked", "system"):
             assert f"admin_activity_{kind}_0" in center_callbacks, f"Missing unified activity log: {kind}"
         users_activity_update = FakeUpdate("admin_activity_users_0", owner)
@@ -642,7 +645,7 @@ async def run():
             "broadcast": (["admin_broadcast"], "admin_backup"),
             "coins": (["admin_coins_menu"], "admin_backup"),
             "maintenance": (["admin_maintenance"], "admin_backup"),
-            "audit_log": (["admin_activity_center", "admin_menu_system"], "admin_backup"),
+            "audit_log": (["admin_logs_menu", "admin_menu_system"], "admin_backup"),
             "backup": (["admin_menu_system"], "admin_delete"),
             "dangerous_delete": (["admin_menu_system"], "admin_backup"),
             "assistant": (["admin_assistant"], "admin_backup"),
@@ -871,7 +874,8 @@ async def run():
         owner_system = FakeUpdate("admin_menu_system", owner)
         await bot.admin_menu_system(owner_system, SimpleNamespace())
         owner_system_buttons = button_callbacks(owner_system.callback_query.edits[-1][1]["reply_markup"])
-        assert {"admin_actions_page_0", "admin_backup", "admin_global_reset", "admin_audit_center", "admin_managers"}.issubset(owner_system_buttons)
+        assert {"admin_backup", "admin_global_reset", "admin_managers"}.issubset(owner_system_buttons)
+        assert "admin_actions_page_0" not in owner_system_buttons and "admin_audit_center" not in owner_system_buttons
         assert await gate_allows("admin_managers", owner)
 
         # Coupon referral conditions distinguish all-time referrals from referrals after creation.
@@ -962,6 +966,10 @@ async def run():
         await bot.admin_audit_center(audit_center, SimpleNamespace(user_data={}))
         audit_buttons = button_callbacks(audit_center.callback_query.edits[-1][1]["reply_markup"])
         assert "admin_audit_all_0" in audit_buttons and "admin_audit_blocked_0" in audit_buttons
+        assert audit_buttons[-1] == "admin_logs_menu"
+        actions_update = FakeUpdate("admin_actions_page_0", owner)
+        await bot.admin_actions_page(actions_update, SimpleNamespace(user_data={}))
+        assert button_callbacks(actions_update.callback_query.edits[-1][1]["reply_markup"])[-1] == "admin_logs_menu"
         blocked_audit = FakeUpdate("admin_audit_blocked_0", owner)
         await bot.admin_audit_filtered_page(blocked_audit, SimpleNamespace(user_data={}))
         assert "נחסמה" in blocked_audit.callback_query.edits[-1][0]
@@ -981,6 +989,8 @@ async def run():
         assert "Replay" in replay_update.callback_query.edits[-1][0] and "42" in replay_update.callback_query.edits[-1][0]
         assert bot._safe_audit_replay_command("ADJUST_COINS:77:+2") is None
         assert not await gate_allows("admin_audit_center", 12345)
+        assert await gate_allows("admin_logs_menu", owner)
+        assert await gate_allows("admin_logs_menu", 12345) if bot.has_admin_permission(12345, "audit_log") else not await gate_allows("admin_logs_menu", 12345)
 
         bot.save_json(bot.COIN_TRANSACTIONS_FILE, [])
         bot.log_coin_transaction("55", 6, -2, 4, reason="test_purchase", source="test", actor_id=owner)
