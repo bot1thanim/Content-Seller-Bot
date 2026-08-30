@@ -6949,6 +6949,7 @@ async def admin_search_size_start(update: Update, context: ContextTypes.DEFAULT_
         encoded = "unknown" if size_bytes is None else str(size_bytes)
         label = "גודל לא ידוע" if size_bytes is None else format_file_size(size_bytes)
         buttons.append([InlineKeyboardButton(f"💾 {label} — {len(group)}", callback_data=f"admin_size_group_{encoded}")])
+    buttons.append([InlineKeyboardButton("🔙 חזרה לחיפוש", callback_data="admin_search_size_start")])
     buttons.append([InlineKeyboardButton("🔙 חזרה לגלריה", callback_data="admin_gallery")])
     await query.edit_message_text(
         "💾 *סינון סרטונים לפי גודל קובץ*\\n\\n"
@@ -6998,7 +6999,7 @@ async def admin_search_size_group(update: Update, context: ContextTypes.DEFAULT_
         chat_id=query.message.chat_id,
         text=f"✅ הסתיימה שליחת קבוצת {label} ({success}/{len(results)} נשלחו).",
         reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("💾 חזרה לקבוצות הגדלים", callback_data="admin_search_size_start")],
+            [InlineKeyboardButton("🔙 חזרה לחיפוש", callback_data="admin_search_size_start")],
             [InlineKeyboardButton("🔙 חזרה לגלריה", callback_data="admin_gallery")],
         ]),
     )
