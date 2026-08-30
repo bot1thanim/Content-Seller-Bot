@@ -5754,13 +5754,13 @@ async def admin_gallery(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ])
     if has_admin_permission(user_id, "category_manage"):
         keyboard.append([InlineKeyboardButton("🏷 קטגוריות", callback_data="admin_categories")])
-    if has_admin_permission(user_id, "gallery_repair"):
-        keyboard.append([InlineKeyboardButton("🛠 תיקון מזהים שבורים", callback_data="admin_repair_start")])
+    if has_admin_permission(user_id, "gallery_repair") and has_admin_permission(user_id, "duplicate_review"):
+        keyboard.append([InlineKeyboardButton("🔄 מצא כפילויות מחדש", callback_data="admin_dup_rescan")])
     if has_admin_permission(user_id, "duplicate_review"):
-        keyboard.append([
-            InlineKeyboardButton("🔎 מצא כפילויות", callback_data="admin_dup_scan"),
-            InlineKeyboardButton("🔄 מצא כפילויות מחדש", callback_data="admin_dup_rescan"),
-        ])
+        duplicate_row = [InlineKeyboardButton("🔎 מצא כפילויות", callback_data="admin_dup_scan")]
+        if has_admin_permission(user_id, "gallery_browse"):
+            duplicate_row.append(InlineKeyboardButton("💾 לפי גודל", callback_data="admin_search_size_start"))
+        keyboard.append(duplicate_row)
     if has_admin_permission(user_id, "recycle_bin"):
         keyboard.append([InlineKeyboardButton("🗑 סל מיחזור", callback_data="admin_trash_page_0")])
     keyboard.append([InlineKeyboardButton("🔙 חזור לפאנל", callback_data="back_admin")])
@@ -5814,7 +5814,7 @@ async def admin_gallery_page(update: Update, context: ContextTypes.DEFAULT_TYPE,
         [InlineKeyboardButton("🔢 חיפוש לפי מספר", callback_data="admin_video_search")],
         [
             InlineKeyboardButton("⏱ חיפוש לפי זמן", callback_data="admin_search_sec_start"),
-            InlineKeyboardButton("💾 חיפוש לפי גודל", callback_data="admin_search_size_start"),
+            InlineKeyboardButton("💾 לפי גודל", callback_data="admin_search_size_start"),
         ],
         [InlineKeyboardButton("🔎 חיפוש משולב", callback_data="admin_combined_search")],
         [InlineKeyboardButton("⭐ הסר ממועדפים" if is_favorite else "☆ סמן כמועדף", callback_data=f"fav_toggle_{v['entry_id']}")],
@@ -6913,7 +6913,7 @@ async def admin_video_search_input(update: Update, context: ContextTypes.DEFAULT
             [InlineKeyboardButton("🔢 חיפוש לפי מספר", callback_data="admin_video_search")],
             [
                 InlineKeyboardButton("⏱ חיפוש לפי זמן", callback_data="admin_search_sec_start"),
-                InlineKeyboardButton("💾 חיפוש לפי גודל", callback_data="admin_search_size_start"),
+                InlineKeyboardButton("💾 לפי גודל", callback_data="admin_search_size_start"),
             ],
         ]),
     )

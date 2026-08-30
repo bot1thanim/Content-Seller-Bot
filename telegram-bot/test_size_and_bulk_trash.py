@@ -51,6 +51,20 @@ async def run():
     assert bot.callback_permission("admin_size_group_2048") == "gallery_browse"
     assert bot.callback_permission("admin_trash_bulk_apply_empty") == "recycle_bin"
 
+    # Build the actual admin gallery keyboard and verify the visible UI layout.
+    root_query = FakeQuery("admin_gallery")
+    await bot.admin_gallery(SimpleNamespace(callback_query=root_query), SimpleNamespace(user_data={}))
+    root_markup = root_query.edits[-1][1]["reply_markup"]
+    root_rows = [[(button.text, button.callback_data) for button in row] for row in root_markup.inline_keyboard]
+    callbacks = [callback for row in root_rows for _, callback in row]
+    labels = [text for row in root_rows for text, _ in row]
+    assert "admin_search_size_start" in callbacks
+    assert "🛠 תיקון מזהים שבורים" not in labels
+    assert "admin_repair_start" not in callbacks
+    assert "admin_dup_rescan" in callbacks
+    size_row = next(row for row in root_rows if any(callback == "admin_search_size_start" for _, callback in row))
+    assert size_row == [("🔎 מצא כפילויות", "admin_dup_scan"), ("💾 לפי גודל", "admin_search_size_start")]
+
     with TemporaryDirectory() as temp:
         root = Path(temp)
         bot.DATA_DIR = root
