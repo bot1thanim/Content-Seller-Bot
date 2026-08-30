@@ -19,6 +19,7 @@ class FakeQuery:
         self.data = data
         self.from_user = SimpleNamespace(id=user_id, first_name="tester")
         self.edits = []
+        self.message = SimpleNamespace(chat_id=123)
 
     async def answer(self, *args, **kwargs):
         return None
@@ -31,19 +32,34 @@ def update_for(data: str) -> SimpleNamespace:
     return SimpleNamespace(callback_query=FakeQuery(data))
 
 
+class FakeBot:
+    async def send_message(self, **kwargs):
+        return SimpleNamespace(message_id=900)
+
+    async def delete_message(self, **kwargs):
+        return None
+
+
+async def fake_send_duplicate_group_media(context, group, chat_id):
+    context.user_data["dup_sent_media_message_ids"] = [101, 102]
+    context.user_data["admin_preview_chat_id"] = chat_id
+    return len(group), 0
+
+
 async def run():
     bot.has_admin_permission = lambda user_id, permission: True
     bot.get_admin_inline_keyboard = lambda: None
 
-    sizes = bot.build_video_file_size_groups([
-        {"entry_id": "a", "file_size": 200 * 1024},
-        {"entry_id": "b", "file_size": 500 * 1024},
-        {"entry_id": "c", "file_size": 2 * 1024 * 1024},
-        {"entry_id": "d", "file_size": 2 * 1024 * 1024},
+    bot.load_videos_with_entry_ids = lambda: [
+        {"entry_id": "a", "file_size": 200 * 1024, "duration": 1},
+        {"entry_id": "b", "file_size": 500 * 1024, "duration": 2},
+        {"entry_id": "c", "file_size": 2 * 1024 * 1024, "duration": 3},
+        {"entry_id": "d", "file_size": 2 * 1024 * 1024, "duration": 4},
         {"entry_id": "e"},
-    ])
-    assert list(sizes) == [200 * 1024, 500 * 1024, 2 * 1024 * 1024, None]
-    assert [len(sizes[key]) for key in sizes] == [1, 1, 2, 1]
+    ]
+    sizes = bot.find_duplicate_size_groups()
+    assert len(sizes) == 1
+    assert [item["entry_id"] for item in sizes[0]] == ["c", "d"]
     assert bot.format_file_size(200 * 1024) == "200KB"
     assert bot.format_file_size(2 * 1024 * 1024) == "2MB"
     assert bot.format_file_size(None) == "גודל לא ידוע"
@@ -64,6 +80,16 @@ async def run():
     assert "admin_dup_rescan" in callbacks
     size_row = next(row for row in root_rows if any(callback == "admin_search_size_start" for _, callback in row))
     assert size_row == [("🔎 מצא כפילויות", "admin_dup_scan"), ("💾 לפי גודל", "admin_search_size_start")]
+
+    original_sender = bot.send_duplicate_group_media
+    bot.send_duplicate_group_media = fake_send_duplicate_group_media
+    size_query = FakeQuery("admin_search_size_start")
+    size_context = SimpleNamespace(user_data={}, bot=FakeBot())
+    await bot.admin_search_size_start(SimpleNamespace(callback_query=size_query), size_context)
+    assert "קבוצת גודל (1/1)" in size_query.edits[-1][0]
+    assert "מספר סרטונים בקבוצה: 2" in size_query.edits[-1][0]
+    assert size_context.user_data["size_review_control_message_id"] == 900
+    bot.send_duplicate_group_media = original_sender
 
     with TemporaryDirectory() as temp:
         root = Path(temp)

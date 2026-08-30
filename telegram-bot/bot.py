@@ -726,7 +726,7 @@ def callback_permission(callback_data: str) -> str | None:
         return "dashboard"
     if callback_data.startswith("admin_problem"):
         return "dashboard"
-    if callback_data.startswith(("vid_", "fav_", "admin_favorites", "admin_video_search", "admin_search_sec", "admin_search_size", "admin_size_group", "admin_combined_search")):
+    if callback_data.startswith(("vid_", "fav_", "admin_favorites", "admin_video_search", "admin_search_sec", "admin_search_size", "admin_size_group", "size_group_", "admin_combined_search")):
         return "gallery_browse"
     if callback_data.startswith(("admin_categories", "admin_cat_", "cat_")):
         return "category_manage"
@@ -6922,87 +6922,121 @@ async def admin_video_search_input(update: Update, context: ContextTypes.DEFAULT
 # ─── Admin: video search by file size ──────────────────────────────────────────
 
 
-def build_video_file_size_groups(videos: list[dict]) -> dict[int | None, list[dict]]:
-    """Group videos by the exact stored byte count; missing sizes share an unknown group."""
-    groups: dict[int | None, list[dict]] = {}
-    for video in videos:
-        if isinstance(video, dict):
-            groups.setdefault(video_file_size_key(video), []).append(video)
-    return dict(sorted(groups.items(), key=lambda item: (item[0] is None, item[0] or 0)))
+def find_duplicate_size_groups() -> list[list[dict]]:
+    """Find groups of two or more videos with the same exact known byte count."""
+    groups: dict[int, list[dict]] = {}
+    for video in load_videos_with_entry_ids():
+        size_bytes = video_file_size_key(video)
+        if size_bytes is not None:
+            groups.setdefault(size_bytes, []).append(video)
+    duplicate_groups = [group for group in groups.values() if len(group) > 1]
+    duplicate_groups.sort(key=lambda group: (video_file_size_key(group[0]) or 0, len(group)))
+    return duplicate_groups
+
+
+async def clear_size_review_control_message(context: ContextTypes.DEFAULT_TYPE) -> bool:
+    user_data = getattr(context, "user_data", None)
+    if not isinstance(user_data, dict):
+        return False
+    message_id = user_data.pop("size_review_control_message_id", None)
+    chat_id = user_data.get("admin_preview_chat_id")
+    if not message_id or not isinstance(chat_id, int):
+        return False
+    try:
+        await context.bot.delete_message(chat_id=chat_id, message_id=message_id)
+        return True
+    except Exception as exc:
+        logger.info("Could not remove prior size-review control message %s: %s", message_id, exc)
+        return False
+
+
+def size_group_keyboard(page: int, total: int) -> InlineKeyboardMarkup:
+    navigation = []
+    if page > 0:
+        navigation.append(InlineKeyboardButton("⬅️ הקודם", callback_data=f"size_group_page_{page - 1}"))
+    navigation.append(InlineKeyboardButton(f"{page + 1}/{total}", callback_data="noop"))
+    if page < total - 1:
+        navigation.append(InlineKeyboardButton("הבא ➡️", callback_data=f"size_group_page_{page + 1}"))
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔁 שלח שוב את הקבוצה", callback_data=f"size_group_send_{page}")],
+        [InlineKeyboardButton("🔙 חזרה לגלריה", callback_data="size_group_back_gallery")],
+        navigation,
+    ])
 
 
 async def admin_search_size_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Scan exact file sizes and open the first duplicate-size group, like duration duplicate review."""
     query = update.callback_query
     await query.answer()
     if not has_admin_permission(query.from_user.id, "gallery"):
         return ConversationHandler.END
-    videos = load_videos_with_entry_ids()
-    groups = build_video_file_size_groups(videos)
+    groups = find_duplicate_size_groups()
+    context.user_data["size_groups"] = groups
     if not groups:
         await query.edit_message_text(
-            "💾 אין סרטונים במאגר.",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 חזרה", callback_data="admin_gallery")]]),
+            "✅ לא נמצאו קבוצות של שני סרטונים או יותר באותו גודל קובץ.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 חזרה לגלריה", callback_data="admin_gallery")]]),
         )
         return
-    buttons = []
-    for size_bytes, group in groups.items():
-        encoded = "unknown" if size_bytes is None else str(size_bytes)
-        label = "גודל לא ידוע" if size_bytes is None else format_file_size(size_bytes)
-        buttons.append([InlineKeyboardButton(f"💾 {label} — {len(group)}", callback_data=f"admin_size_group_{encoded}")])
-    buttons.append([InlineKeyboardButton("🔙 חזרה לחיפוש", callback_data="admin_search_size_start")])
-    buttons.append([InlineKeyboardButton("🔙 חזרה לגלריה", callback_data="admin_gallery")])
-    await query.edit_message_text(
-        "💾 *סינון סרטונים לפי גודל קובץ*\\n\\n"
-        "הקבוצות נבנו מהגדלים הקיימים בפועל במאגר. לא הוגדרו טווחים.",
-        parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup(buttons),
+    await admin_size_group_page(update, context, 0)
+
+
+async def admin_size_group_page(update: Update, context: ContextTypes.DEFAULT_TYPE, page: int = 0):
+    query = update.callback_query
+    had_lower_control = bool(context.user_data.get("size_review_control_message_id"))
+    await clear_sent_duplicate_group_media(context)
+    if had_lower_control:
+        await clear_size_review_control_message(context)
+    groups = context.user_data.get("size_groups", [])
+    if not groups or not (0 <= page < len(groups)):
+        await query.edit_message_text(
+            "✅ אין עוד קבוצות גדלים להצגה.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 חזרה לגלריה", callback_data="admin_gallery")]]),
+        )
+        return
+    group = groups[page]
+    size_bytes = video_file_size_key(group[0])
+    label = format_file_size(size_bytes) if size_bytes is not None else "גודל לא ידוע"
+    if not had_lower_control:
+        await query.edit_message_text(
+            f"💾 *קבוצת גודל ({page + 1}/{len(groups)})*\\n\\n"
+            f"💾 גודל מדויק: {label}\\n"
+            f"👥 מספר סרטונים בקבוצה: {len(group)}\\n\\n"
+            "⏳ שולח את כל סרטוני הקבוצה...",
+            parse_mode="Markdown",
+        )
+    success_count, failed_count = await send_duplicate_group_media(context, group, query.message.chat_id)
+    status = f"✅ נשלחו אוטומטית {success_count}/{len(group)} סרטונים בקבוצת {label}."
+    if failed_count:
+        status += f"\\n⚠️ {failed_count} סרטונים לא נשלחו."
+    lower_control = await context.bot.send_message(
+        chat_id=query.message.chat_id,
+        text=status,
+        reply_markup=size_group_keyboard(page, len(groups)),
     )
+    if lower_control:
+        context.user_data["size_review_control_message_id"] = lower_control.message_id
+        context.user_data["admin_preview_chat_id"] = int(query.message.chat_id)
 
 
-async def admin_search_size_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def admin_size_group_send(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    if not has_admin_permission(query.from_user.id, "gallery"):
-        return ConversationHandler.END
-    raw_size = query.data.removeprefix("admin_size_group_")
-    size_bytes = None if raw_size == "unknown" else int(raw_size) if raw_size.isdigit() else -1
-    if size_bytes == -1:
-        return ConversationHandler.END
-    videos = load_videos_with_entry_ids()
-    results = [video for video in videos if video_file_size_key(video) == size_bytes]
-    results.sort(key=lambda video: (int(video.get("duration", 0) or 0), str(video.get("entry_id", ""))))
-    label = "גודל לא ידוע" if size_bytes is None else format_file_size(size_bytes)
-    if not results:
-        await query.edit_message_text(
-            f"❌ קבוצת {label} אינה זמינה עוד.",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 חזרה לגדלים", callback_data="admin_search_size_start")]]),
-        )
-        return
+    page = int(query.data.removeprefix("size_group_send_"))
+    groups = context.user_data.get("size_groups", [])
+    if 0 <= page < len(groups):
+        await admin_size_group_page(update, context, page)
+    else:
+        await query.answer("הקבוצה כבר אינה זמינה. יש לבצע סריקה מחדש.", show_alert=True)
+
+
+async def admin_size_group_back_gallery(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
     await clear_sent_duplicate_group_media(context)
-    await query.edit_message_text(f"🔎 נמצאו {len(results)} סרטונים בגודל {label}. שולח...")
-    success = 0
-    sent_message_ids = []
-    for video in results:
-        try:
-            sent = await send_admin_video_with_delete_button(
-                context.bot, video["file_id"], video["entry_id"], query.message.chat_id, include_category_assignment=True
-            )
-            if sent and sent != "INVALID_FILE_ID":
-                success += 1
-                sent_message_ids.append(sent.message_id)
-            await asyncio.sleep(0.15)
-        except Exception:
-            logger.exception("Failed to send file-size search result")
-    context.user_data["dup_sent_media_message_ids"] = sent_message_ids
-    context.user_data["admin_preview_chat_id"] = int(query.message.chat_id)
-    await context.bot.send_message(
-        chat_id=query.message.chat_id,
-        text=f"✅ הסתיימה שליחת קבוצת {label} ({success}/{len(results)} נשלחו).",
-        reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("🔙 חזרה לחיפוש", callback_data="admin_search_size_start")],
-            [InlineKeyboardButton("🔙 חזרה לגלריה", callback_data="admin_gallery")],
-        ]),
-    )
+    await clear_size_review_control_message(context)
+    context.user_data.pop("size_groups", None)
+    await admin_gallery(update, context)
 
 
 # ─── Admin: video search by seconds ───────────────────────────────────────────
@@ -9904,7 +9938,9 @@ def main():
         (r"^admin_trash_bulk_(recycle|restore|empty)$", admin_trash_bulk_confirm),
         (r"^admin_trash_bulk_apply_(recycle|restore|empty)$", admin_trash_bulk_apply),
         ("^admin_search_size_start$",   admin_search_size_start),
-        (r"^admin_size_group_(\d+|unknown)$", admin_search_size_group),
+        (r"^size_group_page_\d+$",       lambda update, context: admin_size_group_page(update, context, int(update.callback_query.data.removeprefix("size_group_page_")))),
+        (r"^size_group_send_\d+$",       admin_size_group_send),
+        ("^size_group_back_gallery$",     admin_size_group_back_gallery),
 
         (r"^vid_page_\d+$",             admin_gallery_page),
         (r"^vid_del_\d+$",              admin_gallery_delete),
