@@ -220,6 +220,58 @@ def save_json(filepath, data):
     tmp.replace(filepath)
 
 
+def save_json_bundle_with_rollback(updates: dict[Path, object]) -> None:
+    """Persist several JSON files together and restore originals if a replacement fails."""
+    originals = {}
+    staged = []
+    try:
+        for filepath, data in updates.items():
+            filepath = Path(filepath)
+            originals[filepath] = filepath.read_bytes() if filepath.exists() else None
+            tmp = Path(f"{filepath}.bulk-{uuid.uuid4().hex}.tmp")
+            with open(tmp, "w", encoding="utf-8") as handle:
+                json.dump(data, handle, ensure_ascii=False, indent=2)
+            staged.append((tmp, filepath))
+        for tmp, filepath in staged:
+            tmp.replace(filepath)
+    except Exception:
+        for tmp, _ in staged:
+            tmp.unlink(missing_ok=True)
+        for filepath, raw in originals.items():
+            try:
+                rollback_tmp = Path(f"{filepath}.rollback-{uuid.uuid4().hex}.tmp")
+                if raw is None:
+                    filepath.unlink(missing_ok=True)
+                else:
+                    rollback_tmp.write_bytes(raw)
+                    rollback_tmp.replace(filepath)
+            except Exception:
+                logger.exception("Failed to roll back JSON file %s", filepath)
+        raise
+
+
+def format_file_size(size_bytes: object) -> str:
+    """Format a real byte count for display without inventing a value."""
+    if not isinstance(size_bytes, (int, float)) or isinstance(size_bytes, bool) or size_bytes < 0:
+        return "גודל לא ידוע"
+    size = float(size_bytes)
+    units = ((1024 ** 3, "GB"), (1024 ** 2, "MB"), (1024, "KB"))
+    for factor, label in units:
+        if size >= factor:
+            value = size / factor
+            formatted = f"{value:.2f}".rstrip("0").rstrip(".")
+            return f"{formatted}{label}"
+    return f"{int(size)} B"
+
+
+def video_file_size_key(video: dict) -> int | None:
+    """Return the exact stored Telegram file size, or None when it is unavailable."""
+    value = video.get("file_size") if isinstance(video, dict) else None
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or value < 0:
+        return None
+    return int(value)
+
+
 DEFAULT_CATEGORY = "רנדומלי"
 LEGACY_DEFAULT_CATEGORY = "כללי"
 
@@ -674,7 +726,7 @@ def callback_permission(callback_data: str) -> str | None:
         return "dashboard"
     if callback_data.startswith("admin_problem"):
         return "dashboard"
-    if callback_data.startswith(("vid_", "fav_", "admin_favorites", "admin_video_search", "admin_search_sec", "admin_combined_search")):
+    if callback_data.startswith(("vid_", "fav_", "admin_favorites", "admin_video_search", "admin_search_sec", "admin_search_size", "admin_size_group", "admin_combined_search")):
         return "gallery_browse"
     if callback_data.startswith(("admin_categories", "admin_cat_", "cat_")):
         return "category_manage"
@@ -5746,6 +5798,7 @@ async def admin_gallery_page(update: Update, context: ContextTypes.DEFAULT_TYPE,
 ⏱ אורך: {format_duration(v.get('duration', 0))}
 📤 נשלח: {int(v.get('sent_count', 0) or 0)} פעמים
 📅 נוסף: {added_at}
+💾 גודל: {format_file_size(video_file_size_key(v)) if video_file_size_key(v) is not None else 'גודל לא ידוע'}
 ✅ סטטוס: {status}
 {'⭐ מסומן כמועדף' if is_favorite else ''}"""
     
@@ -5758,9 +5811,10 @@ async def admin_gallery_page(update: Update, context: ContextTypes.DEFAULT_TYPE,
         
     btns = [
         nav,
+        [InlineKeyboardButton("🔢 חיפוש לפי מספר", callback_data="admin_video_search")],
         [
-            InlineKeyboardButton("🔢 חיפוש לפי מספר", callback_data="admin_video_search"),
             InlineKeyboardButton("⏱ חיפוש לפי זמן", callback_data="admin_search_sec_start"),
+            InlineKeyboardButton("💾 חיפוש לפי גודל", callback_data="admin_search_size_start"),
         ],
         [InlineKeyboardButton("🔎 חיפוש משולב", callback_data="admin_combined_search")],
         [InlineKeyboardButton("⭐ הסר ממועדפים" if is_favorite else "☆ סמן כמועדף", callback_data=f"fav_toggle_{v['entry_id']}")],
@@ -6161,7 +6215,9 @@ async def admin_trash_page(update: Update, context: ContextTypes.DEFAULT_TYPE, p
         nav,
         [InlineKeyboardButton("♻️ שחזר סרטון", callback_data=f"trash_restore_{page}")],
         [InlineKeyboardButton("🗑 מחק לצמיתות", callback_data=f"trash_perm_{page}")],
-        [InlineKeyboardButton("🧹 רוקן סל מיחזור", callback_data="trash_empty")],
+        [InlineKeyboardButton("♻️ מחזר הכל", callback_data="admin_trash_bulk_recycle")],
+        [InlineKeyboardButton("↩️ שחזר הכל", callback_data="admin_trash_bulk_restore")],
+        [InlineKeyboardButton("🗑 רוקן סל", callback_data="admin_trash_bulk_empty")],
         [InlineKeyboardButton("🔙 חזרה", callback_data="admin_gallery")]
     ]
     
@@ -6170,6 +6226,102 @@ async def admin_trash_page(update: Update, context: ContextTypes.DEFAULT_TYPE, p
     if sent_msg:
         context.user_data["dup_sent_media_message_ids"] = [sent_msg.message_id]
         context.user_data["admin_preview_chat_id"] = int(query.message.chat_id)
+
+async def admin_trash_bulk_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show the bulk recycle-bin actions; every action requires a second confirmation."""
+    query = update.callback_query
+    await query.answer()
+    if not has_admin_permission(query.from_user.id, "recycle_bin"):
+        return ConversationHandler.END
+    videos = load_json(VIDEOS_FILE)
+    trash = load_json(TRASH_FILE)
+    await query.edit_message_text(
+        f"♻️ *פעולות מרוכזות בסל המחזור*\\n\\nבמאגר: {len(videos)} פריטים\\nבסל: {len(trash)} פריטים",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("♻️ מחזר הכל", callback_data="admin_trash_bulk_recycle")],
+            [InlineKeyboardButton("↩️ שחזר הכל", callback_data="admin_trash_bulk_restore")],
+            [InlineKeyboardButton("🗑 רוקן סל", callback_data="admin_trash_bulk_empty")],
+            [InlineKeyboardButton("❌ ביטול", callback_data="admin_trash_page_0")],
+        ]),
+    )
+
+
+async def admin_trash_bulk_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if not has_admin_permission(query.from_user.id, "recycle_bin"):
+        return ConversationHandler.END
+    mode = "empty" if query.data == "trash_empty" else query.data.removeprefix("admin_trash_bulk_")
+    labels = {"recycle": "למחזר", "restore": "לשחזר", "empty": "למחוק לצמיתות"}
+    if mode not in labels:
+        return ConversationHandler.END
+    videos = load_json(VIDEOS_FILE)
+    trash = load_json(TRASH_FILE)
+    count = len(videos) if mode == "recycle" else len(trash)
+    if count == 0:
+        await query.edit_message_text(
+            "אין פריטים רלוונטיים לביצוע הפעולה.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 חזרה לסל", callback_data="admin_trash_page_0")]]),
+        )
+        return
+    warning = "פעולה הרסנית שאינה ניתנת לביטול" if mode == "empty" else "הפעולה תשנה את מיקום כל הפריטים הרלוונטיים"
+    await query.edit_message_text(
+        f"⚠️ נמצאו {count} פריטים.\\n\\nאתה עומד {labels[mode]} את כולם.\\n{warning}.\\n\\nהאם אתה בטוח?",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("✅ אישור", callback_data=f"admin_trash_bulk_apply_{mode}")],
+            [InlineKeyboardButton("❌ ביטול", callback_data="admin_trash_page_0")],
+        ]),
+    )
+
+
+async def admin_trash_bulk_apply(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if not has_admin_permission(query.from_user.id, "recycle_bin"):
+        return ConversationHandler.END
+    mode = query.data.removeprefix("admin_trash_bulk_apply_")
+    if mode not in {"recycle", "restore", "empty"}:
+        return ConversationHandler.END
+    videos = load_json(VIDEOS_FILE)
+    trash = load_json(TRASH_FILE)
+    count = len(videos) if mode == "recycle" else len(trash)
+    if count == 0:
+        await query.edit_message_text("אין פריטים רלוונטיים לביצוע הפעולה.", reply_markup=get_admin_inline_keyboard())
+        return
+    backup = create_auto_backup(f"bulk_{mode}_trash", query.from_user.id)
+    if not backup:
+        await query.edit_message_text("❌ לא נוצר גיבוי בטיחותי ולכן הפעולה בוטלה. הנתונים לא שונו.", reply_markup=get_admin_inline_keyboard())
+        return
+    try:
+        if mode == "recycle":
+            now = str(datetime.now())
+            moved = []
+            for video in videos:
+                if isinstance(video, dict):
+                    video["deleted_at"] = now
+                moved.append(video)
+            new_videos, new_trash = [], trash + moved
+            action, message = "all_videos_recycled", f"✅ הועברו {count} פריטים לסל המחזור."
+        elif mode == "restore":
+            restored = []
+            for video in trash:
+                if isinstance(video, dict):
+                    video.pop("deleted_at", None)
+                restored.append(video)
+            new_videos, new_trash = videos + restored, []
+            action, message = "all_trash_restored", f"✅ שוחזרו {count} פריטים מהסל."
+        else:
+            new_videos, new_trash = videos, []
+            action, message = "trash_emptied", f"✅ נמחקו לצמיתות {count} פריטים מהסל."
+        save_json_bundle_with_rollback({VIDEOS_FILE: new_videos, TRASH_FILE: new_trash})
+        log_admin_action(query.from_user.id, action, {"count": count, "backup_created": True}, dangerous=(mode == "empty"))
+        await query.edit_message_text(message, reply_markup=get_admin_inline_keyboard())
+    except Exception:
+        logger.exception("Bulk recycle-bin action failed: %s", mode)
+        log_admin_action(query.from_user.id, f"bulk_{mode}_failed", {"count": count}, status="failed")
+        await query.edit_message_text("❌ הפעולה נכשלה. בוצע ניסיון להחזיר את הנתונים למצב הקודם; הנתונים לא נחשבים כמועברים.", reply_markup=get_admin_inline_keyboard())
+
 
 async def admin_trash_restore(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -6758,13 +6910,99 @@ async def admin_video_search_input(update: Update, context: ContextTypes.DEFAULT
         f"✅ סיימתי לשלוח את תוצאות החיפוש ({success}/{len(selected)} נשלחו).",
         reply_markup=InlineKeyboardMarkup([
             [InlineKeyboardButton("🎬 חזרה לעיון בספריה", callback_data=f"vid_page_{first - 1}")],
+            [InlineKeyboardButton("🔢 חיפוש לפי מספר", callback_data="admin_video_search")],
             [
-                InlineKeyboardButton("🔢 חיפוש לפי מספר", callback_data="admin_video_search"),
                 InlineKeyboardButton("⏱ חיפוש לפי זמן", callback_data="admin_search_sec_start"),
+                InlineKeyboardButton("💾 חיפוש לפי גודל", callback_data="admin_search_size_start"),
             ],
         ]),
     )
     return ConversationHandler.END
+
+# ─── Admin: video search by file size ──────────────────────────────────────────
+
+
+def build_video_file_size_groups(videos: list[dict]) -> dict[int | None, list[dict]]:
+    """Group videos by the exact stored byte count; missing sizes share an unknown group."""
+    groups: dict[int | None, list[dict]] = {}
+    for video in videos:
+        if isinstance(video, dict):
+            groups.setdefault(video_file_size_key(video), []).append(video)
+    return dict(sorted(groups.items(), key=lambda item: (item[0] is None, item[0] or 0)))
+
+
+async def admin_search_size_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if not has_admin_permission(query.from_user.id, "gallery"):
+        return ConversationHandler.END
+    videos = load_videos_with_entry_ids()
+    groups = build_video_file_size_groups(videos)
+    if not groups:
+        await query.edit_message_text(
+            "💾 אין סרטונים במאגר.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 חזרה", callback_data="admin_gallery")]]),
+        )
+        return
+    buttons = []
+    for size_bytes, group in groups.items():
+        encoded = "unknown" if size_bytes is None else str(size_bytes)
+        label = "גודל לא ידוע" if size_bytes is None else format_file_size(size_bytes)
+        buttons.append([InlineKeyboardButton(f"💾 {label} — {len(group)}", callback_data=f"admin_size_group_{encoded}")])
+    buttons.append([InlineKeyboardButton("🔙 חזרה לגלריה", callback_data="admin_gallery")])
+    await query.edit_message_text(
+        "💾 *סינון סרטונים לפי גודל קובץ*\\n\\n"
+        "הקבוצות נבנו מהגדלים הקיימים בפועל במאגר. לא הוגדרו טווחים.",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(buttons),
+    )
+
+
+async def admin_search_size_group(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if not has_admin_permission(query.from_user.id, "gallery"):
+        return ConversationHandler.END
+    raw_size = query.data.removeprefix("admin_size_group_")
+    size_bytes = None if raw_size == "unknown" else int(raw_size) if raw_size.isdigit() else -1
+    if size_bytes == -1:
+        return ConversationHandler.END
+    videos = load_videos_with_entry_ids()
+    results = [video for video in videos if video_file_size_key(video) == size_bytes]
+    results.sort(key=lambda video: (int(video.get("duration", 0) or 0), str(video.get("entry_id", ""))))
+    label = "גודל לא ידוע" if size_bytes is None else format_file_size(size_bytes)
+    if not results:
+        await query.edit_message_text(
+            f"❌ קבוצת {label} אינה זמינה עוד.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 חזרה לגדלים", callback_data="admin_search_size_start")]]),
+        )
+        return
+    await clear_sent_duplicate_group_media(context)
+    await query.edit_message_text(f"🔎 נמצאו {len(results)} סרטונים בגודל {label}. שולח...")
+    success = 0
+    sent_message_ids = []
+    for video in results:
+        try:
+            sent = await send_admin_video_with_delete_button(
+                context.bot, video["file_id"], video["entry_id"], query.message.chat_id, include_category_assignment=True
+            )
+            if sent and sent != "INVALID_FILE_ID":
+                success += 1
+                sent_message_ids.append(sent.message_id)
+            await asyncio.sleep(0.15)
+        except Exception:
+            logger.exception("Failed to send file-size search result")
+    context.user_data["dup_sent_media_message_ids"] = sent_message_ids
+    context.user_data["admin_preview_chat_id"] = int(query.message.chat_id)
+    await context.bot.send_message(
+        chat_id=query.message.chat_id,
+        text=f"✅ הסתיימה שליחת קבוצת {label} ({success}/{len(results)} נשלחו).",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("💾 חזרה לקבוצות הגדלים", callback_data="admin_search_size_start")],
+            [InlineKeyboardButton("🔙 חזרה לגלריה", callback_data="admin_gallery")],
+        ]),
+    )
+
 
 # ─── Admin: video search by seconds ───────────────────────────────────────────
 
@@ -9660,7 +9898,12 @@ def main():
         (r"^admin_trash_page_\d+$",    admin_trash_page),
         (r"^trash_restore_\d+$",       admin_trash_restore),
         (r"^trash_perm_\d+$",          admin_trash_perm),
-        ("^trash_empty$",               admin_trash_empty),
+        ("^trash_empty$",               admin_trash_bulk_confirm),
+        ("^admin_trash_bulk_start$",    admin_trash_bulk_start),
+        (r"^admin_trash_bulk_(recycle|restore|empty)$", admin_trash_bulk_confirm),
+        (r"^admin_trash_bulk_apply_(recycle|restore|empty)$", admin_trash_bulk_apply),
+        ("^admin_search_size_start$",   admin_search_size_start),
+        (r"^admin_size_group_(\d+|unknown)$", admin_search_size_group),
 
         (r"^vid_page_\d+$",             admin_gallery_page),
         (r"^vid_del_\d+$",              admin_gallery_delete),
