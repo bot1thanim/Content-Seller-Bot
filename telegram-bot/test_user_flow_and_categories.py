@@ -169,9 +169,9 @@ async def run_tests():
             assert state == bot.ConversationHandler.END, 'Upload must end immediately, without category conversation'
             videos = bot.load_json(bot.VIDEOS_FILE)
             added = next(item for item in videos if item['file_id'] == 'upload-id')
-            assert added['category'] == 'רנדומלי' and added['preview'] is None, 'Upload must use the random default category and no preview'
+            assert added['category'] == 'רנדומלי' and added['categories'] == ['רנדומלי'] and added['preview'] is None, 'Upload must use the unassigned default category and no preview'
             assert added.get('added_at') and added.get('file_status') == 'valid', 'New uploads must retain operational metadata'
-            assert 'קטגוריה: רנדומלי' in upload_message.replies[-1][0], 'Upload confirmation is missing the random default category'
+            assert 'קטגוריה: סרטונים שלא מוינו' in upload_message.replies[-1][0], 'Upload confirmation is missing the unassigned default category'
 
             # One hundred sequential updates must all be stored immediately; no upload is skipped for category/preview input.
             for index in range(2, 101):

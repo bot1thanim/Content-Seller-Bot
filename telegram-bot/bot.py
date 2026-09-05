@@ -76,6 +76,7 @@ AI_AUDIT_FILE = DATA_DIR / "ai_audit.json"
 USER_ACTIVITY_FILE = DATA_DIR / "user_activity.json"
 ALERTS_FILE = DATA_DIR / "alerts.json"
 DUPLICATE_REVIEWS_FILE = DATA_DIR / "duplicate_reviews.json"
+BROADCASTS_FILE = DATA_DIR / "broadcasts.json"
 AUTO_BACKUPS_DIR = DATA_DIR / "auto_backups"
 MAX_AUTO_BACKUPS = 30
 
@@ -95,6 +96,7 @@ BACKUP_ALLOWED_FILES = {
     "user_activity.json": list,
     "alerts.json": list,
     "duplicate_reviews.json": list,
+    "broadcasts.json": list,
 }
 MAX_RESTORE_ARCHIVE_BYTES = 20 * 1024 * 1024
 MAX_RESTORE_UNCOMPRESSED_BYTES = 40 * 1024 * 1024
@@ -192,6 +194,7 @@ def ensure_data_files():
         (USER_ACTIVITY_FILE, []),
         (ALERTS_FILE, []),
         (DUPLICATE_REVIEWS_FILE, []),
+        (BROADCASTS_FILE, []),
     ]
     for filepath, default in defaults:
         if not filepath.exists():
@@ -273,6 +276,7 @@ def video_file_size_key(video: dict) -> int | None:
 
 
 DEFAULT_CATEGORY = "רנדומלי"
+UNSORTED_CATEGORY_LABEL = "סרטונים שלא מוינו"
 LEGACY_DEFAULT_CATEGORY = "כללי"
 
 
@@ -311,18 +315,49 @@ def video_categories(video: dict) -> list[str]:
 
 
 def normalize_video_categories(video: dict) -> bool:
-    """Persist both multi-category data and the legacy primary category for compatibility."""
+    """Normalize one canonical category per video while preserving legacy fields.
+
+    Older records may contain several categories.  They are deliberately reset to
+    the private default/unassigned category rather than silently choosing one.
+    This is a data-shape migration, not a deletion of the video record.
+    """
     if not isinstance(video, dict):
         return False
     categories = video_categories(video)
+    if len(categories) > 1:
+        categories = [DEFAULT_CATEGORY]
     changed = video.get("categories") != categories or video.get("category") != categories[0]
     video["categories"] = categories
     video["category"] = categories[0]
     return changed
 
 
+def display_category_name(category: str) -> str:
+    return UNSORTED_CATEGORY_LABEL if category == DEFAULT_CATEGORY else str(category)
+
+
+def category_is_user_visible(category: str) -> bool:
+    if category == DEFAULT_CATEGORY:
+        return False
+    return bool(load_settings().get("category_visibility", {}).get(category, True))
+
+
+def category_is_random_enabled(category: str) -> bool:
+    if category == DEFAULT_CATEGORY:
+        return True
+    return bool(load_settings().get("category_random_enabled", {}).get(category, True))
+
+
+def user_visible_categories() -> list[str]:
+    return [category for category in _admin_categories() if category_is_user_visible(category)]
+
+
+def random_enabled_categories() -> list[str]:
+    return [category for category in user_visible_categories() if category_is_random_enabled(category)]
+
+
 def display_video_categories(video: dict) -> str:
-    return ", ".join(video_categories(video))
+    return ", ".join(display_category_name(category) for category in video_categories(video))
 
 
 def format_duration(seconds: int | float | None) -> str:
@@ -555,6 +590,15 @@ def load_settings() -> dict:
         order_mode = "alphabetical"
     s["category_order_mode"] = order_mode
     s["categories"] = normalize_category_list(s.get("categories", []), alphabetical=(order_mode == "alphabetical"))
+    category_names = [name for name in s["categories"] if name != DEFAULT_CATEGORY]
+    visibility = s.get("category_visibility", {})
+    random_enabled = s.get("category_random_enabled", {})
+    if not isinstance(visibility, dict):
+        visibility = {}
+    if not isinstance(random_enabled, dict):
+        random_enabled = {}
+    s["category_visibility"] = {name: bool(visibility.get(name, True)) for name in category_names}
+    s["category_random_enabled"] = {name: bool(random_enabled.get(name, True)) for name in category_names}
     return s
 
 def save_settings(s: dict):
@@ -729,6 +773,8 @@ def callback_permission(callback_data: str) -> str | None:
     if callback_data.startswith(("vid_", "fav_", "admin_favorites", "admin_video_search", "admin_search_sec", "admin_search_size", "admin_size_group", "size_group_", "admin_combined_search")):
         return "gallery_browse"
     if callback_data.startswith(("admin_categories", "admin_cat_", "cat_")):
+        if callback_data.startswith(("admin_cat_visibility", "cat_visibility_", "admin_cat_random", "cat_random_")):
+            return "owner"
         return "category_manage"
     if callback_data.startswith("admin_repair"):
         return "gallery_repair"
@@ -1830,7 +1876,11 @@ async def admin_menu_communications(update: Update, context: ContextTypes.DEFAUL
     await query.answer()
     await query.edit_message_text(
         "📢 *הודעות ופרסום*\n\nפעולות אלו פונות למשתמשים ולכן יש לבדוק אותן לפני שליחה.", parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📢 הודעה לכולם", callback_data="admin_broadcast")], _back_to_admin_row()]),
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("📢 הודעה לכולם", callback_data="admin_broadcast")],
+            [InlineKeyboardButton("📊 סטטוס הודעות מתוזמנות", callback_data="admin_broadcast_status")],
+            _back_to_admin_row(),
+        ]),
     )
 
 
@@ -6128,24 +6178,34 @@ async def admin_dup_send_group(update: Update, context: ContextTypes.DEFAULT_TYP
         return
     await admin_dup_page(update, context, page)
 
+def _move_video_to_trash(entry_id: str) -> tuple[dict | None, list[dict]]:
+    """Move exactly one active entry atomically, preserving the existing recycle semantics."""
+    videos = load_videos_with_entry_ids()
+    trash = load_json(TRASH_FILE)
+    target = next((video for video in videos if str(video.get("entry_id")) == str(entry_id)), None)
+    if not target:
+        return None, videos
+    remaining = [video for video in videos if str(video.get("entry_id")) != str(entry_id)]
+    moved = dict(target)
+    moved["deleted_at"] = datetime.now(timezone.utc).isoformat()
+    save_json_bundle_with_rollback({VIDEOS_FILE: remaining, TRASH_FILE: [*trash, moved]})
+    return moved, remaining
+
+
 async def admin_gallery_delete(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
-    
-    videos = load_json(VIDEOS_FILE)
-    trash = load_json(TRASH_FILE)
+    if not has_admin_permission(query.from_user.id, "gallery"):
+        return
+
+    videos = load_videos_with_entry_ids()
     
     if "del_eid_" in query.data:
         eid = query.data.replace("del_eid_", "")
         to_delete = [v for v in videos if v.get("entry_id") == eid]
         if to_delete:
             target_v = to_delete[0]
-            # Remove ONLY this specific entry by entry_id
-            videos = [vi for vi in videos if vi.get("entry_id") != eid]
-            target_v["deleted_at"] = str(datetime.now())
-            trash.append(target_v)
-            save_json(VIDEOS_FILE, videos)
-            save_json(TRASH_FILE, trash)
+            _, videos = _move_video_to_trash(eid)
             await query.answer("הסרטון הספציפי הועבר לסל המיחזור!", show_alert=True)
             try: await query.message.delete() 
             except: pass
@@ -6163,24 +6223,21 @@ async def admin_gallery_delete(update: Update, context: ContextTypes.DEFAULT_TYP
                 else:
                     new_videos.append(vi)
             videos = new_videos
-            target_v["deleted_at"] = str(datetime.now())
-            trash.append(target_v)
-            save_json(VIDEOS_FILE, videos)
-            save_json(TRASH_FILE, trash)
+            _, videos = _move_video_to_trash(str(target_v.get("entry_id", "")))
             await query.answer("הסרטון הועבר לסל המיחזור!", show_alert=True)
             try: await query.message.delete() 
             except: pass
     else:
         idx = int(query.data.split("vid_del_")[1])
         if 0 <= idx < len(videos):
-            v = videos.pop(idx)
-            v["deleted_at"] = str(datetime.now())
-            trash.append(v)
-            save_json(VIDEOS_FILE, videos)
-            save_json(TRASH_FILE, trash)
+            entry_id = str(videos[idx].get("entry_id", ""))
+            _, remaining = _move_video_to_trash(entry_id)
             await query.answer("הסרטון הועבר לסל המיחזור!", show_alert=True)
-            if videos: await admin_gallery_page(update, context, 0)
-            else: await query.edit_message_text("המאגר ריק.", reply_markup=get_admin_inline_keyboard())
+            if remaining:
+                # Keep the user at the same logical position, clamped to the new end.
+                await admin_gallery_page(update, context, min(idx, len(remaining) - 1))
+            else:
+                await query.edit_message_text("המאגר ריק.", reply_markup=get_admin_inline_keyboard())
 
 async def admin_trash_page(update: Update, context: ContextTypes.DEFAULT_TYPE, page=None):
     query = update.callback_query
@@ -7181,8 +7238,10 @@ async def admin_categories_menu(update: Update, context: ContextTypes.DEFAULT_TY
     order_mode = load_settings().get("category_order_mode", "alphabetical")
     order_label = "א׳–ת׳" if order_mode == "alphabetical" else "סדר ידני"
     text = "🏷 *קטגוריות — כלי ניהול פרטי*\n\n"
-    text += f"סדר נוכחי: *{order_label}*\n\nהקטגוריות הקיימות:\n" + "\n".join(f"• {category}" for category in categories)
-    text += "\n\nהקטגוריות אינן מוצגות למשתמשים כרגע. בעתיד, בחירה ב׳רנדומלי׳ תבחר סרטון מתוך קטגוריה זו באופן אקראי."
+    text += f"סדר נוכחי: *{order_label}*\n\nהקטגוריות הקיימות:\n" + "\n".join(
+        f"• {display_category_name(category)}" for category in categories
+    )
+    text += "\n\nקטגוריית ברירת המחדל מוצגת כאן כ׳סרטונים שלא מוינו׳. קטגוריות משתמש ונכונות לרנדומלי יוגדרו בנפרד, כדי לא לערבב בין הרשאות צפייה לבין בחירה אקראית."
     shared_progress = shared_category_sort_progress()
     if shared_progress.get("entry_ids"):
         text += (
@@ -7283,7 +7342,7 @@ async def admin_cat_browse_menu(update: Update, context: ContextTypes.DEFAULT_TY
     for index, category in enumerate(categories):
         count = len(_category_videos(category))
         buttons.append([
-            InlineKeyboardButton(f"📁 {category} ({count})", callback_data=f"cat_browse_pick_{index}")
+            InlineKeyboardButton(f"📁 {display_category_name(category)} ({count})", callback_data=f"cat_browse_pick_{index}")
         ])
     buttons.append([InlineKeyboardButton("🔙 חזרה לקטגוריות", callback_data="admin_categories")])
     await query.edit_message_text(
@@ -7490,18 +7549,13 @@ async def admin_cat_clone_pick(update: Update, context: ContextTypes.DEFAULT_TYP
     settings["categories"] = categories + [cloned]
     save_settings(settings)
     videos = load_videos_with_entry_ids()
-    copied = 0
-    for video in videos:
-        memberships = video_categories(video)
-        if source in memberships:
-            video["categories"] = memberships + [cloned]
-            normalize_video_categories(video)
-            copied += 1
+    # A video has one canonical category.  Cloning creates the category only;
+    # it must not duplicate memberships behind the scenes.
     save_json(VIDEOS_FILE, videos)
-    log_admin_action(query.from_user.id, "category_cloned", {"source": source, "clone": cloned, "videos": copied})
+    log_admin_action(query.from_user.id, "category_cloned", {"source": source, "clone": cloned, "videos": 0})
     await query.edit_message_text(
-        f"✅ הקטגוריה ׳{source}׳ שוכפלה ל׳{cloned}׳. {copied} סרטונים שויכו גם לקטגוריה החדשה.\n"
-        "אפשר לשנות את שם הקטגוריה החדשה במסך עריכת הקטגוריות.",
+        f"✅ הקטגוריה ׳{source}׳ שוכפלה ל׳{cloned}׳ כקטגוריה ריקה.\n"
+        "כל סרטון נשאר בקטגוריה אחת בלבד; אפשר לשייך סרטונים לקטגוריה החדשה דרך מיון הקטגוריות.",
         reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 חזרה לעריכת קטגוריות", callback_data="admin_cat_edit")]]),
     )
 
@@ -7582,13 +7636,11 @@ async def admin_cat_merge_confirm(update: Update, context: ContextTypes.DEFAULT_
     videos = load_videos_with_entry_ids()
     changed = 0
     for video in videos:
-        memberships = video_categories(video)
-        if source in memberships:
-            updated = [item for item in memberships if not (remove_source and item == source)]
-            if target not in updated:
-                updated.append(target)
-            video["categories"] = updated or [DEFAULT_CATEGORY]
-            normalize_video_categories(video)
+        if source in video_categories(video):
+            # Merging moves each source video to the target; it never creates a
+            # second membership.  Keeping the source means keeping an empty category.
+            video["categories"] = [target]
+            video["category"] = target
             changed += 1
     save_json(VIDEOS_FILE, videos)
     if remove_source:
@@ -7597,8 +7649,8 @@ async def admin_cat_merge_confirm(update: Update, context: ContextTypes.DEFAULT_
         save_settings(settings)
     log_admin_action(query.from_user.id, "categories_merged", {"source": source, "target": target, "removed_source": remove_source, "videos": changed})
     await query.edit_message_text(
-        f"✅ המיזוג הושלם: {changed} סרטונים שויכו ל׳{target}׳."
-        + (f" קטגוריית המקור ׳{source}׳ הוסרה." if remove_source else f" קטגוריית המקור ׳{source}׳ נשארה."),
+        f"✅ המיזוג הושלם: {changed} סרטונים הועברו ל׳{target}׳ בקטגוריה יחידה."
+        + (f" קטגוריית המקור ׳{source}׳ הוסרה." if remove_source else f" קטגוריית המקור ׳{source}׳ נשארה ללא שיוכים."),
         reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 חזרה לעריכת קטגוריות", callback_data="admin_cat_edit")]]),
     )
 
@@ -7608,7 +7660,7 @@ async def admin_cat_edit_menu(update: Update, context: ContextTypes.DEFAULT_TYPE
     await query.answer()
     await query.edit_message_text(
         "✏️ *עריכת קטגוריות*\n\nאפשר להוסיף, לשנות שם, להסיר, לשכפל או למזג קטגוריות. "
-        "סרטון יכול להשתייך לכמה קטגוריות במקביל.",
+        "כל סרטון משתייך לקטגוריה אחת בלבד.",
         parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup([
             [InlineKeyboardButton("➕ הוסף קטגוריה", callback_data="admin_cat_add")],
@@ -7616,9 +7668,89 @@ async def admin_cat_edit_menu(update: Update, context: ContextTypes.DEFAULT_TYPE
             [InlineKeyboardButton("📋 שכפל קטגוריה", callback_data="admin_cat_clone")],
             [InlineKeyboardButton("🔀 מזג קטגוריות", callback_data="admin_cat_merge")],
             [InlineKeyboardButton("🗑 הסר קטגוריה", callback_data="admin_cat_delete")],
+            [InlineKeyboardButton("👁️ נראות למשתמשים", callback_data="admin_cat_visibility")],
+            [InlineKeyboardButton("🎲 רנדומלי כללי — קטגוריות", callback_data="admin_cat_random")],
             [InlineKeyboardButton("🔙 חזרה", callback_data="admin_categories")],
         ]),
     )
+
+
+async def admin_cat_visibility_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    settings = load_settings()
+    categories = [category for category in _admin_categories() if category != DEFAULT_CATEGORY]
+    buttons = []
+    for index, category in enumerate(categories):
+        visible = bool(settings.get("category_visibility", {}).get(category, True))
+        buttons.append([InlineKeyboardButton(
+            f"{'👁️' if visible else '🚫'} {display_category_name(category)}",
+            callback_data=f"cat_visibility_toggle_{index}",
+        )])
+    buttons.append([InlineKeyboardButton("🔙 חזרה לעריכת קטגוריות", callback_data="admin_cat_edit")])
+    await query.edit_message_text(
+        "👁️ *נראות קטגוריות למשתמשים*\n\nלחץ על קטגוריה כדי להציג או להסתיר אותה. קטגוריות מוסתרות לא יופיעו בבחירה ידנית או ברנדומלי הכללי.",
+        parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(buttons),
+    )
+
+
+async def admin_cat_visibility_toggle(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    try:
+        index = int(query.data.rsplit("_", 1)[1])
+    except (AttributeError, ValueError):
+        return
+    categories = [category for category in _admin_categories() if category != DEFAULT_CATEGORY]
+    if not 0 <= index < len(categories):
+        await query.answer("הקטגוריה אינה זמינה.", show_alert=True)
+        return
+    category = categories[index]
+    settings = load_settings()
+    visibility = settings.setdefault("category_visibility", {})
+    visibility[category] = not bool(visibility.get(category, True))
+    save_settings(settings)
+    log_admin_action(query.from_user.id, "category_visibility_changed", {"category": category, "visible": visibility[category]})
+    await admin_cat_visibility_menu(update, context)
+
+
+async def admin_cat_random_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    settings = load_settings()
+    categories = [category for category in _admin_categories() if category != DEFAULT_CATEGORY]
+    buttons = []
+    for index, category in enumerate(categories):
+        enabled = bool(settings.get("category_random_enabled", {}).get(category, True))
+        buttons.append([InlineKeyboardButton(
+            f"{'🎲' if enabled else '🚫'} {display_category_name(category)}",
+            callback_data=f"cat_random_toggle_{index}",
+        )])
+    buttons.append([InlineKeyboardButton("🔙 חזרה לעריכת קטגוריות", callback_data="admin_cat_edit")])
+    await query.edit_message_text(
+        "🎲 *השתתפות ברנדומלי הכללי*\n\nהפעל או השבת כל קטגוריה בנפרד. ההגדרה נשמרת בנפרד מהרשאת הצפייה.",
+        parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(buttons),
+    )
+
+
+async def admin_cat_random_toggle(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    try:
+        index = int(query.data.rsplit("_", 1)[1])
+    except (AttributeError, ValueError):
+        return
+    categories = [category for category in _admin_categories() if category != DEFAULT_CATEGORY]
+    if not 0 <= index < len(categories):
+        await query.answer("הקטגוריה אינה זמינה.", show_alert=True)
+        return
+    category = categories[index]
+    settings = load_settings()
+    enabled = settings.setdefault("category_random_enabled", {})
+    enabled[category] = not bool(enabled.get(category, True))
+    save_settings(settings)
+    log_admin_action(query.from_user.id, "category_random_enabled_changed", {"category": category, "enabled": enabled[category]})
+    await admin_cat_random_menu(update, context)
 
 
 async def admin_cat_add_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -7662,7 +7794,7 @@ async def admin_cat_rename_start(update: Update, context: ContextTypes.DEFAULT_T
     ]
     buttons.append([InlineKeyboardButton("🔙 חזרה", callback_data="admin_cat_edit")])
     if len(buttons) == 1:
-        await query.edit_message_text("אין עדיין קטגוריות שניתן לשנות. ׳רנדומלי׳ היא קטגוריית ברירת המחדל הקבועה.", reply_markup=InlineKeyboardMarkup(buttons))
+        await query.edit_message_text("אין עדיין קטגוריות שניתן לשנות. ׳סרטונים שלא מוינו׳ היא קטגוריית ברירת המחדל הקבועה.", reply_markup=InlineKeyboardMarkup(buttons))
         return ConversationHandler.END
     await query.edit_message_text("בחר קטגוריה לשינוי שם:", reply_markup=InlineKeyboardMarkup(buttons))
 
@@ -7729,9 +7861,9 @@ async def admin_cat_delete_start(update: Update, context: ContextTypes.DEFAULT_T
     ]
     buttons.append([InlineKeyboardButton("🔙 חזרה", callback_data="admin_cat_edit")])
     if len(buttons) == 1:
-        await query.edit_message_text("אין עדיין קטגוריות שניתן להסיר. ׳רנדומלי׳ היא קטגוריית ברירת המחדל הקבועה.", reply_markup=InlineKeyboardMarkup(buttons))
+        await query.edit_message_text("אין עדיין קטגוריות שניתן להסיר. ׳סרטונים שלא מוינו׳ היא קטגוריית ברירת המחדל הקבועה.", reply_markup=InlineKeyboardMarkup(buttons))
         return
-    await query.edit_message_text("בחר קטגוריה להסרה. הסרטונים שלה יעברו ל׳רנדומלי׳:", reply_markup=InlineKeyboardMarkup(buttons))
+    await query.edit_message_text("בחר קטגוריה להסרה. הסרטונים שלה יעברו ל׳סרטונים שלא מוינו׳:", reply_markup=InlineKeyboardMarkup(buttons))
 
 
 async def admin_cat_delete_pick(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -7744,7 +7876,7 @@ async def admin_cat_delete_pick(update: Update, context: ContextTypes.DEFAULT_TY
         return
     category = categories[index]
     await query.edit_message_text(
-        f"האם להסיר את הקטגוריה ׳{category}׳? כל הסרטונים שלה יעברו ל׳רנדומלי׳.",
+        f"האם להסיר את הקטגוריה ׳{category}׳? כל הסרטונים שלה יעברו ל׳סרטונים שלא מוינו׳.",
         reply_markup=InlineKeyboardMarkup([
             [InlineKeyboardButton("✅ כן, הסר", callback_data=f"cat_delete_confirm_{index}")],
             [InlineKeyboardButton("❌ ביטול", callback_data="admin_cat_edit")],
@@ -7793,13 +7925,32 @@ def _category_sort_videos() -> list[dict]:
 
 
 def _category_sort_pending_videos() -> list[dict]:
-    """Return only videos not yet handled by normal category sorting."""
+    """Return the current source-of-truth queue of videos not yet handled."""
     reviewed = category_sort_reviewed_entry_ids()
     return [video for video in _category_sort_videos() if str(video.get("entry_id", "")) not in reviewed]
 
 
+def _merge_category_sort_session_with_current_source(context: ContextTypes.DEFAULT_TYPE) -> list[dict]:
+    """Refresh a continue session from current videos without re-adding reviewed IDs."""
+    all_current = load_videos_with_entry_ids()
+    current_by_id = {str(video.get("entry_id", "")): video for video in all_current}
+    pending = _category_sort_pending_videos()
+    existing_ids = context.user_data.get("cat_sort_entry_ids")
+    if not isinstance(existing_ids, list):
+        return pending
+    # Keep the existing session order, including already handled items, so that
+    # clicking Next/Previous never shifts page indexes. Append only new pending IDs.
+    merged = [current_by_id[entry_id] for entry_id in existing_ids if entry_id in current_by_id]
+    known = {str(video.get("entry_id", "")) for video in merged}
+    merged.extend(video for video in pending if str(video.get("entry_id", "")) not in known)
+    context.user_data["cat_sort_entry_ids"] = [str(video.get("entry_id", "")) for video in merged]
+    return merged
+
+
 def _category_sort_context_videos(context: ContextTypes.DEFAULT_TYPE) -> list[dict]:
-    """Resolve the current fixed sort session by entry ID, preserving its order safely."""
+    """Resolve a session against current source data and append newly pending videos."""
+    if context.user_data.get("cat_sort_mode") == "continue":
+        return _merge_category_sort_session_with_current_source(context)
     entry_ids = context.user_data.get("cat_sort_entry_ids")
     if not isinstance(entry_ids, list):
         return _category_sort_videos()
@@ -7813,7 +7964,13 @@ def _start_category_sort_session(context: ContextTypes.DEFAULT_TYPE, mode: str) 
     saved_ids = shared.get("entry_ids") if isinstance(shared.get("entry_ids"), list) else []
     if saved_ids:
         available = {str(video.get("entry_id", "")): video for video in load_videos_with_entry_ids()}
-        videos = [available[str(entry_id)] for entry_id in saved_ids if str(entry_id) in available]
+        pending = _category_sort_pending_videos()
+        if not pending:
+            videos = []
+        else:
+            videos = [available[str(entry_id)] for entry_id in saved_ids if str(entry_id) in available]
+            known = {str(video.get("entry_id", "")) for video in videos}
+            videos.extend(video for video in pending if str(video.get("entry_id", "")) not in known)
         saved_page = int(shared.get("page", 0) or 0)
         context.user_data["cat_sort_shared_resume_page"] = max(0, min(saved_page, max(0, len(videos) - 1)))
     else:
@@ -7866,7 +8023,7 @@ def _category_sort_markup(videos: list[dict], page: int, current_categories: lis
     buttons = []
     row = []
     for index, category in enumerate(_admin_categories()):
-        label = f"✅ {category}" if category in current_categories else category
+        label = f"✅ {display_category_name(category)}" if category in current_categories else display_category_name(category)
         row.append(InlineKeyboardButton(label, callback_data=f"cat_assign_{page}_{index}"))
         if len(row) == 2:
             buttons.append(row)
@@ -7912,7 +8069,7 @@ async def admin_cat_sort_page(update: Update, context: ContextTypes.DEFAULT_TYPE
         f"מצב: *{mode_label}*\n\n"
         f"⏱ אורך: *{format_duration(video.get('duration', 0))}*\n"
         "\n📁 הקטגוריות שנבחרו מסומנות ב־✅ על הכפתורים.\n\n"
-        "אפשר לסמן כמה קטגוריות. לחיצה על קטגוריה שומרת את ההתקדמות ומעדכנת מיד את הסימון; אם לא משנים קטגוריה, לחץ על ׳סיים סרטון׳ כדי לשמור את הטיפול בו."
+        "בחר קטגוריה אחת. בחירה חדשה מחליפה שיוך קודם; אם לא משנים קטגוריה, לחץ על ׳סיים סרטון׳ כדי לשמור את הטיפול בו."
     )
     if (
         str(previous_progress.get("entry_id") or "") == str(video.get("entry_id") or "")
@@ -7950,11 +8107,9 @@ async def admin_cat_assign(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if selected_category == DEFAULT_CATEGORY and selected_category in memberships and len(memberships) == 1:
         await query.answer("כל סרטון חייב להשתייך לפחות לקטגוריה אחת.", show_alert=True)
         return
-    if selected_category in memberships:
-        memberships = [item for item in memberships if item != selected_category]
-    else:
-        memberships.append(selected_category)
-    selected_video["categories"] = memberships or [DEFAULT_CATEGORY]
+    # Category sorting is intentionally single-choice: selecting a category replaces
+    # any legacy/multiple membership instead of appending a second category.
+    selected_video["categories"] = [DEFAULT_CATEGORY if selected_category == DEFAULT_CATEGORY else selected_category]
     normalize_video_categories(selected_video)
     all_videos = load_videos_with_entry_ids()
     for index, video in enumerate(all_videos):
@@ -8032,11 +8187,7 @@ async def admin_quick_category_toggle(update: Update, context: ContextTypes.DEFA
     if category == DEFAULT_CATEGORY and category in memberships and len(memberships) == 1:
         await query.answer("כל סרטון חייב להשתייך לפחות לקטגוריה אחת.", show_alert=True)
         return
-    if category in memberships:
-        memberships = [item for item in memberships if item != category]
-    else:
-        memberships.append(category)
-    video["categories"] = memberships or [DEFAULT_CATEGORY]
+    video["categories"] = [DEFAULT_CATEGORY if category == DEFAULT_CATEGORY else category]
     normalize_video_categories(video)
     save_json(VIDEOS_FILE, all_videos)
     mark_category_sort_reviewed(entry_id)
@@ -8121,6 +8272,50 @@ async def _show_broadcast_preview(message, context: ContextTypes.DEFAULT_TYPE):
     )
     # The manager's text may contain arbitrary Markdown characters, so do not parse it as Markdown.
     await message.reply_text(preview, reply_markup=_broadcast_preview_markup())
+
+
+def _broadcast_status_label(status: str) -> str:
+    return {"pending": "ממתין", "sending": "נשלח כעת", "sent": "נשלח", "failed": "נכשל", "cancelled": "בוטל"}.get(status, "לא ידוע")
+
+
+async def admin_broadcast_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if not has_admin_permission(query.from_user.id, "broadcast"):
+        return
+    records = load_json(BROADCASTS_FILE)
+    records = [item for item in records if isinstance(item, dict)] if isinstance(records, list) else []
+    records = list(reversed(records[-20:]))
+    buttons = []
+    lines = ["📊 *סטטוס הודעות מתוזמנות*", ""]
+    for record in records:
+        status = _broadcast_status_label(str(record.get("status")))
+        lines.append(f"• {status} | {record.get('sent', 0)}/{len(record.get('recipient_ids', []))} | {str(record.get('created_at', ''))[:16]}")
+        if record.get("status") == "pending":
+            buttons.append([InlineKeyboardButton(f"❌ בטל {str(record.get('id'))[:8]}", callback_data=f"broadcast_cancel_{record.get('id')}")])
+    if not records:
+        lines.append("אין הודעות מתוזמנות או היסטוריית שליחה.")
+    buttons.append([InlineKeyboardButton("🔙 חזרה", callback_data="admin_menu_communications")])
+    await query.edit_message_text("\n".join(lines), parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(buttons))
+
+
+async def admin_broadcast_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if not has_admin_permission(query.from_user.id, "broadcast"):
+        return
+    broadcast_id = (query.data or "").removeprefix("broadcast_cancel_")
+    records = load_json(BROADCASTS_FILE)
+    changed = False
+    for record in records if isinstance(records, list) else []:
+        if isinstance(record, dict) and record.get("id") == broadcast_id and record.get("status") == "pending":
+            record["status"] = "cancelled"
+            record["cancelled_at"] = datetime.now(timezone.utc).isoformat()
+            changed = True
+            log_admin_action(query.from_user.id, "broadcast_cancelled", {"broadcast_id": broadcast_id})
+    if changed:
+        save_json(BROADCASTS_FILE, records)
+    await admin_broadcast_status(update, context)
 
 
 async def admin_broadcast_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -8212,6 +8407,92 @@ async def admin_broadcast_get_delay(update: Update, context: ContextTypes.DEFAUL
     return ADMIN_BROADCAST_PREVIEW
 
 
+def _broadcast_markup_payload(markup) -> dict | None:
+    if not markup or not getattr(markup, "inline_keyboard", None):
+        return None
+    first = markup.inline_keyboard[0][0]
+    return {"text": str(first.text), "url": str(first.url)} if getattr(first, "url", None) else None
+
+
+def _broadcast_markup_from_payload(payload):
+    if not isinstance(payload, dict) or not payload.get("url"):
+        return None
+    return InlineKeyboardMarkup([[InlineKeyboardButton(str(payload.get("text") or "קישור"), url=str(payload["url"]))]])
+
+
+def _save_broadcast_record(record: dict) -> None:
+    records = load_json(BROADCASTS_FILE)
+    if not isinstance(records, list):
+        records = []
+    records = [item for item in records if isinstance(item, dict) and item.get("id") != record.get("id")]
+    records.append(record)
+    save_json(BROADCASTS_FILE, records)
+
+
+def _new_broadcast_record(*, actor_id: int, text: str, media, markup, delay_min: int, users: dict) -> dict:
+    now = datetime.now(timezone.utc)
+    return {
+        "id": uuid.uuid4().hex,
+        "created_at": now.isoformat(),
+        "scheduled_for": (now + timedelta(minutes=max(0, delay_min))).isoformat(),
+        "created_by": int(actor_id),
+        "text": text,
+        "media": list(media) if isinstance(media, tuple) else None,
+        "markup": _broadcast_markup_payload(markup),
+        "recipient_ids": [str(uid) for uid in users],
+        "status": "pending",
+        "sent": 0,
+        "failed": 0,
+    }
+
+
+async def _execute_broadcast_record(bot_client, record: dict) -> None:
+    if record.get("status") not in {"pending", "sending"}:
+        return
+    record["status"] = "sending"
+    _save_broadcast_record(record)
+    media = tuple(record["media"]) if isinstance(record.get("media"), list) and len(record["media"]) == 2 else None
+    markup = _broadcast_markup_from_payload(record.get("markup"))
+    sent = failed = 0
+    for uid in record.get("recipient_ids", []):
+        try:
+            await _send_message_payload(bot_client, uid, str(record.get("text") or ""), media, markup)
+            sent += 1
+        except Exception as exc:
+            logger.warning("Failed scheduled broadcast to %s: %s", uid, type(exc).__name__)
+            failed += 1
+        await asyncio.sleep(0.05)
+    record["sent"], record["failed"] = sent, failed
+    record["status"] = "failed" if failed else "sent"
+    record["completed_at"] = datetime.now(timezone.utc).isoformat()
+    _save_broadcast_record(record)
+    log_admin_action(int(record.get("created_by", ADMIN_ID)), "broadcast_sent", {
+        "broadcast_id": record.get("id"), "recipients": len(record.get("recipient_ids", [])),
+        "sent": sent, "failed": failed,
+    })
+
+
+async def scheduled_broadcast_loop(bot_client) -> None:
+    """Resume due pending broadcasts after restart without blocking update handling."""
+    while True:
+        try:
+            records = load_json(BROADCASTS_FILE)
+            now = datetime.now(timezone.utc)
+            for record in records if isinstance(records, list) else []:
+                if not isinstance(record, dict) or record.get("status") != "pending":
+                    continue
+                try:
+                    due = datetime.fromisoformat(str(record.get("scheduled_for")).replace("Z", "+00:00"))
+                except (TypeError, ValueError):
+                    continue
+                if due <= now:
+                    await _execute_broadcast_record(bot_client, record)
+            await asyncio.sleep(10)
+        except Exception as exc:
+            logger.error("Scheduled broadcast worker failed safely: %s", type(exc).__name__)
+            await asyncio.sleep(20)
+
+
 async def admin_broadcast_preview_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -8252,31 +8533,39 @@ async def admin_broadcast_preview_action(update: Update, context: ContextTypes.D
     users = load_json(USERS_FILE)
     if not isinstance(users, dict):
         users = {}
-    await query.edit_message_text(f"📤 הבוט שולח את ההודעה ל־{len(users)} משתמשים...", reply_markup=None)
-    if delay_min > 0:
-        await asyncio.sleep(delay_min * 60)
-    sent = 0
-    failed = 0
-    progress = query.message
-
-    for uid in users:
-        try:
-            await _send_message_payload(context.bot, uid, msg, media, markup)
-            sent += 1
-        except Exception as exc:
-            logger.warning("Failed to send broadcast to %s: %s", uid, type(exc).__name__)
-            failed += 1
-        if (sent + failed) % 20 == 0:
-            try:
-                await progress.edit_text(f"📤 נשלח: {sent + failed}/{len(users)}...")
-            except Exception:
-                pass
-        await asyncio.sleep(0.05)
-
-    log_admin_action(query.from_user.id, "broadcast_sent", {"recipients": len(users), "sent": sent, "failed": failed, "delay_minutes": delay_min})
+    record = _new_broadcast_record(
+        actor_id=query.from_user.id,
+        text=msg,
+        media=media,
+        markup=markup,
+        delay_min=delay_min,
+        users=users,
+    )
+    _save_broadcast_record(record)
     _clear_broadcast_draft(context)
+
+    if delay_min > 0:
+        log_admin_action(query.from_user.id, "broadcast_scheduled", {
+            "broadcast_id": record["id"], "recipients": len(users), "delay_minutes": delay_min,
+            "status": "pending",
+        })
+        await query.edit_message_text(
+            f"⏰ *הודעה מתוזמנת נשמרה*\n\n"
+            f"סטטוס: *ממתין*\n"
+            f"נמענים: *{len(users)}*\n"
+            f"שליחה בעוד: *{delay_min} דקות*",
+            parse_mode="Markdown",
+            reply_markup=get_admin_inline_keyboard(query.from_user.id),
+        )
+        return ConversationHandler.END
+
+    await query.edit_message_text(f"📤 הבוט שולח את ההודעה ל־{len(users)} משתמשים...", reply_markup=None)
+    await _execute_broadcast_record(context.bot, record)
+    status_label = "נשלחה" if record.get("status") == "sent" else "הושלמה עם כשלים"
     await query.message.reply_text(
-        f"✅ *שליחה הושלמה!*\n\n✔️ הצליח: *{sent}*\n❌ נכשל: *{failed}*",
+        f"✅ *שליחה {status_label}!*\n\n"
+        f"✔️ הצליח: *{record.get('sent', 0)}*\n"
+        f"❌ נכשל: *{record.get('failed', 0)}*",
         parse_mode="Markdown",
         reply_markup=get_admin_inline_keyboard(query.from_user.id),
     )
@@ -8659,6 +8948,60 @@ async def _admin_coupon_edit_show(update: Update, context: ContextTypes.DEFAULT_
     return ADMIN_COUPON_EDIT_MENU
 
 
+async def admin_coupon_edit_option(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if not has_admin_permission(query.from_user.id, "coupon_manage"):
+        return ConversationHandler.END
+    code = context.user_data.get("coupon_edit_code")
+    coupons = load_json(COUPONS_FILE)
+    coupon = coupons.get(code) if isinstance(code, str) else None
+    if not isinstance(coupon, dict):
+        return ConversationHandler.END
+    data = query.data or ""
+    if data == "coupon_edit_expires_none":
+        coupon["expires"] = None
+        field, value = "expires", None
+    elif data == "coupon_edit_max_uses_none":
+        coupon["max_uses"] = None
+        field, value = "max_uses", None
+    else:
+        return await _admin_coupon_edit_show(update, context)
+    coupons[code] = coupon
+    save_json(COUPONS_FILE, coupons)
+    log_admin_action(query.from_user.id, "coupon_updated", {"code": code, "field": field, "before": "set", "after": value})
+    await query.edit_message_text(f"✅ הקופון `{code}` עודכן. המימושים הקיימים נשמרו.", parse_mode="Markdown", reply_markup=_coupon_edit_markup())
+    return ADMIN_COUPON_EDIT_MENU
+
+
+async def admin_coupon_edit_referral_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if not has_admin_permission(query.from_user.id, "coupon_manage"):
+        return ConversationHandler.END
+    mode = (query.data or "").removeprefix("coupon_edit_referral_")
+    if mode not in {"none", "total", "since"}:
+        return ADMIN_COUPON_EDIT_REFERRAL_MODE
+    code = context.user_data.get("coupon_edit_code")
+    coupons = load_json(COUPONS_FILE)
+    coupon = coupons.get(code) if isinstance(code, str) else None
+    if not isinstance(coupon, dict):
+        return ConversationHandler.END
+    if mode == "none":
+        before = {"mode": coupon.get("referral_mode", "none"), "minimum": coupon.get("referral_minimum", 0)}
+        coupon["referral_mode"] = "none"
+        coupon["referral_minimum"] = 0
+        coupons[code] = coupon
+        save_json(COUPONS_FILE, coupons)
+        log_admin_action(query.from_user.id, "coupon_updated", {"code": code, "field": "referral_requirement", "before": before, "after": {"mode": "none", "minimum": 0}})
+        await query.edit_message_text(f"✅ תנאי ההפניות של `{code}` בוטל.", parse_mode="Markdown", reply_markup=_coupon_edit_markup())
+        return ADMIN_COUPON_EDIT_MENU
+    context.user_data["coupon_edit_referral_mode"] = "since_created" if mode == "since" else mode
+    label = "מאז יצירת הקופון" if mode == "since" else "בסך הכול"
+    await query.edit_message_text(f"כמה הפניות מוצלחות נדרשות {label}? שלח מספר שלם חיובי.", reply_markup=_flow_back_markup("coupon_edit_back", "🔙 ביטול וחזרה"))
+    return ADMIN_COUPON_EDIT_REFERRAL_MINIMUM
+
+
 async def admin_coupon_edit_field(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -8669,18 +9012,28 @@ async def admin_coupon_edit_field(update: Update, context: ContextTypes.DEFAULT_
         return await _admin_coupon_edit_show(update, context)
     if field == "referrals":
         await query.edit_message_text(
-            "🤝 תנאי הפניות חדש?\n\nשלח `skip` ללא תנאי, `total` לסך הפניות, או `since` להפניות חדשות בלבד מאז יצירת הקופון.",
-            parse_mode="Markdown",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 ביטול וחזרה", callback_data="coupon_edit_back")]]),
+            "🤝 תנאי הפניות חדש?",
+            reply_markup=_coupon_referral_mode_markup("coupon_edit_referral"),
         )
         return ADMIN_COUPON_EDIT_REFERRAL_MODE
     context.user_data["coupon_edit_field"] = field
     prompts = {
         "coins": "🪙 שלח את שווי הקופון החדש במספר מטבעות חיובי.",
-        "expires": "📅 שלח תאריך תפוגה בפורמט `YYYY-MM-DD`, או `skip` ללא תוקף.",
-        "max_uses": "👥 שלח מגבלת מימושים חיובית, או `skip` ללא מגבלה. אי אפשר להגדיר מספר נמוך ממספר המימושים שכבר בוצעו.",
+        "expires": "📅 שלח תאריך תפוגה בפורמט `YYYY-MM-DD`, או בחר ללא תוקף.",
+        "max_uses": "👥 שלח מגבלת מימושים חיובית, או בחר ללא מגבלה. אי אפשר להגדיר מספר נמוך ממספר המימושים שכבר בוצעו.",
     }
-    await query.edit_message_text(prompts[field], parse_mode="Markdown", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 ביטול וחזרה", callback_data="coupon_edit_back")]]))
+    option_markup = _flow_back_markup("coupon_edit_back", "🔙 ביטול וחזרה")
+    if field == "expires":
+        option_markup = InlineKeyboardMarkup([
+            [InlineKeyboardButton("♾ ללא תאריך תפוגה", callback_data="coupon_edit_expires_none")],
+            [InlineKeyboardButton("🔙 ביטול וחזרה", callback_data="coupon_edit_back")],
+        ])
+    elif field == "max_uses":
+        option_markup = InlineKeyboardMarkup([
+            [InlineKeyboardButton("♾ ללא הגבלת שימושים", callback_data="coupon_edit_max_uses_none")],
+            [InlineKeyboardButton("🔙 ביטול וחזרה", callback_data="coupon_edit_back")],
+        ])
+    await query.edit_message_text(prompts[field], parse_mode="Markdown", reply_markup=option_markup)
     return ADMIN_COUPON_EDIT_VALUE
 
 
@@ -8818,6 +9171,67 @@ async def admin_coupon_new_start(update: Update, context: ContextTypes.DEFAULT_T
     await query.edit_message_text("🎟 *קופון חדש*\n\nשלח את *קוד הקופון* (אותיות/מספרים):", parse_mode="Markdown", reply_markup=_flow_back_markup())
     return ADMIN_COUPON_CODE
 
+def _new_coupon_expiry_markup() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("♾ ללא תאריך תפוגה", callback_data="coupon_new_expiry_none")],
+        [InlineKeyboardButton("🔙 חזרה", callback_data="back_admin")],
+    ])
+
+
+def _new_coupon_limit_markup() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("♾ ללא הגבלת שימושים", callback_data="coupon_new_limit_none")],
+        [InlineKeyboardButton("🔙 חזרה", callback_data="back_admin")],
+    ])
+
+
+def _coupon_referral_mode_markup(prefix: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🚫 ללא תנאי הפניות", callback_data=f"{prefix}_none")],
+        [InlineKeyboardButton("👥 סך הפניות בכל הזמנים", callback_data=f"{prefix}_total")],
+        [InlineKeyboardButton("🆕 הפניות מאז יצירת הקופון", callback_data=f"{prefix}_since")],
+        [InlineKeyboardButton("🔙 חזרה", callback_data="back_admin")],
+    ])
+
+
+async def admin_coupon_new_expiry_none(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if not has_admin_permission(query.from_user.id, "coupon_manage"):
+        return ConversationHandler.END
+    context.user_data["new_coupon_expiry"] = None
+    await query.edit_message_text("👥 מגבלת שימושים? הזן מספר חיובי או בחר ללא הגבלה.", reply_markup=_new_coupon_limit_markup())
+    return ADMIN_COUPON_LIMIT
+
+
+async def admin_coupon_new_limit_none(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if not has_admin_permission(query.from_user.id, "coupon_manage"):
+        return ConversationHandler.END
+    context.user_data["new_coupon_max_uses"] = None
+    await query.edit_message_text("👥 תנאי הפניות למימוש?", reply_markup=_coupon_referral_mode_markup("coupon_new_referral"))
+    return ADMIN_COUPON_REFERRAL_MODE
+
+
+async def admin_coupon_new_referral_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if not has_admin_permission(query.from_user.id, "coupon_manage"):
+        return ConversationHandler.END
+    mode = (query.data or "").removeprefix("coupon_new_referral_")
+    if mode not in {"none", "total", "since"}:
+        return ADMIN_COUPON_REFERRAL_MODE
+    context.user_data["new_coupon_referral_mode"] = "since_created" if mode == "since" else mode
+    if mode == "none":
+        context.user_data["new_coupon_referral_minimum"] = 0
+        await query.edit_message_text("שומר את הקופון ללא תנאי הפניות...")
+        return await admin_coupon_save(update, context)
+    label = "מאז יצירת הקופון" if mode == "since" else "בסך הכול"
+    await query.edit_message_text(f"כמה הפניות מוצלחות נדרשות {label}? שלח מספר שלם חיובי.", reply_markup=_flow_back_markup())
+    return ADMIN_COUPON_REFERRAL_MINIMUM
+
+
 async def admin_coupon_get_code(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not has_admin_permission(update.effective_user.id, "coupon_manage"):
         return ConversationHandler.END
@@ -8844,7 +9258,7 @@ async def admin_coupon_get_coins(update: Update, context: ContextTypes.DEFAULT_T
     except ValueError:
         await update.message.reply_text("❌ מספר לא תקין.", reply_markup=_flow_back_markup())
         return ADMIN_COUPON_COINS
-    await update.message.reply_text("📅 תאריך תפוגה? (`YYYY-MM-DD` או `skip`):", parse_mode="Markdown", reply_markup=_flow_back_markup())
+    await update.message.reply_text("📅 תאריך תפוגה? הזן `YYYY-MM-DD` או בחר ללא תוקף.", parse_mode="Markdown", reply_markup=_new_coupon_expiry_markup())
     return ADMIN_COUPON_EXPIRY
 
 async def admin_coupon_get_expiry(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -8860,7 +9274,7 @@ async def admin_coupon_get_expiry(update: Update, context: ContextTypes.DEFAULT_
         except ValueError:
             await update.message.reply_text("❌ פורמט לא תקין. נסה `YYYY-MM-DD` או `skip`.", parse_mode="Markdown", reply_markup=_flow_back_markup())
             return ADMIN_COUPON_EXPIRY
-    await update.message.reply_text("👥 מגבלת שימושים? (מספר או `skip`):", parse_mode="Markdown", reply_markup=_flow_back_markup())
+    await update.message.reply_text("👥 מגבלת שימושים? הזן מספר חיובי או בחר ללא הגבלה.", parse_mode="Markdown", reply_markup=_new_coupon_limit_markup())
     return ADMIN_COUPON_LIMIT
 
 async def admin_coupon_get_limit(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -8878,10 +9292,8 @@ async def admin_coupon_get_limit(update: Update, context: ContextTypes.DEFAULT_T
             return ADMIN_COUPON_LIMIT
     context.user_data["new_coupon_max_uses"] = max_uses
     await update.message.reply_text(
-        "👥 תנאי הפניות למימוש?\n\n"
-        "שלח `skip` ללא תנאי, `total` כדי לדרוש סך הפניות בכל הזמנים, או `since` כדי לדרוש הפניות חדשות בלבד מרגע יצירת הקופון.",
-        parse_mode="Markdown",
-        reply_markup=_flow_back_markup(),
+        "👥 תנאי הפניות למימוש?",
+        reply_markup=_coupon_referral_mode_markup("coupon_new_referral"),
     )
     return ADMIN_COUPON_REFERRAL_MODE
 
@@ -9429,7 +9841,7 @@ async def handle_video(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         f"✅ הסרטון נוסף למאגר ({len(videos)} בסך הכול).\n"
         f"⏱ אורך: {format_duration(video.duration or 0)}\n"
-        "📁 קטגוריה: רנדומלי\n\n"
+        f"📁 קטגוריה: {UNSORTED_CATEGORY_LABEL}\n\n"
         "אפשר לשייך קטגוריה אחר כך דרך גלריית סרטונים ← קטגוריות ← מיון לקטגוריות."
     )
     return ConversationHandler.END
@@ -9471,6 +9883,7 @@ async def admin_video_preview_receive(update: Update, context: ContextTypes.DEFA
         "duration": dur,
         "file_size": size,
         "category": cat,
+        "categories": [cat] if cat else [DEFAULT_CATEGORY],
         "preview": preview,
         "added_at": str(datetime.now())
     })
@@ -9630,9 +10043,18 @@ def main():
         states={
             ADMIN_COUPON_CODE:   [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_coupon_get_code)],
             ADMIN_COUPON_COINS:  [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_coupon_get_coins)],
-            ADMIN_COUPON_EXPIRY: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_coupon_get_expiry)],
-            ADMIN_COUPON_LIMIT:  [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_coupon_get_limit)],
-            ADMIN_COUPON_REFERRAL_MODE: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_coupon_get_referral_mode)],
+            ADMIN_COUPON_EXPIRY: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, admin_coupon_get_expiry),
+                CallbackQueryHandler(admin_coupon_new_expiry_none, pattern="^coupon_new_expiry_none$"),
+            ],
+            ADMIN_COUPON_LIMIT: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, admin_coupon_get_limit),
+                CallbackQueryHandler(admin_coupon_new_limit_none, pattern="^coupon_new_limit_none$"),
+            ],
+            ADMIN_COUPON_REFERRAL_MODE: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, admin_coupon_get_referral_mode),
+                CallbackQueryHandler(admin_coupon_new_referral_button, pattern=r"^coupon_new_referral_(none|total|since)$"),
+            ],
             ADMIN_COUPON_REFERRAL_MINIMUM: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_coupon_get_referral_minimum)],
         },
         fallbacks=[CommandHandler("cancel", cancel), CallbackQueryHandler(back_admin, pattern="^back_admin$")],
@@ -9645,8 +10067,14 @@ def main():
                 CallbackQueryHandler(admin_coupon_edit_field, pattern=r"^coupon_edit_field_(coins|expires|max_uses|referrals)$"),
                 CallbackQueryHandler(admin_coupon_edit_back, pattern="^coupon_edit_back$"),
             ],
-            ADMIN_COUPON_EDIT_VALUE: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_coupon_edit_value)],
-            ADMIN_COUPON_EDIT_REFERRAL_MODE: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_coupon_edit_referral_mode)],
+            ADMIN_COUPON_EDIT_VALUE: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, admin_coupon_edit_value),
+                CallbackQueryHandler(admin_coupon_edit_option, pattern=r"^coupon_edit_(expires_none|max_uses_none)$"),
+            ],
+            ADMIN_COUPON_EDIT_REFERRAL_MODE: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, admin_coupon_edit_referral_mode),
+                CallbackQueryHandler(admin_coupon_edit_referral_button, pattern=r"^coupon_edit_referral_(none|total|since)$"),
+            ],
             ADMIN_COUPON_EDIT_REFERRAL_MINIMUM: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_coupon_edit_referral_minimum)],
         },
         fallbacks=[
@@ -9887,6 +10315,8 @@ def main():
         ("^admin_coins_menu$",          admin_coins_menu),
         ("^admin_coin_control$",         admin_coin_control_menu),
         ("^admin_menu_communications$", admin_menu_communications),
+        ("^admin_broadcast_status$",   admin_broadcast_status),
+        (r"^broadcast_cancel_[0-9a-f]+$", admin_broadcast_cancel),
         ("^admin_menu_system$",         admin_menu_system),
         ("^admin_managers$",            admin_managers_menu),
         ("^admin_owner_assistant_settings$", admin_owner_assistant_settings),
@@ -9957,6 +10387,10 @@ def main():
         ("^cat_browse_current$",        admin_cat_browse_current),
         ("^cat_browse_send_all$",       admin_cat_browse_send_all),
         ("^admin_cat_edit$",            admin_cat_edit_menu),
+        ("^admin_cat_visibility$",       admin_cat_visibility_menu),
+        (r"^cat_visibility_toggle_\d+$", admin_cat_visibility_toggle),
+        ("^admin_cat_random$",           admin_cat_random_menu),
+        (r"^cat_random_toggle_\d+$",    admin_cat_random_toggle),
         ("^admin_cat_clone$",           admin_cat_clone_start),
         (r"^cat_clone_pick_\d+$",       admin_cat_clone_pick),
         ("^admin_cat_merge$",           admin_cat_merge_start),
@@ -10052,6 +10486,7 @@ def main():
         )
         asyncio.create_task(notify_back_online())
         asyncio.create_task(daily_owner_report_loop(app.bot))
+        asyncio.create_task(scheduled_broadcast_loop(app.bot))
         while True:
             await asyncio.sleep(3600)
 

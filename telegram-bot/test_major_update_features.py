@@ -486,13 +486,13 @@ async def run():
         assert "מכפיל הפניות" in multiplier_text
         assert "מחיר PayPal" in multiplier_text and "המתנה היומית" in multiplier_text
 
-        # Legacy category values are migrated safely and can hold multiple memberships.
+        # Legacy category values are migrated safely to exactly one unassigned category.
         videos = bot.load_videos_with_entry_ids()
         assert bot.video_categories(videos[0]) == ["ישראלי"]
         videos[0]["categories"] = ["ישראלי", "קצר"]
         bot.normalize_video_categories(videos[0])
         bot.save_json(bot.VIDEOS_FILE, videos)
-        assert set(bot.video_categories(bot.load_json(bot.VIDEOS_FILE)[0])) == {"ישראלי", "קצר"}
+        assert bot.video_categories(bot.load_json(bot.VIDEOS_FILE)[0]) == [bot.DEFAULT_CATEGORY]
         legacy_random_video = {"file_id": "legacy-random", "duration": 9, "category": "כללי"}
         bot.normalize_video_categories(legacy_random_video)
         assert bot.video_categories(legacy_random_video) == ["רנדומלי"]
