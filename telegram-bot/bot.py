@@ -578,6 +578,30 @@ def apply_restore_payloads(payloads: dict) -> None:
     _write_restore_payloads_atomic(payloads)
 
 
+def _restore_payload_matches_after_save(filename: str, expected, actual) -> bool:
+    """Validate persisted restore data without rejecting harmless settings normalization.
+
+    ``settings.json`` is a live configuration document. Its writer may retain runtime
+    keys or normalize category/review ordering while the restore is being applied.
+    Restore must still fail on a missing or changed expected value, but exact whole-file
+    equality is too strict and caused false rollback failures in production.
+    """
+    if filename != "settings.json":
+        return actual == expected
+    if not isinstance(expected, dict) or not isinstance(actual, dict):
+        return False
+    for key, expected_value in expected.items():
+        if key not in actual:
+            return False
+        actual_value = actual[key]
+        if key in {"categories", DUPLICATE_REVIEWED_KEY} and isinstance(expected_value, list) and isinstance(actual_value, list):
+            if set(actual_value) != set(expected_value):
+                return False
+        elif actual_value != expected_value:
+            return False
+    return True
+
+
 def load_videos_with_entry_ids():
     """Load video records and permanently normalize IDs and category memberships."""
     videos = load_json(VIDEOS_FILE)
@@ -9714,7 +9738,14 @@ async def admin_restore_apply(update: Update, context: ContextTypes.DEFAULT_TYPE
         logger.info("RESTORE_DATA_SAVED actor=%s", query.from_user.id)
         for filename, expected in merged_payloads.items():
             actual = load_json(DATA_DIR / filename)
-            if actual != expected:
+            if not _restore_payload_matches_after_save(filename, expected, actual):
+                logger.error(
+                    "RESTORE_VERIFY_MISMATCH actor=%s file=%s expected_keys=%s actual_keys=%s",
+                    query.from_user.id,
+                    filename,
+                    sorted(expected.keys()) if isinstance(expected, dict) else None,
+                    sorted(actual.keys()) if isinstance(actual, dict) else None,
+                )
                 raise RuntimeError(f"אימות המיזוג נכשל בקובץ {filename}.")
         logger.info("RESTORE_DATA_RELOADED actor=%s files=%s", query.from_user.id, sorted(merged_payloads.keys()))
         logger.info("RESTORE_USERS_MERGED actor=%s", query.from_user.id) if "users.json" in merged_payloads else None
