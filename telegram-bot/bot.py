@@ -78,6 +78,7 @@ ALERTS_FILE = DATA_DIR / "alerts.json"
 DUPLICATE_REVIEWS_FILE = DATA_DIR / "duplicate_reviews.json"
 BROADCASTS_FILE = DATA_DIR / "broadcasts.json"
 RESTORE_UNDO_FILE = DATA_DIR / "restore_undo.json"
+RESTORE_SESSION_FILE = DATA_DIR / "restore_session.json"
 AUTO_BACKUPS_DIR = DATA_DIR / "auto_backups"
 MAX_AUTO_BACKUPS = 30
 
@@ -9589,6 +9590,7 @@ async def admin_restore_start(update: Update, context: ContextTypes.DEFAULT_TYPE
     if not is_admin(query.from_user.id):
         return ConversationHandler.END
     context.user_data.pop("pending_restore", None)
+    save_json(RESTORE_SESSION_FILE, {})
     logger.info("RESTORE_START actor=%s", query.from_user.id)
     await query.edit_message_text(
         "📥 *שחזור מגיבוי*\n\n"
@@ -9641,6 +9643,12 @@ async def admin_restore_receive(update: Update, context: ContextTypes.DEFAULT_TY
         return ADMIN_RESTORE
 
     context.user_data["pending_restore"] = payloads
+    save_json(RESTORE_SESSION_FILE, {
+        "actor_id": update.effective_user.id,
+        "payloads": payloads,
+        "received_at": datetime.now(timezone.utc).isoformat(),
+    })
+    logger.info("RESTORE_SESSION_SAVED actor=%s file_exists=%s", update.effective_user.id, RESTORE_SESSION_FILE.exists())
     try:
         await update.message.reply_text(
             "🔎 תצוגה מקדימה של הגיבוי\n\n"
@@ -9665,11 +9673,26 @@ async def admin_restore_receive(update: Update, context: ContextTypes.DEFAULT_TY
 
 async def admin_restore_apply(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
+    session = load_json(RESTORE_SESSION_FILE)
+    session_payloads = session.get("payloads") if isinstance(session, dict) and session.get("actor_id") == query.from_user.id else None
+    logger.info(
+        "RESTORE_BUTTON_CLICKED callback_data=%s user_id=%s conversation_state=%s restore_session_exists=%s backup_file_exists=%s",
+        query.data, query.from_user.id, context.user_data.get("_conversation_state"), RESTORE_SESSION_FILE.exists(), bool(session_payloads),
+    )
+    log_admin_action(query.from_user.id, "restore_button_clicked", {
+        "callback_data": query.data,
+        "conversation_state": context.user_data.get("_conversation_state"),
+        "restore_session_exists": RESTORE_SESSION_FILE.exists(),
+        "backup_file_exists": bool(session_payloads),
+    }, source="telegram_callback")
     await query.answer()
     if not is_admin(query.from_user.id):
+        logger.warning("RESTORE_FAILED stage=permission actor=%s", query.from_user.id)
         return ConversationHandler.END
     logger.info("RESTORE_CONFIRM_RECEIVED actor=%s callback=%s", query.from_user.id, query.data)
-    payloads = context.user_data.get("pending_restore")
+    logger.info("RESTORE_APPLY_ENTERED actor=%s", query.from_user.id)
+    log_admin_action(query.from_user.id, "restore_apply_entered", {"callback_data": query.data}, source="telegram_callback")
+    payloads = context.user_data.get("pending_restore") or session_payloads
     if not isinstance(payloads, dict) or not payloads:
         await query.edit_message_text("❌ אין גיבוי מוכן לשחזור. שלח את קובץ הגיבוי מחדש.", reply_markup=get_admin_inline_keyboard())
         return ConversationHandler.END
@@ -9699,7 +9722,10 @@ async def admin_restore_apply(update: Update, context: ContextTypes.DEFAULT_TYPE
         logger.info("RESTORE_LOGS_MERGED actor=%s", query.from_user.id) if any(name in merged_payloads for name in ("admin_actions.json", "coin_transactions.json", "ai_audit.json")) else None
         log_admin_action(query.from_user.id, "backup_restore_merged", {"files": sorted(payloads.keys()), "mode": "additive"})
         logger.info("RESTORE_COMPLETED actor=%s", query.from_user.id)
+        logger.info("RESTORE_APPLY_EXITED actor=%s status=completed", query.from_user.id)
+        log_admin_action(query.from_user.id, "restore_apply_exited", {"status": "completed"}, source="telegram_callback")
         context.user_data.pop("pending_restore", None)
+        save_json(RESTORE_SESSION_FILE, {})
         await query.edit_message_text(
             "✅ המיזוג מהגיבוי הושלם בהצלחה!\n\n"
             f"{restore_summary(merged_payloads)}\n\n"
@@ -9718,6 +9744,8 @@ async def admin_restore_apply(update: Update, context: ContextTypes.DEFAULT_TYPE
         except Exception:
             logger.exception("Backup rollback failed")
         logger.exception("RESTORE_FAILED actor=%s", query.from_user.id, exc_info=True)
+        logger.info("RESTORE_APPLY_EXITED actor=%s status=failed", query.from_user.id)
+        log_admin_action(query.from_user.id, "restore_apply_exited", {"status": "failed", "error": str(exc)[:500]}, source="telegram_callback", status="failed")
         safe_reason = re.sub(r"(?:/|\\\\)[^\\s]+", "<נתיב>", str(exc).strip() or "סיבה לא ידועה")[:500]
         await query.edit_message_text(f"❌ השחזור נכשל: {safe_reason}. הנתונים הוחזרו למצב שהיה לפני הניסיון.", parse_mode=None, reply_markup=get_admin_inline_keyboard())
     return ConversationHandler.END
@@ -9739,6 +9767,7 @@ async def admin_restore_undo(update: Update, context: ContextTypes.DEFAULT_TYPE)
         for filename in snapshot.get("missing", []):
             (DATA_DIR / filename).unlink(missing_ok=True)
         save_json(RESTORE_UNDO_FILE, {})
+        save_json(RESTORE_SESSION_FILE, {})
         log_admin_action(query.from_user.id, "backup_restore_undo", {"files": sorted(files.keys())})
         await query.edit_message_text("↩️ הוחזר המצב שהיה לפני המיזוג.", reply_markup=get_admin_inline_keyboard())
     except Exception as exc:

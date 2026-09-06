@@ -150,6 +150,8 @@ async def run():
         bot.ALERTS_FILE = data / "alerts.json"
         bot.DUPLICATE_REVIEWS_FILE = data / "duplicate_reviews.json"
         bot.AUTO_BACKUPS_DIR = data / "auto_backups"
+        bot.RESTORE_UNDO_FILE = data / "restore_undo.json"
+        bot.RESTORE_SESSION_FILE = data / "restore_session.json"
         owner = bot.ADMIN_ID
         bot.ensure_data_files()
         write(bot.SETTINGS_FILE, {"categories": ["כללי", "ישראלי", "קצר"], "admin_managers": {}})

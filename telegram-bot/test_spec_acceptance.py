@@ -65,6 +65,7 @@ async def run():
         bot.ADMIN_ACTIONS_FILE = root / "admin_actions.json"
         bot.BROADCASTS_FILE = root / "broadcasts.json"
         bot.RESTORE_UNDO_FILE = root / "restore_undo.json"
+        bot.RESTORE_SESSION_FILE = root / "restore_session.json"
         bot.AUTO_BACKUPS_DIR = root / "auto_backups"
         bot.is_admin = lambda user_id: True
         bot.get_admin_inline_keyboard = lambda user_id=None: None
@@ -139,17 +140,17 @@ async def run():
         bot.save_json(bot.ADMIN_ACTIONS_FILE, [])
         bot.create_auto_backup = lambda *args, **kwargs: True
         bot.build_zip_of_data = lambda: b"snapshot"
+        restore_payloads = {
+            "users.json": {"current": {"balance": 1}, "restored": {"balance": 7}},
+            "videos.json": [
+                {"entry_id": "v-current", "file_id": "current-file", "duration": 999},
+                {"entry_id": "v-restored", "file_id": "restored-file", "duration": 2},
+            ],
+        }
+        # Critical production-path assertion: context.user_data is empty, but the persisted restore session survives.
+        bot.save_json(bot.RESTORE_SESSION_FILE, {"actor_id": 1, "payloads": restore_payloads})
         restore_query = FakeQuery("admin_restore_apply")
-        restore_context = SimpleNamespace(
-            user_data={"pending_restore": {
-                "users.json": {"current": {"balance": 1}, "restored": {"balance": 7}},
-                "videos.json": [
-                    {"entry_id": "v-current", "file_id": "current-file", "duration": 999},
-                    {"entry_id": "v-restored", "file_id": "restored-file", "duration": 2},
-                ],
-            }},
-            bot=FakeBot(),
-        )
+        restore_context = SimpleNamespace(user_data={}, bot=FakeBot())
         await bot.admin_restore_apply(SimpleNamespace(callback_query=restore_query), restore_context)
         restored_users = bot.load_json(bot.USERS_FILE)
         restored_videos = bot.load_json(bot.VIDEOS_FILE)
