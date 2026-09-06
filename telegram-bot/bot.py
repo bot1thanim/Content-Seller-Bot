@@ -77,6 +77,7 @@ USER_ACTIVITY_FILE = DATA_DIR / "user_activity.json"
 ALERTS_FILE = DATA_DIR / "alerts.json"
 DUPLICATE_REVIEWS_FILE = DATA_DIR / "duplicate_reviews.json"
 BROADCASTS_FILE = DATA_DIR / "broadcasts.json"
+RESTORE_UNDO_FILE = DATA_DIR / "restore_undo.json"
 AUTO_BACKUPS_DIR = DATA_DIR / "auto_backups"
 MAX_AUTO_BACKUPS = 30
 
@@ -477,19 +478,98 @@ def restore_summary(payloads: dict) -> str:
     return "\n".join(parts)
 
 
-def apply_restore_payloads(payloads: dict) -> None:
-    """Write only validated data files; callers must create a rollback snapshot first."""
+def _restore_video_key(video: object) -> str | None:
+    if not isinstance(video, dict):
+        return None
+    for field in ("entry_id", "file_id", "file_unique_id"):
+        value = video.get(field)
+        if value not in (None, ""):
+            return f"{field}:{value}"
+    return None
+
+
+def _restore_list_key(item: object) -> str:
+    try:
+        return json.dumps(item, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    except TypeError:
+        return repr(item)
+
+
+def merge_restore_payloads(payloads: dict) -> dict:
+    """Merge backup data into current data without overwriting current records."""
+    merged = {}
+    for filename, incoming in payloads.items():
+        path = DATA_DIR / filename
+        current = load_json(path) if path.exists() else None
+        if filename == "videos.json":
+            current_list = current if isinstance(current, list) else []
+            by_key = {_restore_video_key(item): item for item in current_list if _restore_video_key(item)}
+            result = list(current_list)
+            for item in incoming if isinstance(incoming, list) else []:
+                key = _restore_video_key(item)
+                if key is None or key not in by_key:
+                    result.append(item)
+                    if key:
+                        by_key[key] = item
+            merged[filename] = normalize_restored_videos(result)
+        elif filename in {"users.json", "coins.json", "referrals.json", "coupons.json", "settings.json"}:
+            current_dict = dict(current) if isinstance(current, dict) else {}
+            if isinstance(incoming, dict):
+                for key, value in incoming.items():
+                    if key not in current_dict:
+                        current_dict[key] = value
+                if filename == "settings.json":
+                    current_categories = current_dict.get("categories", [])
+                    incoming_categories = incoming.get("categories", [])
+                    current_dict["categories"] = normalize_category_list(list(current_categories if isinstance(current_categories, list) else []) + list(incoming_categories if isinstance(incoming_categories, list) else []))
+            merged[filename] = current_dict
+        elif isinstance(incoming, list):
+            current_list = current if isinstance(current, list) else []
+            seen = {_restore_list_key(item) for item in current_list}
+            result = list(current_list)
+            for item in incoming:
+                key = _restore_list_key(item)
+                if key not in seen:
+                    result.append(item)
+                    seen.add(key)
+            merged[filename] = result
+        elif isinstance(incoming, dict):
+            current_dict = dict(current) if isinstance(current, dict) else {}
+            for key, value in incoming.items():
+                current_dict.setdefault(key, value)
+            merged[filename] = current_dict
+        else:
+            merged[filename] = incoming
+    if "duplicate_reviews.json" in merged:
+        current_reviews = load_json(DUPLICATE_REVIEWS_FILE) if DUPLICATE_REVIEWS_FILE.exists() else []
+        merged["duplicate_reviews.json"] = sorted(set(current_reviews if isinstance(current_reviews, list) else []) | set(merged["duplicate_reviews.json"] if isinstance(merged["duplicate_reviews.json"], list) else []))
+    return merged
+
+
+def _snapshot_current_restore_state() -> dict:
+    files = {}
+    missing = []
+    for filename in BACKUP_ALLOWED_FILES:
+        path = DATA_DIR / filename
+        if path.exists():
+            files[filename] = load_json(path)
+        else:
+            missing.append(filename)
+    return {"files": files, "missing": sorted(missing), "created_at": datetime.now(timezone.utc).isoformat()}
+
+
+def _write_restore_payloads_atomic(payloads: dict) -> None:
     DATA_DIR.mkdir(exist_ok=True)
-    for filename, data in payloads.items():
-        save_json(DATA_DIR / filename, data)
-    # Old backups kept review marks inside settings; new ones have a dedicated file too.
+    save_json_bundle_with_rollback({DATA_DIR / filename: data for filename, data in payloads.items()})
     if "duplicate_reviews.json" in payloads:
         save_reviewed_non_duplicate_signatures(payloads["duplicate_reviews.json"])
-    elif "settings.json" in payloads:
-        legacy_reviews = payloads["settings.json"].get(DUPLICATE_REVIEWED_KEY, [])
-        save_reviewed_non_duplicate_signatures(legacy_reviews if isinstance(legacy_reviews, list) else [])
     if "videos.json" in payloads:
         load_videos_with_entry_ids()
+
+
+def apply_restore_payloads(payloads: dict) -> None:
+    """Write validated payloads atomically; callers must create a rollback snapshot first."""
+    _write_restore_payloads_atomic(payloads)
 
 
 def load_videos_with_entry_ids():
@@ -9508,7 +9588,7 @@ async def admin_restore_start(update: Update, context: ContextTypes.DEFAULT_TYPE
         "📥 *שחזור מגיבוי*\n\n"
         "שלח קובץ ZIP של גיבוי הנתונים. הקובץ ייבדק תחילה ולא ישכתב דבר עד שתאשר ידנית.\n"
         "מגבלת קובץ: 20MB.\n\n"
-        "⚠️ לאחר האישור, הנתונים הקיימים יוחלפו — אך תקבל קודם גיבוי חירום של המצב הנוכחי.",
+        "✅ לאחר האישור יבוצע מיזוג מצטבר: נתונים קיימים לא יימחקו ולא יידרסו. ייווצר Snapshot אוטומטי וניתן יהיה לבצע חזור.",
         parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("❌ ביטול / חזור", callback_data="back_admin")]]),
     )
@@ -9555,7 +9635,7 @@ async def admin_restore_receive(update: Update, context: ContextTypes.DEFAULT_TY
         await update.message.reply_text(
             "🔎 תצוגה מקדימה של הגיבוי\n\n"
             f"{restore_summary(payloads)}\n\n"
-            "הנתונים עדיין לא שונו. לחץ על אשר שחזור כדי לבצע החלפה, או על ביטול.",
+            "הנתונים עדיין לא שונו. לחץ על אשר שחזור כדי לבצע מיזוג, או על ביטול.",
             parse_mode=None,
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("✅ אשר שחזור", callback_data="admin_restore_apply")],
@@ -9579,66 +9659,74 @@ async def admin_restore_apply(update: Update, context: ContextTypes.DEFAULT_TYPE
         return ConversationHandler.END
     payloads = context.user_data.get("pending_restore")
     if not isinstance(payloads, dict) or not payloads:
-        await query.edit_message_text(
-            "❌ אין גיבוי מוכן לשחזור. שלח את קובץ הגיבוי מחדש.",
-            reply_markup=get_admin_inline_keyboard(),
-        )
+        await query.edit_message_text("❌ אין גיבוי מוכן לשחזור. שלח את קובץ הגיבוי מחדש.", reply_markup=get_admin_inline_keyboard())
         return ConversationHandler.END
 
-    original_payloads = {}
-    missing_before_restore = set()
-    for filename in payloads:
-        filepath = DATA_DIR / filename
-        if filepath.exists():
-            original_payloads[filename] = load_json(filepath)
-        else:
-            missing_before_restore.add(filename)
-    restore_started = False
+    before_state = _snapshot_current_restore_state()
+    merged_payloads = merge_restore_payloads(payloads)
     try:
         auto_snapshot = create_auto_backup("restore_data", query.from_user.id)
         if not auto_snapshot:
             raise RuntimeError("automatic backup creation failed")
-        snapshot = build_zip_of_data()
+        emergency = build_zip_of_data()
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        await context.bot.send_document(
-            chat_id=ADMIN_ID,
-            document=snapshot,
-            filename=f"before_restore_{stamp}.zip",
-            caption="💾 גיבוי חירום אוטומטי לפני שחזור",
-        )
-        restore_started = True
-        apply_restore_payloads(payloads)
-        for filename, expected in payloads.items():
+        await context.bot.send_document(chat_id=ADMIN_ID, document=emergency, filename=f"before_restore_{stamp}.zip", caption="💾 גיבוי חירום אוטומטי לפני מיזוג")
+        save_json(RESTORE_UNDO_FILE, before_state)
+        apply_restore_payloads(merged_payloads)
+        for filename, expected in merged_payloads.items():
             actual = load_json(DATA_DIR / filename)
             if actual != expected:
-                raise RuntimeError(f"אימות השחזור נכשל בקובץ {filename}.")
-        log_admin_action(query.from_user.id, "backup_restored", {"files": sorted(payloads.keys())})
+                raise RuntimeError(f"אימות המיזוג נכשל בקובץ {filename}.")
+        log_admin_action(query.from_user.id, "backup_restore_merged", {"files": sorted(payloads.keys()), "mode": "additive"})
         context.user_data.pop("pending_restore", None)
         await query.edit_message_text(
-            "✅ השחזור הושלם בהצלחה!\n\n"
-            f"{restore_summary(payloads)}\n\n"
-            "נשלח אליך גם גיבוי חירום של המצב שהיה לפני השחזור.",
+            "✅ המיזוג מהגיבוי הושלם בהצלחה!\n\n"
+            f"{restore_summary(merged_payloads)}\n\n"
+            "הנתונים הקיימים נשמרו. ניתן לחזור למצב הקודם באמצעות הכפתור למטה.",
             parse_mode=None,
-            reply_markup=get_admin_inline_keyboard(),
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("↩️ חזור למצב הקודם", callback_data="admin_restore_undo")],
+                [InlineKeyboardButton("🔙 חזרה לפאנל", callback_data="back_admin")],
+            ]),
         )
     except Exception as exc:
-        if restore_started:
-            try:
-                for filename, previous in original_payloads.items():
-                    save_json(DATA_DIR / filename, previous)
-                for filename in missing_before_restore:
-                    (DATA_DIR / filename).unlink(missing_ok=True)
-            except Exception:
-                logger.exception("Backup rollback failed")
+        try:
+            _write_restore_payloads_atomic(before_state.get("files", {}))
+            for filename in before_state.get("missing", []):
+                (DATA_DIR / filename).unlink(missing_ok=True)
+        except Exception:
+            logger.exception("Backup rollback failed")
         logger.exception("Backup restore failed")
-        safe_reason = str(exc).strip() or "סיבה לא ידועה"
-        safe_reason = re.sub(r"(?:/|\\\\)[^\\s]+", "<נתיב>", safe_reason)[:500]
-        await query.edit_message_text(
-            f"❌ השחזור נכשל: {safe_reason}. הנתונים הוחזרו למצב שהיה לפני ניסיון השחזור; השתמש בגיבוי החירום שנשלח לפני הפעולה אם נדרש.",
-            parse_mode=None,
-            reply_markup=get_admin_inline_keyboard(),
-        )
+        safe_reason = re.sub(r"(?:/|\\\\)[^\\s]+", "<נתיב>", str(exc).strip() or "סיבה לא ידועה")[:500]
+        await query.edit_message_text(f"❌ השחזור נכשל: {safe_reason}. הנתונים הוחזרו למצב שהיה לפני הניסיון.", parse_mode=None, reply_markup=get_admin_inline_keyboard())
     return ConversationHandler.END
+
+
+async def admin_restore_undo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if not is_admin(query.from_user.id):
+        return
+    snapshot = load_json(RESTORE_UNDO_FILE)
+    files = snapshot.get("files") if isinstance(snapshot, dict) else None
+    if not isinstance(files, dict) or not files:
+        await query.edit_message_text("❌ אין Snapshot זמין לחזרה.", reply_markup=get_admin_inline_keyboard())
+        return
+    current_state = _snapshot_current_restore_state()
+    try:
+        apply_restore_payloads(files)
+        for filename in snapshot.get("missing", []):
+            (DATA_DIR / filename).unlink(missing_ok=True)
+        save_json(RESTORE_UNDO_FILE, {})
+        log_admin_action(query.from_user.id, "backup_restore_undo", {"files": sorted(files.keys())})
+        await query.edit_message_text("↩️ הוחזר המצב שהיה לפני המיזוג.", reply_markup=get_admin_inline_keyboard())
+    except Exception as exc:
+        try:
+            _write_restore_payloads_atomic(current_state.get("files", {}))
+        except Exception:
+            logger.exception("Undo rollback failed")
+        logger.exception("Backup restore undo failed")
+        await query.edit_message_text(f"❌ החזרה נכשלה: {str(exc)[:300]}", reply_markup=get_admin_inline_keyboard())
 
 # ─── Admin: global reset ──────────────────────────────────────────────────────
 
@@ -10317,6 +10405,8 @@ def main():
         ("^admin_menu_communications$", admin_menu_communications),
         ("^admin_broadcast_status$",   admin_broadcast_status),
         (r"^broadcast_cancel_[0-9a-f]+$", admin_broadcast_cancel),
+        ("^admin_restore_apply$",       admin_restore_apply),
+        ("^admin_restore_undo$",         admin_restore_undo),
         ("^admin_menu_system$",         admin_menu_system),
         ("^admin_managers$",            admin_managers_menu),
         ("^admin_owner_assistant_settings$", admin_owner_assistant_settings),

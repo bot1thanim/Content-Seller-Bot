@@ -45,16 +45,30 @@ class FakeBot:
         self.sent.append(kwargs)
         return SimpleNamespace(message_id=1)
 
+    async def send_document(self, **kwargs):
+        self.sent.append({"document": True, **kwargs})
+        return SimpleNamespace(message_id=1)
+
 
 async def run():
     with TemporaryDirectory() as temp:
         root = Path(temp)
         bot.DATA_DIR = root
+        bot.USERS_FILE = root / "users.json"
+        bot.COINS_FILE = root / "coins.json"
+        bot.REFERRALS_FILE = root / "referrals.json"
+        bot.ORDERS_FILE = root / "orders.json"
+        bot.COUPONS_FILE = root / "coupons.json"
         bot.VIDEOS_FILE = root / "videos.json"
         bot.TRASH_FILE = root / "trash.json"
         bot.SETTINGS_FILE = root / "settings.json"
         bot.ADMIN_ACTIONS_FILE = root / "admin_actions.json"
         bot.BROADCASTS_FILE = root / "broadcasts.json"
+        bot.RESTORE_UNDO_FILE = root / "restore_undo.json"
+        bot.AUTO_BACKUPS_DIR = root / "auto_backups"
+        bot.is_admin = lambda user_id: True
+        bot.get_admin_inline_keyboard = lambda user_id=None: None
+        bot.log_admin_action = lambda *args, **kwargs: None
         bot.save_json(bot.VIDEOS_FILE, [])
         bot.save_json(bot.TRASH_FILE, [])
         bot.save_json(bot.SETTINGS_FILE, {"categories": [bot.DEFAULT_CATEGORY, "דרמה"]})
@@ -118,6 +132,38 @@ async def run():
             for button in row
         ]
         assert "coupon_new_expiry_none" in coupon_callbacks
+
+        # Restore confirmation performs additive merge and preserves current records.
+        bot.save_json(bot.USERS_FILE, {"current": {"balance": 99, "permissions": ["gallery"]}})
+        bot.save_json(bot.VIDEOS_FILE, [{"entry_id": "v-current", "file_id": "current-file", "duration": 1}])
+        bot.save_json(bot.ADMIN_ACTIONS_FILE, [])
+        bot.create_auto_backup = lambda *args, **kwargs: True
+        bot.build_zip_of_data = lambda: b"snapshot"
+        restore_query = FakeQuery("admin_restore_apply")
+        restore_context = SimpleNamespace(
+            user_data={"pending_restore": {
+                "users.json": {"current": {"balance": 1}, "restored": {"balance": 7}},
+                "videos.json": [
+                    {"entry_id": "v-current", "file_id": "current-file", "duration": 999},
+                    {"entry_id": "v-restored", "file_id": "restored-file", "duration": 2},
+                ],
+            }},
+            bot=FakeBot(),
+        )
+        await bot.admin_restore_apply(SimpleNamespace(callback_query=restore_query), restore_context)
+        restored_users = bot.load_json(bot.USERS_FILE)
+        restored_videos = bot.load_json(bot.VIDEOS_FILE)
+        assert restored_users["current"]["balance"] == 99
+        assert "restored" in restored_users
+        assert len([v for v in restored_videos if v["entry_id"] == "v-current"]) == 1
+        assert "v-restored" in {v["entry_id"] for v in restored_videos}
+        assert any("חזור למצב הקודם" in button.text for row in restore_query.edits[-1][1]["reply_markup"].inline_keyboard for button in row)
+        undo_query = FakeQuery("admin_restore_undo")
+        await bot.admin_restore_undo(SimpleNamespace(callback_query=undo_query), SimpleNamespace())
+        assert bot.load_json(bot.USERS_FILE) == {"current": {"balance": 99, "permissions": ["gallery"]}}
+        undone_videos = bot.load_json(bot.VIDEOS_FILE)
+        assert len(undone_videos) == 1
+        assert undone_videos[0]["entry_id"] == "v-current" and undone_videos[0]["file_id"] == "current-file" and undone_videos[0]["duration"] == 1
 
         # Scheduling after confirmation persists pending status and does not send now.
         fake_bot = FakeBot()

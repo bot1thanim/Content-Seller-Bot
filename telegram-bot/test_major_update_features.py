@@ -588,8 +588,10 @@ async def run():
         apply_update = FakeUpdate("admin_restore_apply", owner)
         apply_context = SimpleNamespace(bot=RestoreBot(full_backup), user_data={"pending_restore": full_payloads})
         assert await bot.admin_restore_apply(apply_update, apply_context) == bot.ConversationHandler.END
-        assert bot.load_json(bot.USERS_FILE) == full_payloads["users.json"]
-        assert "השחזור הושלם בהצלחה" in apply_update.callback_query.edits[-1][0]
+        restored_after_merge = bot.load_json(bot.USERS_FILE)
+        assert restored_after_merge["77"]["first_name"] == "Changed after preview"
+        assert restored_after_merge["88"]["first_name"] == "Extra"
+        assert "המיזוג מהגיבוי הושלם בהצלחה" in apply_update.callback_query.edits[-1][0]
         assert apply_context.user_data.get("pending_restore") is None
         assert apply_context.bot.sent_documents, "Restore must deliver the emergency backup before writing"
         bad_update = RestoreUpdate(owner, b"not-a-zip")
