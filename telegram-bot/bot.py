@@ -478,14 +478,19 @@ def restore_summary(payloads: dict) -> str:
     return "\n".join(parts)
 
 
-def _restore_video_key(video: object) -> str | None:
+def _restore_video_identity_keys(video: object) -> set[str]:
     if not isinstance(video, dict):
-        return None
-    for field in ("entry_id", "file_id", "file_unique_id"):
-        value = video.get(field)
-        if value not in (None, ""):
-            return f"{field}:{value}"
-    return None
+        return set()
+    return {
+        f"{field}:{video[field]}"
+        for field in ("entry_id", "file_id", "file_unique_id")
+        if video.get(field) not in (None, "")
+    }
+
+
+def _restore_video_key(video: object) -> str | None:
+    keys = _restore_video_identity_keys(video)
+    return next(iter(keys), None)
 
 
 def _restore_list_key(item: object) -> str:
@@ -503,14 +508,14 @@ def merge_restore_payloads(payloads: dict) -> dict:
         current = load_json(path) if path.exists() else None
         if filename == "videos.json":
             current_list = current if isinstance(current, list) else []
-            by_key = {_restore_video_key(item): item for item in current_list if _restore_video_key(item)}
+            known_identity_keys = set().union(*(_restore_video_identity_keys(item) for item in current_list)) if current_list else set()
             result = list(current_list)
             for item in incoming if isinstance(incoming, list) else []:
-                key = _restore_video_key(item)
-                if key is None or key not in by_key:
-                    result.append(item)
-                    if key:
-                        by_key[key] = item
+                identity_keys = _restore_video_identity_keys(item)
+                if identity_keys and identity_keys & known_identity_keys:
+                    continue
+                result.append(item)
+                known_identity_keys.update(identity_keys)
             merged[filename] = normalize_restored_videos(result)
         elif filename in {"users.json", "coins.json", "referrals.json", "coupons.json", "settings.json"}:
             current_dict = dict(current) if isinstance(current, dict) else {}
@@ -9584,6 +9589,7 @@ async def admin_restore_start(update: Update, context: ContextTypes.DEFAULT_TYPE
     if not is_admin(query.from_user.id):
         return ConversationHandler.END
     context.user_data.pop("pending_restore", None)
+    logger.info("RESTORE_START actor=%s", query.from_user.id)
     await query.edit_message_text(
         "📥 *שחזור מגיבוי*\n\n"
         "שלח קובץ ZIP של גיבוי הנתונים. הקובץ ייבדק תחילה ולא ישכתב דבר עד שתאשר ידנית.\n"
@@ -9606,6 +9612,7 @@ async def admin_restore_receive(update: Update, context: ContextTypes.DEFAULT_TY
         await update.message.reply_text("❌ קובץ הגיבוי גדול מדי. המגבלה היא 20MB.")
         return ADMIN_RESTORE
 
+    logger.info("RESTORE_FILE_RECEIVED actor=%s filename=%s size=%s", update.effective_user.id, doc.file_name, doc.file_size)
     await update.message.reply_text("⏳ בודק את הגיבוי — עדיין לא בוצע שחזור...")
     try:
         tg_file = await context.bot.get_file(doc.file_id)
@@ -9616,15 +9623,18 @@ async def admin_restore_receive(update: Update, context: ContextTypes.DEFAULT_TY
         if not raw_archive:
             raise ValueError("קובץ הגיבוי שהתקבל ריק.")
         payloads = parse_restore_archive(raw_archive)
-    except zipfile.BadZipFile:
+        logger.info("RESTORE_VALIDATED actor=%s files=%s", update.effective_user.id, sorted(payloads.keys()))
+    except zipfile.BadZipFile as exc:
+        logger.warning("RESTORE_FAILED stage=validation actor=%s error=%s", update.effective_user.id, exc)
         await update.message.reply_text("❌ לא ניתן לבדוק את הגיבוי. הגיבוי אינו קובץ ZIP תקין. הנתונים הקיימים בבוט לא שונו.", parse_mode=None)
         return ADMIN_RESTORE
     except ValueError as exc:
+        logger.warning("RESTORE_FAILED stage=validation actor=%s error=%s", update.effective_user.id, exc)
         safe_reason = str(exc).strip() or "מבנה הגיבוי אינו תקין"
         await update.message.reply_text(f"❌ לא ניתן לבדוק את הגיבוי. סיבה: {safe_reason}. הנתונים הקיימים בבוט לא שונו.", parse_mode=None)
         return ADMIN_RESTORE
     except Exception as exc:
-        logger.exception("Backup validation failed")
+        logger.exception("RESTORE_FAILED stage=validation actor=%s", update.effective_user.id, exc_info=True)
         safe_reason = str(exc).strip() or "שגיאה לא ידועה בבדיקת הגיבוי"
         safe_reason = re.sub(r"(?:/|\\\\)[^\\s]+", "<נתיב>", safe_reason)[:500]
         await update.message.reply_text(f"❌ לא ניתן לבדוק את הגיבוי. סיבה: {safe_reason}. הנתונים הקיימים בבוט לא שונו.", parse_mode=None)
@@ -9642,9 +9652,10 @@ async def admin_restore_receive(update: Update, context: ContextTypes.DEFAULT_TY
                 [InlineKeyboardButton("❌ ביטול / חזור", callback_data="back_admin")],
             ]),
         )
+        logger.info("RESTORE_PREVIEW_CREATED actor=%s files=%s", update.effective_user.id, sorted(payloads.keys()))
         return ADMIN_RESTORE_CONFIRM
     except Exception as exc:
-        logger.exception("Backup preview display failed after successful validation")
+        logger.exception("RESTORE_FAILED stage=preview actor=%s", update.effective_user.id, exc_info=True)
         await update.message.reply_text(
             "⚠️ הגיבוי עבר את בדיקת התקינות, אך Telegram לא הצליח להציג את תצוגת התוצאה. הנתונים הקיימים בבוט לא שונו. שלח את הקובץ מחדש.",
             parse_mode=None,
@@ -9657,13 +9668,16 @@ async def admin_restore_apply(update: Update, context: ContextTypes.DEFAULT_TYPE
     await query.answer()
     if not is_admin(query.from_user.id):
         return ConversationHandler.END
+    logger.info("RESTORE_CONFIRM_RECEIVED actor=%s callback=%s", query.from_user.id, query.data)
     payloads = context.user_data.get("pending_restore")
     if not isinstance(payloads, dict) or not payloads:
         await query.edit_message_text("❌ אין גיבוי מוכן לשחזור. שלח את קובץ הגיבוי מחדש.", reply_markup=get_admin_inline_keyboard())
         return ConversationHandler.END
 
     before_state = _snapshot_current_restore_state()
+    logger.info("RESTORE_APPLY_STARTED actor=%s files=%s", query.from_user.id, sorted(payloads.keys()))
     merged_payloads = merge_restore_payloads(payloads)
+    logger.info("RESTORE_MERGE_STARTED actor=%s files=%s", query.from_user.id, sorted(merged_payloads.keys()))
     try:
         auto_snapshot = create_auto_backup("restore_data", query.from_user.id)
         if not auto_snapshot:
@@ -9671,13 +9685,20 @@ async def admin_restore_apply(update: Update, context: ContextTypes.DEFAULT_TYPE
         emergency = build_zip_of_data()
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         await context.bot.send_document(chat_id=ADMIN_ID, document=emergency, filename=f"before_restore_{stamp}.zip", caption="💾 גיבוי חירום אוטומטי לפני מיזוג")
+        logger.info("RESTORE_SNAPSHOT_CREATED actor=%s", query.from_user.id)
         save_json(RESTORE_UNDO_FILE, before_state)
         apply_restore_payloads(merged_payloads)
+        logger.info("RESTORE_DATA_SAVED actor=%s", query.from_user.id)
         for filename, expected in merged_payloads.items():
             actual = load_json(DATA_DIR / filename)
             if actual != expected:
                 raise RuntimeError(f"אימות המיזוג נכשל בקובץ {filename}.")
+        logger.info("RESTORE_DATA_RELOADED actor=%s files=%s", query.from_user.id, sorted(merged_payloads.keys()))
+        logger.info("RESTORE_USERS_MERGED actor=%s", query.from_user.id) if "users.json" in merged_payloads else None
+        logger.info("RESTORE_VIDEOS_MERGED actor=%s", query.from_user.id) if "videos.json" in merged_payloads else None
+        logger.info("RESTORE_LOGS_MERGED actor=%s", query.from_user.id) if any(name in merged_payloads for name in ("admin_actions.json", "coin_transactions.json", "ai_audit.json")) else None
         log_admin_action(query.from_user.id, "backup_restore_merged", {"files": sorted(payloads.keys()), "mode": "additive"})
+        logger.info("RESTORE_COMPLETED actor=%s", query.from_user.id)
         context.user_data.pop("pending_restore", None)
         await query.edit_message_text(
             "✅ המיזוג מהגיבוי הושלם בהצלחה!\n\n"
@@ -9696,7 +9717,7 @@ async def admin_restore_apply(update: Update, context: ContextTypes.DEFAULT_TYPE
                 (DATA_DIR / filename).unlink(missing_ok=True)
         except Exception:
             logger.exception("Backup rollback failed")
-        logger.exception("Backup restore failed")
+        logger.exception("RESTORE_FAILED actor=%s", query.from_user.id, exc_info=True)
         safe_reason = re.sub(r"(?:/|\\\\)[^\\s]+", "<נתיב>", str(exc).strip() or "סיבה לא ידועה")[:500]
         await query.edit_message_text(f"❌ השחזור נכשל: {safe_reason}. הנתונים הוחזרו למצב שהיה לפני הניסיון.", parse_mode=None, reply_markup=get_admin_inline_keyboard())
     return ConversationHandler.END
