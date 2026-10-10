@@ -338,6 +338,25 @@ def display_category_name(category: str) -> str:
     return UNSORTED_CATEGORY_LABEL if category == DEFAULT_CATEGORY else str(category)
 
 
+def is_sorted_catalog_enabled() -> bool:
+    return bool(load_settings().get("sorted_catalog_enabled", False))
+def catalog_categories() -> list[str]:
+    return [c for c in user_visible_categories() if c != DEFAULT_CATEGORY]
+def catalog_videos(category: str | None = None) -> list[dict]:
+    allowed=set(catalog_categories())
+    out=[]
+    for v in load_json(VIDEOS_FILE):
+        if not isinstance(v,dict) or not v.get("file_id") or v.get("file_status") in {"broken","broken_skipped"}:
+            continue
+        memberships=set(video_categories(v))
+        if is_sorted_catalog_enabled():
+            if category is not None and (category not in allowed or category not in memberships): continue
+            if category is None and not (memberships & allowed): continue
+        elif category is not None and category not in memberships:
+            continue
+        out.append(v)
+    return out
+
 def category_is_user_visible(category: str) -> bool:
     if category == DEFAULT_CATEGORY:
         return False
@@ -870,6 +889,7 @@ def callback_permission(callback_data: str) -> str | None:
         return "panel"
     if callback_data == "admin_logs_menu":
         return "audit_log"
+    if callback_data == "admin_sorted_catalog": return "owner"
     if callback_data in {"admin_owner_assistant_settings", "admin_daily_report"}:
         return "owner"
     if callback_data in {"admin_assistant", "admin_assistant_back"} or callback_data.startswith("assistant_"):
@@ -1621,21 +1641,10 @@ def register_user(user, ref_id=None):
                 log_coin_transaction(ref_key, before, reward, after, reason="referral_reward", source="system_referral")
     return users.get(uid, {})
 
-def count_unseen_videos(user_id: int) -> int:
-    """Count usable videos that a user has not received before."""
-    users = load_json(USERS_FILE)
-    seen = set(users.get(str(user_id), {}).get("seen_videos", []))
-    return sum(
-        1
-        for video in load_json(VIDEOS_FILE)
-        if isinstance(video, dict)
-        and video.get("file_id")
-        and video.get("file_status") not in {"broken", "broken_skipped"}
-        and video.get("file_id") not in seen
-    )
-
-
-async def send_videos_to_user(context, user_id: int, count: int) -> int:
+def count_unseen_videos(user_id: int, category: str | None = None) -> int:
+    seen=set(load_json(USERS_FILE).get(str(user_id),{}).get("seen_videos",[]))
+    return sum(1 for v in catalog_videos(category) if v.get("file_id") not in seen)
+async def send_videos_to_user(context, user_id: int, count: int, category: str | None = None) -> int:
     """Send a random selection of strictly unseen, usable videos to one user.
 
     The function intentionally never falls back to previously sent videos.
@@ -1647,12 +1656,7 @@ async def send_videos_to_user(context, user_id: int, count: int) -> int:
     seen = user_data.get("seen_videos", [])
     seen_set = set(seen)
 
-    pool = [
-        video for video in all_videos
-        if isinstance(video, dict)
-        and video.get("file_id")
-        and video.get("file_status") not in {"broken", "broken_skipped"}
-    ]
+    pool = catalog_videos(category)
     unseen = [video for video in pool if video["file_id"] not in seen_set]
     selected = random.sample(unseen, min(count, len(unseen)))
 
@@ -1663,13 +1667,15 @@ async def send_videos_to_user(context, user_id: int, count: int) -> int:
             await context.bot.send_video(chat_id=user_id, video=file_id)
             seen.append(file_id)
             seen_set.add(file_id)
-            video["sent_count"] = int(video.get("sent_count", 0) or 0) + 1
+            stored_video = next((item for item in all_videos if item.get("file_id") == file_id), video)
+            stored_video["sent_count"] = int(stored_video.get("sent_count", 0) or 0) + 1
             sent += 1
             await asyncio.sleep(0.05)
         except BadRequest as exc:
             # A file that fails here cannot be used by the current bot. Mark it for repair.
             if "file" in str(exc).lower() or "identifier" in str(exc).lower():
-                video["file_status"] = "broken"
+                stored_video = next((item for item in all_videos if item.get("file_id") == video.get("file_id")), video)
+                stored_video["file_status"] = "broken"
             logger.warning("Could not send a library video to user %s: %s", user_id, exc)
         except Exception as exc:
             logger.warning("Could not send a library video to user %s: %s", user_id, exc)
@@ -1861,6 +1867,9 @@ def get_admin_inline_keyboard(user_id: int = ADMIN_ID):
     # Keep the familiar two-column day-to-day layout; partial-permission managers
     # receive only the buttons they are permitted to use, without empty placeholders.
     add("maintenance", [InlineKeyboardButton(f"📡 סטטוס בוט: {maint_status}", callback_data="admin_maintenance")])
+    if is_owner(user_id):
+        state="🟢 מאגר ממויין פעיל" if is_sorted_catalog_enabled() else "⚪ מאגר ממויין כבוי"
+        rows.append([InlineKeyboardButton(state,callback_data="admin_sorted_catalog")])
     overview_row = []
     if has_admin_permission(user_id, "user_lookup"):
         overview_row.append(InlineKeyboardButton("📊 סטטיסטיקה", callback_data="admin_stats"))
@@ -1919,7 +1928,7 @@ def _clear_transient_flow_state(context: ContextTypes.DEFAULT_TYPE) -> None:
         "broadcast_edit_mode", "repair_list", "repair_index", "repair_scan_summary",
         "assistant_pending_action", "assistant_delivery_draft", "coupon_edit_code",
         "coupon_edit_field", "coupon_edit_referral_mode",
-        "nickname_edit_target", "cat_sort_shared_resume_page",
+        "nickname_edit_target", "cat_sort_shared_resume_page", "purchase_category",
     ):
         context.user_data.pop(key, None)
 
@@ -2207,6 +2216,24 @@ async def vip_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ─── Payment ──────────────────────────────────────────────────────────────────
 
+def purchase_category_markup() -> InlineKeyboardMarkup:
+    rows=[]
+    for i,c in enumerate(catalog_categories()):
+        n=len(catalog_videos(c))
+        if n: rows.append([InlineKeyboardButton(f"📁 {display_category_name(c)} ({n})",callback_data=f"purchase_category_{i}")])
+    return InlineKeyboardMarkup(rows+[[InlineKeyboardButton("🔙 חזרה",callback_data="back_main")]])
+async def purchase_category_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q=update.callback_query; await q.answer()
+    if not catalog_categories() or not any(catalog_videos(c) for c in catalog_categories()):
+        await q.edit_message_text("❌ אין כרגע סרטונים ממוינים וזמינים לרכישה.",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 חזרה",callback_data="back_main")]])); return
+    await q.edit_message_text("📂 *בחר קטגוריה לרכישה*\n\nהסרטון ייבחר אוטומטית מתוך הקטגוריה שבחרת.",parse_mode="Markdown",reply_markup=purchase_category_markup())
+async def purchase_category_selected(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q=update.callback_query; await q.answer()
+    try: c=catalog_categories()[int((q.data or "").rsplit("_",1)[1])]
+    except (ValueError,IndexError): return await purchase_category_menu(update,context)
+    if not catalog_videos(c): await q.answer("אין כרגע סרטונים זמינים בקטגוריה הזו.",show_alert=True); return
+    context.user_data["purchase_category"]=c
+    await payment_method_menu(update,context)
 async def purchase_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -2247,6 +2274,8 @@ async def payment_method_menu(update: Update, context: ContextTypes.DEFAULT_TYPE
     coins = load_json(COINS_FILE)
     balance = coins.get(str(query.from_user.id), 0)
     english = get_user_language(query.from_user.id) == "en"
+    if is_sorted_catalog_enabled() and not context.user_data.get("purchase_category"):
+        return await purchase_category_menu(update, context)
     await query.edit_message_text(
         ("💰 *Purchase videos*\n\nVideos are random and you only receive ones you have not received before. Choose a payment method:"
          if english else "💰 *רכישת סרטונים*\n\nהסרטונים נשלחים באקראי ורק כאלה שעדיין לא קיבלת. בחר אמצעי תשלום:"),
@@ -2255,6 +2284,7 @@ async def payment_method_menu(update: Update, context: ContextTypes.DEFAULT_TYPE
             [InlineKeyboardButton("💳 Pay with PayPal" if english else "💳 תשלום בפייפאל", callback_data="paypal_menu")],
             [InlineKeyboardButton(f"🪙 Pay with coins (balance: {balance})" if english else f"🪙 שלם במטבעות (יתרה: {balance})", callback_data="coins_menu")],
             [InlineKeyboardButton("ℹ️ Purchase guide" if english else "ℹ️ הסבר על הרכישה", callback_data="purchase_help")],
+            *([[InlineKeyboardButton("📂 Change category" if english else "📂 החלף קטגוריה", callback_data="purchase_category_menu")]] if is_sorted_catalog_enabled() else []),
             [InlineKeyboardButton("🔙 Back" if english else "🔙 חזרה", callback_data="back_main")],
         ]),
     )
@@ -2292,7 +2322,8 @@ async def paypal_package_selected(update: Update, context: ContextTypes.DEFAULT_
     idx = int(query.data.split("_")[1])
     pkg = PACKAGES[idx]
     
-    available = count_unseen_videos(query.from_user.id)
+    category=context.user_data.get("purchase_category") if is_sorted_catalog_enabled() else None
+    available = count_unseen_videos(query.from_user.id, category)
     if available < pkg["videos"]:
         await query.edit_message_text(
             (f"Only {available} new videos are currently available for you. To avoid duplicates, this package cannot be completed right now. Choose a smaller package or return after new content is added."
@@ -2302,6 +2333,7 @@ async def paypal_package_selected(update: Update, context: ContextTypes.DEFAULT_
         return
 
     price = round(pkg["price"] * (1 - vip["discount"]), 2)
+    users=load_json(USERS_FILE); users.setdefault(str(query.from_user.id),{})["pending_purchase"]={"videos":int(pkg["videos"]),"category":category}; save_json(USERS_FILE,users)
     # Generate PayPal link with price
     final_link = f"{PAYPAL_LINK}/{price}"
     
@@ -2351,15 +2383,17 @@ async def coin_package_buy(update: Update, context: ContextTypes.DEFAULT_TYPE):
     vip = get_user_vip(uid)
     idx   = int(query.data.split("_")[1])
     pkg = PACKAGES[idx]
+    category=context.user_data.get("purchase_category") if is_sorted_catalog_enabled() else None
     original_cost = int(pkg["coins"])
     cost = int(original_cost * (1 - vip["discount"]))
     coins = load_json(COINS_FILE)
     bal = int(coins.get(uid, 0) or 0)
     english = get_user_language(uid) == "en"
+    category = context.user_data.get("purchase_category") if is_sorted_catalog_enabled() else None
     if bal < cost:
         await query.answer((f"❌ You do not have enough coins. Missing: {cost - bal}." if english else f"❌ אין לך מספיק מטבעות. חסרים {cost - bal}."), show_alert=True)
         return
-    if count_unseen_videos(query.from_user.id) < pkg["videos"]:
+    if count_unseen_videos(query.from_user.id, category) < pkg["videos"]:
         await query.answer(("❌ There are not enough new videos available for this package. Choose a smaller package." if english else "❌ אין מספיק סרטונים חדשים זמינים לחבילה זו. בחר חבילה קטנה יותר."), show_alert=True)
         return
 
@@ -2415,7 +2449,8 @@ async def coin_package_confirm(update: Update, context: ContextTypes.DEFAULT_TYP
     log_coin_transaction(uid, bal, -cost, bal - cost, reason="video_purchase", source="user_coin_purchase")
     log_user_activity(uid, "purchase_started", {"videos_requested": int(pkg["videos"]), "cost": cost, "balance_after": bal - cost}, source="user")
     
-    sent = await send_videos_to_user(context, query.from_user.id, pkg["videos"])
+    sent = await send_videos_to_user(context, query.from_user.id, pkg["videos"], category)
+    context.user_data.pop("purchase_category",None)
     if sent > 0:
         record_order(query.from_user.id, 0, sent, "coins")
         log_user_activity(uid, "purchase_completed", {"videos_sent": int(sent), "cost": cost}, source="user")
@@ -5862,7 +5897,9 @@ async def admin_approve_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
     count = context.user_data.get("approve_v_count", 0)
     
     try:
-        available = count_unseen_videos(int(uid))
+        record=load_json(USERS_FILE).get(str(uid),{}); pending=record.get("pending_purchase",{}) if isinstance(record,dict) else {}
+        category=pending.get("category") if is_sorted_catalog_enabled() else None
+        available = count_unseen_videos(int(uid), category)
         if available < count:
             await update.message.reply_text(
                 f"❌ למשתמש נותרו רק {available} סרטונים חדשים שעדיין לא קיבל. "
@@ -5870,8 +5907,12 @@ async def admin_approve_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 reply_markup=get_admin_inline_keyboard(),
             )
             return ConversationHandler.END
-        sent = await send_videos_to_user(context, int(uid), count)
+        sent = await send_videos_to_user(context, int(uid), count, category)
         if sent > 0:
+            users = load_json(USERS_FILE)
+            if str(uid) in users:
+                users[str(uid)].pop("pending_purchase", None)
+                save_json(USERS_FILE, users)
             record_order(int(uid), 0, sent, "manual")
             await update.message.reply_text(f"✅ בוצע! {sent} סרטונים נשלחו למשתמש {uid}.", reply_markup=get_admin_inline_keyboard())
             try:
@@ -9918,6 +9959,13 @@ async def admin_delete_confirm(update: Update, context: ContextTypes.DEFAULT_TYP
 
 # ─── Admin: maintenance mode ──────────────────────────────────────────────────
 
+async def admin_sorted_catalog_toggle(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q=update.callback_query; await q.answer()
+    if not is_owner(q.from_user.id): return
+    settings=load_settings(); settings["sorted_catalog_enabled"]=not bool(settings.get("sorted_catalog_enabled",False)); save_settings(settings)
+    enabled=settings["sorted_catalog_enabled"]
+    await q.answer("✅ המאגר הממויין הופעל" if enabled else "✅ המאגר הממויין כובה",show_alert=True)
+    await q.edit_message_text(("📚 *מאגר ממויין פעיל*\n\nהמשתמשים יבחרו קטגוריה ויקבלו סרטון מתוכה." if enabled else "📚 *מאגר ממויין כבוי*\n\nחזרנו למצב הרגיל: סרטונים אקראיים מכל המאגר."),parse_mode="Markdown",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔄 החלף מצב",callback_data="admin_sorted_catalog")],[InlineKeyboardButton("🔙 חזרה לפאנל",callback_data="back_admin")]]))
 async def admin_maintenance_toggle(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -10466,6 +10514,8 @@ def main():
     cbs = [
         ("^noop$",                      noop_callback),
         ("^payment_method$",            payment_method_menu),
+        ("^purchase_category_menu$",    purchase_category_menu),
+        (r"^purchase_category_\d+$",  purchase_category_selected),
         ("^purchase_help$",             purchase_help),
         ("^paypal_menu$",               paypal_menu),
         (r"^pp_\d+$",                   paypal_package_selected),
@@ -10589,6 +10639,7 @@ def main():
         ("^admin_delete$",              admin_delete_start),
         ("^admin_delete_confirm$",      admin_delete_confirm),
         ("^admin_global_reset$",        admin_global_reset_start),
+        ("^admin_sorted_catalog$",       admin_sorted_catalog_toggle),
         ("^admin_maintenance$",          admin_maintenance_toggle),
         ("^maint_on$",                   admin_maintenance_toggle),
         ("^maint_off$",                  admin_maintenance_toggle),
