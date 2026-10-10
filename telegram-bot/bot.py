@@ -611,10 +611,22 @@ def _restore_payload_matches_after_save(filename: str, expected, actual) -> bool
         return actual == expected
     if not isinstance(expected, dict) or not isinstance(actual, dict):
         return False
-    for key, expected_value in expected.items():
+    # Runtime settings are normalized by load_settings()/save_settings() while
+    # restore also persists duplicate-review compatibility data. Compare the
+    # semantic, normalized view so harmless migrations do not trigger rollback.
+    expected_normalized = normalize_restored_settings(dict(expected))
+    actual_normalized = normalize_restored_settings(dict(actual))
+    for key, expected_value in expected_normalized.items():
+        if key in {"category_visibility", "category_random_enabled"} and isinstance(expected_value, dict):
+            expected_value = {str(name): bool(value) for name, value in expected_value.items()}
+            actual_value = actual_normalized.get(key, {})
+            if not isinstance(actual_value, dict):
+                return False
+            actual_value = {str(name): bool(value) for name, value in actual_value.items()}
+        else:
+            actual_value = actual_normalized.get(key)
         if key not in actual:
             return False
-        actual_value = actual[key]
         if key in {"categories", DUPLICATE_REVIEWED_KEY} and isinstance(expected_value, list) and isinstance(actual_value, list):
             if set(actual_value) != set(expected_value):
                 return False
