@@ -76,13 +76,29 @@ async def run():
         bot.save_json(bot.ADMIN_ACTIONS_FILE, [])
         bot.save_json(bot.BROADCASTS_FILE, [])
 
-        # Legacy multi-membership is normalized to one default/unassigned category,
-        # without deleting the video record.
+        # Multi-membership is canonical and preserved across normalization.
         legacy = {"entry_id": "legacy", "file_id": "f", "categories": ["דרמה", "קומדיה"]}
         changed = bot.normalize_video_categories(legacy)
         assert changed is True
-        assert legacy["categories"] == [bot.DEFAULT_CATEGORY]
-        assert legacy["category"] == bot.DEFAULT_CATEGORY
+        assert legacy["categories"] == ["דרמה", "קומדיה"]
+        assert legacy["category"] == "דרמה"
+
+        # Curated sales mode exposes only videos assigned to open categories;
+        # hidden and unassigned videos never enter the public pool.
+        bot.save_json(bot.SETTINGS_FILE, {
+            "categories": [bot.DEFAULT_CATEGORY, "דרמה", "קומדיה", "פנימי"],
+            "sorted_catalog_enabled": True,
+            "category_visibility": {"דרמה": True, "קומדיה": True, "פנימי": False},
+        })
+        curated = [
+            {"entry_id": "public", "file_id": "public", "categories": ["דרמה", "קומדיה"]},
+            {"entry_id": "hidden", "file_id": "hidden", "categories": ["פנימי"]},
+            {"entry_id": "unassigned", "file_id": "unassigned", "categories": [bot.DEFAULT_CATEGORY]},
+        ]
+        bot.save_json(bot.VIDEOS_FILE, curated)
+        assert {v["entry_id"] for v in bot.catalog_videos()} == {"public"}
+        assert [v["entry_id"] for v in bot.catalog_videos("דרמה")] == ["public"]
+        assert bot.catalog_videos("פנימי") == []
 
         # 1,000 existing videos plus 10 newly added videos are sourced dynamically.
         old = [{"entry_id": f"v{i}", "file_id": f"f{i}", "duration": i} for i in range(1000)]

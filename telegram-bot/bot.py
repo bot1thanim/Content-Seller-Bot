@@ -317,17 +317,19 @@ def video_categories(video: dict) -> list[str]:
 
 
 def normalize_video_categories(video: dict) -> bool:
-    """Normalize one canonical category per video while preserving legacy fields.
+    """Normalize category memberships while preserving every valid assignment.
 
-    Older records may contain several categories.  They are deliberately reset to
-    the private default/unassigned category rather than silently choosing one.
-    This is a data-shape migration, not a deletion of the video record.
+    The legacy ``category`` field remains as a compatibility mirror of the first
+    membership, while ``categories`` is the canonical list.  A video may belong
+    to more than one category; the private default is used only when it has no
+    real category assignment.
     """
     if not isinstance(video, dict):
         return False
     categories = video_categories(video)
-    if len(categories) > 1:
-        categories = [DEFAULT_CATEGORY]
+    if DEFAULT_CATEGORY in categories and len(categories) > 1:
+        categories = [category for category in categories if category != DEFAULT_CATEGORY]
+    categories = categories or [DEFAULT_CATEGORY]
     changed = video.get("categories") != categories or video.get("category") != categories[0]
     video["categories"] = categories
     video["category"] = categories[0]
@@ -1867,9 +1869,6 @@ def get_admin_inline_keyboard(user_id: int = ADMIN_ID):
     # Keep the familiar two-column day-to-day layout; partial-permission managers
     # receive only the buttons they are permitted to use, without empty placeholders.
     add("maintenance", [InlineKeyboardButton(f"📡 סטטוס בוט: {maint_status}", callback_data="admin_maintenance")])
-    if is_owner(user_id):
-        state="🟢 מאגר ממויין פעיל" if is_sorted_catalog_enabled() else "⚪ מאגר ממויין כבוי"
-        rows.append([InlineKeyboardButton(state,callback_data="admin_sorted_catalog")])
     overview_row = []
     if has_admin_permission(user_id, "user_lookup"):
         overview_row.append(InlineKeyboardButton("📊 סטטיסטיקה", callback_data="admin_stats"))
@@ -1891,6 +1890,9 @@ def get_admin_inline_keyboard(user_id: int = ADMIN_ID):
         direct_row.append(InlineKeyboardButton("✅ אישור תשלום", callback_data="admin_approve"))
     if direct_row:
         rows.append(direct_row)
+    if is_owner(user_id):
+        state = "🟢 מאגר ממויין פעיל" if is_sorted_catalog_enabled() else "⚪ מאגר ממויין כבוי"
+        rows.append([InlineKeyboardButton(state, callback_data="admin_sorted_catalog")])
     if has_admin_permission(user_id, "gallery") or has_admin_permission(user_id, "duplicates"):
         rows.append([InlineKeyboardButton("🎬 גלריית סרטונים", callback_data="admin_gallery")])
         rows.append([InlineKeyboardButton("🧹 סיכום וניקוי מאגר", callback_data="admin_ops_dashboard")])
@@ -2240,19 +2242,30 @@ async def purchase_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if await maintenance_gate(update):
         return
     english = get_user_language(query.from_user.id) == "en"
+    catalog_help = (
+        ("3️⃣ Choose an open category; videos are selected randomly from that category.\n"
+         "4️⃣ The bot only sends each user videos they have not received before.")
+        if english and is_sorted_catalog_enabled() else
+        ("3️⃣ הסרטונים נבחרים באקראי מתוך הקטגוריה הפתוחה שבחרת.\n"
+         "4️⃣ הבוט שולח לכל משתמש רק סרטונים שעדיין לא קיבל, כך שאין חזרות.")
+        if is_sorted_catalog_enabled() else
+        ("3️⃣ Videos are selected randomly from the library; you do not choose a specific video.\n"
+         "4️⃣ The bot only sends each user videos they have not received before.")
+        if english else
+        "3️⃣ הסרטונים נבחרים *באקראי* מתוך המאגר. לא בוחרים סרטון ספציפי.\n"
+        "4️⃣ הבוט שולח לכל משתמש רק סרטונים שעדיין לא קיבל, כך שאין חזרות."
+    )
     text = (
         "ℹ️ *How do I purchase and receive videos?*\n\n"
         "1️⃣ Choose a package and pay with PayPal or coins.\n"
         "2️⃣ After payment approval, the bot sends the package quantity.\n"
-        "3️⃣ Videos are selected *randomly* from the library; you do not choose a specific video.\n"
-        "4️⃣ The bot only sends each user videos they have not received before.\n\n"
+        f"{catalog_help}\n\n"
         "For PayPal, send proof of payment through Support. With coins, videos are sent immediately after approval."
         if english else
         "ℹ️ *איך קונים ומקבלים סרטונים?*\n\n"
         "1️⃣ בוחרים חבילה ותשלום בפייפאל או במטבעות.\n"
         "2️⃣ לאחר אישור התשלום, הבוט שולח את כמות הסרטונים שבחבילה.\n"
-        "3️⃣ הסרטונים נבחרים *באקראי* מתוך המאגר. לא בוחרים סרטון ספציפי.\n"
-        "4️⃣ הבוט שולח לכל משתמש רק סרטונים שעדיין לא קיבל, כך שאין חזרות.\n\n"
+        f"{catalog_help}\n\n"
         "בתשלום בפייפאל יש לשלוח צילום מסך של אישור התשלום דרך התמיכה. "
         "בתשלום במטבעות הסרטונים נשלחים מיד לאחר אישור הפעולה."
     )
@@ -7788,10 +7801,11 @@ async def admin_cat_merge_confirm(update: Update, context: ContextTypes.DEFAULT_
     changed = 0
     for video in videos:
         if source in video_categories(video):
-            # Merging moves each source video to the target; it never creates a
-            # second membership.  Keeping the source means keeping an empty category.
-            video["categories"] = [target]
-            video["category"] = target
+            memberships = [item for item in video_categories(video) if item != source]
+            if target not in memberships:
+                memberships.append(target)
+            video["categories"] = memberships or [DEFAULT_CATEGORY]
+            normalize_video_categories(video)
             changed += 1
     save_json(VIDEOS_FILE, videos)
     if remove_source:
@@ -7800,7 +7814,7 @@ async def admin_cat_merge_confirm(update: Update, context: ContextTypes.DEFAULT_
         save_settings(settings)
     log_admin_action(query.from_user.id, "categories_merged", {"source": source, "target": target, "removed_source": remove_source, "videos": changed})
     await query.edit_message_text(
-        f"✅ המיזוג הושלם: {changed} סרטונים הועברו ל׳{target}׳ בקטגוריה יחידה."
+        f"✅ המיזוג הושלם: {changed} סרטונים עודכנו ושויכו ל׳{target}׳."
         + (f" קטגוריית המקור ׳{source}׳ הוסרה." if remove_source else f" קטגוריית המקור ׳{source}׳ נשארה ללא שיוכים."),
         reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 חזרה לעריכת קטגוריות", callback_data="admin_cat_edit")]]),
     )
@@ -7811,7 +7825,7 @@ async def admin_cat_edit_menu(update: Update, context: ContextTypes.DEFAULT_TYPE
     await query.answer()
     await query.edit_message_text(
         "✏️ *עריכת קטגוריות*\n\nאפשר להוסיף, לשנות שם, להסיר, לשכפל או למזג קטגוריות. "
-        "כל סרטון משתייך לקטגוריה אחת בלבד.",
+        "סרטון יכול להשתייך ליותר מקטגוריה אחת.",
         parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup([
             [InlineKeyboardButton("➕ הוסף קטגוריה", callback_data="admin_cat_add")],
@@ -8220,7 +8234,7 @@ async def admin_cat_sort_page(update: Update, context: ContextTypes.DEFAULT_TYPE
         f"מצב: *{mode_label}*\n\n"
         f"⏱ אורך: *{format_duration(video.get('duration', 0))}*\n"
         "\n📁 הקטגוריות שנבחרו מסומנות ב־✅ על הכפתורים.\n\n"
-        "בחר קטגוריה אחת. בחירה חדשה מחליפה שיוך קודם; אם לא משנים קטגוריה, לחץ על ׳סיים סרטון׳ כדי לשמור את הטיפול בו."
+        "אפשר לבחור או להסיר כמה קטגוריות. הסרטון ייחשב ממוין כאשר יש לו לפחות קטגוריה אחת; לחץ על ׳סיים סרטון׳ כדי לשמור ולעבור הלאה."
     )
     if (
         str(previous_progress.get("entry_id") or "") == str(video.get("entry_id") or "")
@@ -8255,12 +8269,14 @@ async def admin_cat_assign(update: Update, context: ContextTypes.DEFAULT_TYPE):
     selected_category = categories[category_index]
     selected_video = videos[page]
     memberships = video_categories(selected_video)
-    if selected_category == DEFAULT_CATEGORY and selected_category in memberships and len(memberships) == 1:
-        await query.answer("כל סרטון חייב להשתייך לפחות לקטגוריה אחת.", show_alert=True)
-        return
-    # Category sorting is intentionally single-choice: selecting a category replaces
-    # any legacy/multiple membership instead of appending a second category.
-    selected_video["categories"] = [DEFAULT_CATEGORY if selected_category == DEFAULT_CATEGORY else selected_category]
+    if selected_category == DEFAULT_CATEGORY:
+        selected_video["categories"] = [DEFAULT_CATEGORY]
+    elif selected_category in memberships:
+        remaining = [item for item in memberships if item != selected_category]
+        selected_video["categories"] = remaining or [DEFAULT_CATEGORY]
+    else:
+        selected_video["categories"] = [item for item in memberships if item != DEFAULT_CATEGORY]
+        selected_video["categories"].append(selected_category)
     normalize_video_categories(selected_video)
     all_videos = load_videos_with_entry_ids()
     for index, video in enumerate(all_videos):
@@ -8335,10 +8351,14 @@ async def admin_quick_category_toggle(update: Update, context: ContextTypes.DEFA
         return
     category = categories[category_index]
     memberships = video_categories(video)
-    if category == DEFAULT_CATEGORY and category in memberships and len(memberships) == 1:
-        await query.answer("כל סרטון חייב להשתייך לפחות לקטגוריה אחת.", show_alert=True)
-        return
-    video["categories"] = [DEFAULT_CATEGORY if category == DEFAULT_CATEGORY else category]
+    if category == DEFAULT_CATEGORY:
+        video["categories"] = [DEFAULT_CATEGORY]
+    elif category in memberships:
+        remaining = [item for item in memberships if item != category]
+        video["categories"] = remaining or [DEFAULT_CATEGORY]
+    else:
+        video["categories"] = [item for item in memberships if item != DEFAULT_CATEGORY]
+        video["categories"].append(category)
     normalize_video_categories(video)
     save_json(VIDEOS_FILE, all_videos)
     mark_category_sort_reviewed(entry_id)
