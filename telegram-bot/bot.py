@@ -2512,10 +2512,11 @@ async def coin_package_confirm(update: Update, context: ContextTypes.DEFAULT_TYP
     coins = load_json(COINS_FILE)
     bal = int(coins.get(uid, 0) or 0)
     english = get_user_language(uid) == "en"
+    category = context.user_data.get("purchase_category") if is_sorted_catalog_enabled() else None
     if bal < cost:
         await query.edit_message_text("❌ Your balance changed and is no longer sufficient." if english else "❌ היתרה השתנתה ואינה מספיקה עוד לרכישה זו.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🪙 Back" if english else "🪙 חזרה", callback_data="coins_menu")]]))
         return
-    if count_unseen_videos(query.from_user.id) < pkg["videos"]:
+    if count_unseen_videos(query.from_user.id, category) < pkg["videos"]:
         await query.edit_message_text("❌ Not enough new videos are available for this package." if english else "❌ אין מספיק סרטונים חדשים זמינים לחבילה זו.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🪙 Back" if english else "🪙 חזרה", callback_data="coins_menu")]]))
         return
 
