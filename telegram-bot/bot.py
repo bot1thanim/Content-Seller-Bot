@@ -1681,6 +1681,22 @@ def get_discounted_price(user_id: str, original_price: float) -> float:
     discount = vip["discount"]
     return round(original_price * (1 - discount), 2)
 
+
+def user_order_metrics(user_id: str, orders: list[dict] | None = None) -> tuple[int, int]:
+    """Return (package purchases, videos received) for an admin/user report."""
+    records = orders if isinstance(orders, list) else load_json(ORDERS_FILE)
+    matching = [
+        row for row in records
+        if isinstance(row, dict) and str(row.get("user_id")) == str(user_id)
+    ]
+    videos = 0
+    for row in matching:
+        try:
+            videos += max(0, int(row.get("videos_count", 0) or 0))
+        except (TypeError, ValueError):
+            continue
+    return len(matching), videos
+
 # ─── Business logic ───────────────────────────────────────────────────────────
 
 def register_user(user, ref_id=None):
@@ -3984,8 +4000,9 @@ async def _assistant_apply_runtime_command(
             return True
         referrals = int((load_json(REFERRALS_FILE).get(target_id, {}) or {}).get("count", 0) or 0)
         orders = [row for row in load_json(ORDERS_FILE) if isinstance(row, dict) and str(row.get("user_id")) == target_id]
+        package_count, video_count = user_order_metrics(target_id, orders)
         if orders_match:
-            lines = [f"🧾 *הזמנות של `{target_id}`: {len(orders)}*"]
+            lines = [f"🧾 *הזמנות של `{target_id}`*", f"📦 רכישת חבילות: {package_count}", f"🎬 רכישת סרטונים: {video_count}"]
             for row in orders[-5:]:
                 lines.append(f"• {str(row.get('date') or 'ללא תאריך')[:19]} — {int(row.get('videos_count', 0) or 0)} סרטונים — {row.get('type', 'לא צוין')}")
             _assistant_log_tool(context, user_id, canonical_text, "users", "success", "הוצגו הזמנות משתמש", {"target_user_id": target_id, "orders": len(orders)})
@@ -3999,7 +4016,8 @@ async def _assistant_apply_runtime_command(
             f"👑 דרגה: {vip['icon']} {vip['name']}\n"
             f"🪙 מטבעות: {coins}\n"
             f"👥 הפניות: {referrals}\n"
-            f"🛒 רכישות: {len(orders)}"
+            f"📦 רכישת חבילות: {package_count}\n"
+            f"🎬 רכישת סרטונים: {video_count}"
         )
         log_admin_action(user_id, "assistant_user_viewed", {"target_id": target_id}, source="assistant", target_user_id=target_id)
         _assistant_log_tool(context, user_id, canonical_text, "users", "success", "הוצגו פרטי משתמש", {"target_user_id": target_id})
@@ -5444,6 +5462,7 @@ async def users_page(update: Update, context: ContextTypes.DEFAULT_TYPE):
     bal = coins_d.get(uid, 0)
     vip = get_user_vip(uid)
     ref_cnt   = refs.get(uid, {}).get("count", 0)
+    package_count, video_count = user_order_metrics(uid, orders)
     user_ords = [o for o in orders if str(o.get("user_id")) == uid]
     spent     = sum(o.get("amount", 0) for o in user_ords)
 
@@ -5455,7 +5474,8 @@ async def users_page(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"📅 הצטרף: {u.get('joined', 'N/A')}\n"
         f"🪙 מטבעות: {bal}\n"
         f"👥 הפניות: {ref_cnt}\n"
-        f"🛒 רכישות: {len(user_ords)}\n"
+        f"📦 רכישת חבילות: {package_count}\n"
+        f"🎬 רכישת סרטונים: {video_count}\n"
         f"💰 סה\"כ הוציא: ₪{spent}"
     )
     nav = []
@@ -5509,6 +5529,7 @@ async def admin_check_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
     bal       = coins.get(target_id, 0)
     vip       = get_user_vip(target_id)
     ref_cnt   = refs.get(target_id, {}).get("count", 0)
+    package_count, video_count = user_order_metrics(target_id, orders)
     user_ords = [o for o in orders if str(o.get("user_id")) == target_id]
     coin_n    = sum(1 for o in user_ords if o.get("type") == "coins")
     await update.message.reply_text(
@@ -5517,7 +5538,8 @@ async def admin_check_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"👑 דרגה: {vip['icon']} {vip['name']}\n"
         f"🪙 מטבעות: {bal}\n"
         f"👥 הפניות: {ref_cnt}\n"
-        f"🛒 רכישות: {len(user_ords)} ({coin_n} במטבעות)\n"
+        f"📦 רכישת חבילות: {package_count} ({coin_n} במטבעות)\n"
+        f"🎬 רכישת סרטונים: {video_count}\n"
         f"💰 סה\"כ הוציא: ₪{sum(o.get('amount',0) for o in user_ords)}",
         reply_markup=get_admin_inline_keyboard()
     )
