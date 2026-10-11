@@ -621,25 +621,8 @@ def _restore_payload_matches_after_save(filename: str, expected, actual) -> bool
     # Runtime settings are normalized by load_settings()/save_settings() while
     # restore also persists duplicate-review compatibility data. Compare the
     # semantic, normalized view so harmless migrations do not trigger rollback.
-    def normalized_runtime_settings(value: dict) -> dict:
-        normalized = normalize_restored_settings(dict(value))
-        categories = [
-            category for category in normalized.get("categories", [])
-            if category != DEFAULT_CATEGORY
-        ]
-        for key in ("category_visibility", "category_random_enabled"):
-            raw = normalized.get(key, {})
-            if not isinstance(raw, dict):
-                raw = {}
-            # load_settings() fills missing entries with True for every current
-            # category. Do the same for both expected and actual settings.
-            normalized[key] = {
-                category: bool(raw.get(category, True)) for category in categories
-            }
-        return normalized
-
-    expected_normalized = normalized_runtime_settings(expected)
-    actual_normalized = normalized_runtime_settings(actual)
+    expected_normalized = normalize_restored_settings(dict(expected))
+    actual_normalized = normalize_restored_settings(dict(actual))
     for key, expected_value in expected_normalized.items():
         actual_value = actual_normalized.get(key)
         # ``load_settings`` may add compatibility/default keys while the file is
@@ -648,8 +631,20 @@ def _restore_payload_matches_after_save(filename: str, expected, actual) -> bool
         # "settings.json" verification failure.
         if key not in actual_normalized:
             return False
-        if key in {"categories", DUPLICATE_REVIEWED_KEY} and isinstance(expected_value, list) and isinstance(actual_value, list):
-            if set(actual_value) != set(expected_value):
+        if key in {"category_visibility", "category_random_enabled"} and isinstance(expected_value, dict):
+            # A newer runtime may add entries for categories that an older
+            # backup never knew about. Validate only the entries represented by
+            # the backup; absent entries use the runtime default of True.
+            if not isinstance(actual_value, dict):
+                return False
+            for category, expected_flag in expected_value.items():
+                if bool(actual_value.get(category, True)) != bool(expected_flag):
+                    return False
+        elif key in {"categories", DUPLICATE_REVIEWED_KEY} and isinstance(expected_value, list) and isinstance(actual_value, list):
+            # Additive restore may retain entries created after the backup. The
+            # invariant is that every backed-up entry survives, not that the
+            # current file has no newer entries.
+            if not set(expected_value).issubset(set(actual_value)):
                 return False
         elif actual_value != expected_value:
             return False
