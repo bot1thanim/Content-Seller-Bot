@@ -625,7 +625,11 @@ def _restore_payload_matches_after_save(filename: str, expected, actual) -> bool
             actual_value = {str(name): bool(value) for name, value in actual_value.items()}
         else:
             actual_value = actual_normalized.get(key)
-        if key not in actual:
+        # ``load_settings`` may add compatibility/default keys while the file is
+        # being written.  Check the normalized view, not the raw JSON object;
+        # otherwise an otherwise valid legacy backup is rolled back with a false
+        # "settings.json" verification failure.
+        if key not in actual_normalized:
             return False
         if key in {"categories", DUPLICATE_REVIEWED_KEY} and isinstance(expected_value, list) and isinstance(actual_value, list):
             if set(actual_value) != set(expected_value):
