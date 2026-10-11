@@ -2230,24 +2230,74 @@ async def vip_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ─── Payment ──────────────────────────────────────────────────────────────────
 
+def public_category_inventory() -> list[tuple[str, int]]:
+    """Return visible public categories and counts with one settings/video read.
+
+    The purchase menu is user-facing and may be opened on a large library.  The
+    previous implementation reloaded settings and videos once per category,
+    which could exceed Telegram's callback response window and look like a hang.
+    """
+    settings = load_settings()
+    categories = normalize_category_list(
+        settings.get("categories", []),
+        alphabetical=(settings.get("category_order_mode", "alphabetical") == "alphabetical"),
+    )
+    visibility = settings.get("category_visibility", {})
+    if not isinstance(visibility, dict):
+        visibility = {}
+    public_categories = [
+        category for category in categories
+        if category != DEFAULT_CATEGORY and bool(visibility.get(category, True))
+    ]
+    counts = {category: 0 for category in public_categories}
+    for video in load_json(VIDEOS_FILE):
+        if not isinstance(video, dict) or not video.get("file_id") or video.get("file_status") in {"broken", "broken_skipped"}:
+            continue
+        memberships = set(video_categories(video))
+        for category in public_categories:
+            if category in memberships:
+                counts[category] += 1
+    return [(category, counts[category]) for category in public_categories]
+
+
 def purchase_category_markup() -> InlineKeyboardMarkup:
-    rows=[]
-    for i,c in enumerate(catalog_categories()):
-        n=len(catalog_videos(c))
-        if n: rows.append([InlineKeyboardButton(f"📁 {display_category_name(c)} ({n})",callback_data=f"purchase_category_{i}")])
-    return InlineKeyboardMarkup(rows+[[InlineKeyboardButton("🔙 חזרה",callback_data="back_main")]])
+    rows = []
+    inventory = [(category, count) for category, count in public_category_inventory() if count]
+    for index, (category, count) in enumerate(inventory):
+        rows.append([InlineKeyboardButton(
+            f"📁 {display_category_name(category)} ({count})",
+            callback_data=f"purchase_category_{index}",
+        )])
+    return InlineKeyboardMarkup(rows + [[InlineKeyboardButton("🔙 חזרה", callback_data="back_main")]])
+
+
 async def purchase_category_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q=update.callback_query; await q.answer()
-    if not catalog_categories() or not any(catalog_videos(c) for c in catalog_categories()):
-        await q.edit_message_text("❌ אין כרגע סרטונים ממוינים וזמינים לרכישה.",reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 חזרה",callback_data="back_main")]])); return
-    await q.edit_message_text("📂 *בחר קטגוריה לרכישה*\n\nהסרטון ייבחר אוטומטית מתוך הקטגוריה שבחרת.",parse_mode="Markdown",reply_markup=purchase_category_markup())
+    q = update.callback_query
+    await q.answer()
+    inventory = [(category, count) for category, count in public_category_inventory() if count]
+    if not inventory:
+        await q.edit_message_text(
+            "❌ אין כרגע סרטונים ממוינים וזמינים לרכישה.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 חזרה", callback_data="back_main")]]),
+        )
+        return
+    await q.edit_message_text(
+        "📂 *בחר קטגוריה לרכישה*\n\nהסרטון ייבחר אוטומטית מתוך הקטגוריה שבחרת.",
+        parse_mode="Markdown",
+        reply_markup=purchase_category_markup(),
+    )
+
+
 async def purchase_category_selected(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q=update.callback_query; await q.answer()
-    try: c=catalog_categories()[int((q.data or "").rsplit("_",1)[1])]
-    except (ValueError,IndexError): return await purchase_category_menu(update,context)
-    if not catalog_videos(c): await q.answer("אין כרגע סרטונים זמינים בקטגוריה הזו.",show_alert=True); return
-    context.user_data["purchase_category"]=c
-    await payment_method_menu(update,context)
+    q = update.callback_query
+    await q.answer()
+    inventory = [(category, count) for category, count in public_category_inventory() if count]
+    try:
+        category = inventory[int((q.data or "").rsplit("_", 1)[1])][0]
+    except (ValueError, IndexError):
+        return await purchase_category_menu(update, context)
+    context.user_data["purchase_category"] = category
+    await payment_method_menu(update, context)
 async def purchase_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
