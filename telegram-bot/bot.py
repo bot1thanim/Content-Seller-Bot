@@ -181,6 +181,7 @@ ADMIN_COUPON_EDIT_REFERRAL_MODE = 44
 ADMIN_COUPON_EDIT_REFERRAL_MINIMUM = 45
 ADMIN_VIP_CONFIG_MENU = 46
 ADMIN_VIP_CONFIG_VALUE = 47
+ADMIN_VIP_CONFIG_CONFIRM_DELETE = 48
 
 
 # ─── Data helpers ─────────────────────────────────────────────────────────────
@@ -1619,8 +1620,10 @@ def get_vip_settings() -> tuple[str, list[dict]]:
     raw_levels = settings.get("vip_levels")
     source = raw_levels if isinstance(raw_levels, list) and raw_levels else VIP_LEVELS
     levels = []
-    for index, fallback in enumerate(VIP_LEVELS):
-        raw = source[index] if index < len(source) and isinstance(source[index], dict) else fallback
+    for index, raw in enumerate(source):
+        fallback = VIP_LEVELS[min(index, len(VIP_LEVELS) - 1)]
+        if not isinstance(raw, dict):
+            raw = fallback
         try:
             threshold = max(0, int(raw.get("min_purchases", fallback["min_purchases"])))
         except (TypeError, ValueError):
@@ -1631,12 +1634,14 @@ def get_vip_settings() -> tuple[str, list[dict]]:
             discount = fallback["discount"]
         levels.append({
             "name": str(raw.get("name") or fallback["name"])[:32],
-            "icon": str(raw.get("icon") or fallback["icon"])[:4],
+            "icon": str(raw.get("icon") or fallback["icon"])[:12],
             "min_purchases": threshold,
             "discount": discount,
         })
     levels.sort(key=lambda level: level["min_purchases"])
-    if not levels or levels[0]["min_purchases"] != 0:
+    if not levels:
+        levels = [dict(VIP_LEVELS[0])]
+    if levels[0]["min_purchases"] != 0:
         levels.insert(0, dict(VIP_LEVELS[0]))
     return metric, levels
 
@@ -1996,6 +2001,7 @@ def _clear_transient_flow_state(context: ContextTypes.DEFAULT_TYPE) -> None:
     """Clear incomplete input-flow data so an exit can never poison the next flow."""
     for key in (
         "admin_msg_text", "approve_v_count", "coins_target_id", "vip_target_id",
+        "vip_config_index", "vip_config_mode",
         "new_coupon_code", "new_coupon_coins", "new_coupon_expiry", "new_coupon_max_uses",
         "new_coupon_referral_mode", "new_coupon_referral_minimum",
         "pending_restore", "support_reply_target", "category_rename_old",
@@ -8885,11 +8891,15 @@ def _vip_config_markup() -> InlineKeyboardMarkup:
         )]
     ]
     for index, level in enumerate(levels):
-        rows.append([InlineKeyboardButton(
+        row = [InlineKeyboardButton(
             f"{level['icon']} {level['name']} — {level['min_purchases']}+ | {int(level['discount'] * 100)}%",
             callback_data=f"vip_cfg_edit_{index}",
-        )])
+        )]
+        if index > 0:
+            row.append(InlineKeyboardButton("🗑", callback_data=f"vip_cfg_delete_{index}"))
+        rows.append(row)
     rows.extend([
+        [InlineKeyboardButton("➕ הוסף דרגה חדשה", callback_data="vip_cfg_add")],
         [InlineKeyboardButton("👤 שינוי דרגה למשתמש", callback_data="vip_cfg_user")],
         [InlineKeyboardButton("🔙 חזרה", callback_data="back_admin")],
     ])
@@ -8906,7 +8916,7 @@ async def admin_vip_config_menu(update: Update, context: ContextTypes.DEFAULT_TY
         "💎 *ניהול דרגות VIP*",
         f"מדד נוכחי: *{'מספר רכישות' if metric == VIP_METRIC_PURCHASES else 'מספר סרטונים'}*",
         "",
-        "לחץ על דרגה כדי לשנות את הסף ואת אחוז ההנחה.",
+        "לחץ על דרגה כדי לערוך שם, סמל, סף ואחוז הנחה.",
     ]
     for level in levels:
         lines.append(f"{level['icon']} {level['name']}: {level['min_purchases']}+ | {int(level['discount'] * 100)}%")
@@ -8922,11 +8932,37 @@ async def admin_vip_config_action(update: Update, context: ContextTypes.DEFAULT_
     if query.data == "vip_cfg_user":
         await query.edit_message_text("שלח את ה-ID של המשתמש לשינוי ידני:", reply_markup=_flow_back_markup())
         return ADMIN_VIP_ID
+    if query.data == "vip_cfg_add":
+        context.user_data["vip_config_mode"] = "add"
+        await query.edit_message_text(
+            "➕ *הוספת דרגה חדשה*\n\n"
+            "שלח בפורמט:\n`שם | אימוג׳י/סמל | סף | אחוז הנחה`\n\n"
+            "דוגמה:\n`פלטינה | 👑 | 50 | 65`",
+            parse_mode="Markdown",
+            reply_markup=_flow_back_markup(),
+        )
+        return ADMIN_VIP_CONFIG_VALUE
     if query.data == "vip_cfg_metric":
         settings = load_settings()
         settings["vip_metric"] = VIP_METRIC_VIDEOS if settings.get("vip_metric", VIP_METRIC_PURCHASES) == VIP_METRIC_PURCHASES else VIP_METRIC_PURCHASES
         save_settings(settings)
         return await admin_vip_config_menu(update, context)
+    if query.data.startswith("vip_cfg_delete_"):
+        try:
+            index = int(query.data.rsplit("_", 1)[1])
+        except (TypeError, ValueError):
+            return ADMIN_VIP_CONFIG_MENU
+        settings = load_settings()
+        metric, levels = get_vip_settings()
+        if index <= 0 or index >= len(levels):
+            await query.edit_message_text("❌ אי אפשר למחוק את דרגת הבסיס. ניתן למחוק רק דרגות נוספות.", reply_markup=_vip_config_markup())
+            return ADMIN_VIP_CONFIG_MENU
+        levels.pop(index)
+        settings["vip_metric"] = metric
+        settings["vip_levels"] = levels
+        save_settings(settings)
+        await query.edit_message_text("✅ הדרגה נמחקה.", reply_markup=_vip_config_markup())
+        return ADMIN_VIP_CONFIG_MENU
     try:
         index = int(query.data.rsplit("_", 1)[1])
     except (TypeError, ValueError):
@@ -8935,12 +8971,13 @@ async def admin_vip_config_action(update: Update, context: ContextTypes.DEFAULT_
     if index < 0 or index >= len(levels):
         return ADMIN_VIP_CONFIG_MENU
     context.user_data["vip_config_index"] = index
+    context.user_data["vip_config_mode"] = "edit"
     level = levels[index]
     await query.edit_message_text(
         f"עריכת {level['icon']} {level['name']}\n\n"
-        f"הגדר סף ואחוז הנחה בפורמט: `סף אחוז`\n"
-        f"לדוגמה: `10 15`\n\n"
-        f"נוכחי: {level['min_purchases']} ו־{int(level['discount'] * 100)}%",
+        f"שלח בפורמט:\n`שם | אימוג׳י/סמל | סף | אחוז הנחה`\n\n"
+        f"לדוגמה: `פלטינה | 👑 | 50 | 65`\n\n"
+        f"נוכחי: `{level['name']} | {level['icon']} | {level['min_purchases']} | {int(level['discount'] * 100)}`",
         parse_mode="Markdown",
         reply_markup=_flow_back_markup(),
     )
@@ -8950,27 +8987,35 @@ async def admin_vip_config_action(update: Update, context: ContextTypes.DEFAULT_
 async def admin_vip_config_value(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not has_admin_permission(update.effective_user.id, "vip_manage"):
         return ConversationHandler.END
-    parts = (update.message.text or "").replace(",", " ").split()
+    parts = [part.strip() for part in (update.message.text or "").split("|")]
     try:
-        threshold = int(parts[0])
-        discount_percent = float(parts[1])
+        name, icon = parts[0], parts[1]
+        threshold = int(parts[2])
+        discount_percent = float(parts[3])
+        if not name or not icon:
+            raise ValueError
         if threshold < 0 or not 0 <= discount_percent <= 100:
             raise ValueError
     except (IndexError, TypeError, ValueError):
-        await update.message.reply_text("❌ קלט לא תקין. שלח שני מספרים: סף ואחוז, לדוגמה `10 15`.", parse_mode="Markdown", reply_markup=_flow_back_markup())
+        await update.message.reply_text("❌ קלט לא תקין. שלח: `שם | אימוג׳י/סמל | סף | אחוז`, לדוגמה `פלטינה | 👑 | 50 | 65`.", parse_mode="Markdown", reply_markup=_flow_back_markup())
         return ADMIN_VIP_CONFIG_VALUE
+    mode = context.user_data.get("vip_config_mode")
     index = context.user_data.get("vip_config_index")
     metric, levels = get_vip_settings()
-    if not isinstance(index, int) or index < 0 or index >= len(levels):
+    new_level = {"name": name[:32], "icon": icon[:12], "min_purchases": threshold, "discount": discount_percent / 100}
+    if mode == "add":
+        levels.append(new_level)
+    elif isinstance(index, int) and 0 <= index < len(levels):
+        levels[index] = new_level
+    else:
         return await admin_vip_config_menu(update, context)
     settings = load_settings()
     settings["vip_metric"] = metric
     settings["vip_levels"] = levels
-    settings["vip_levels"][index]["min_purchases"] = threshold
-    settings["vip_levels"][index]["discount"] = discount_percent / 100
     settings["vip_levels"] = sorted(settings["vip_levels"], key=lambda level: level["min_purchases"])
     save_settings(settings)
     context.user_data.pop("vip_config_index", None)
+    context.user_data.pop("vip_config_mode", None)
     await update.message.reply_text("✅ הגדרות הדרגה נשמרו.", reply_markup=_vip_config_markup())
     return ADMIN_VIP_CONFIG_MENU
 
@@ -10491,7 +10536,7 @@ def main():
     vip_conv = ConversationHandler(
         entry_points=[CallbackQueryHandler(admin_vip_start, pattern="^admin_vip$")],
         states={
-            ADMIN_VIP_CONFIG_MENU: [CallbackQueryHandler(admin_vip_config_action, pattern=r"^vip_cfg_(?:metric|edit_\d+|user)$")],
+            ADMIN_VIP_CONFIG_MENU: [CallbackQueryHandler(admin_vip_config_action, pattern=r"^vip_cfg_(?:metric|add|edit_\d+|delete_\d+|user)$")],
             ADMIN_VIP_CONFIG_VALUE: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_vip_config_value)],
             ADMIN_VIP_ID:    [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_vip_id)],
             ADMIN_VIP_LEVEL: [CallbackQueryHandler(admin_vip_level, pattern="^set_vip_")],
