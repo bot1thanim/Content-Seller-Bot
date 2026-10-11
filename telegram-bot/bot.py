@@ -117,13 +117,17 @@ PACKAGES = [
     {"price": 180, "videos": 200, "coins": 1800, "label_paypal": "₪180 – 200 סרטונים",  "label_coins": "🪙1800 – 200 סרטונים"},
 ]
 
-# VIP Levels
+# VIP Levels.  The editable copy is stored in settings.json; this list is the
+# migration-safe fallback for installations that predate configurable tiers.
 VIP_LEVELS = [
-    {"name": "ברונזה", "min_purchases": 0,   "discount": 0.0,  "icon": "🥉"},
-    {"name": "כסף",   "min_purchases": 20,  "discount": 0.15, "icon": "🥈"},
-    {"name": "זהב",   "min_purchases": 50,  "discount": 0.30, "icon": "🥇"},
-    {"name": "יהלום", "min_purchases": 100, "discount": 0.50, "icon": "💎"},
+    {"name": "ברונזה", "min_purchases": 0,  "discount": 0.00, "icon": "🥉"},
+    {"name": "כסף",    "min_purchases": 6,  "discount": 0.10, "icon": "🥈"},
+    {"name": "זהב",    "min_purchases": 16, "discount": 0.25, "icon": "🥇"},
+    {"name": "יהלום",  "min_purchases": 31, "discount": 0.40, "icon": "💎"},
 ]
+VIP_METRIC_PURCHASES = "purchases"
+VIP_METRIC_VIDEOS = "videos"
+VIP_METRICS = {VIP_METRIC_PURCHASES, VIP_METRIC_VIDEOS}
 
 # ── Conversation states ────────────────────────────────────────────────────────
 (
@@ -175,6 +179,8 @@ ADMIN_COUPON_EDIT_MENU = 42
 ADMIN_COUPON_EDIT_VALUE = 43
 ADMIN_COUPON_EDIT_REFERRAL_MODE = 44
 ADMIN_COUPON_EDIT_REFERRAL_MINIMUM = 45
+ADMIN_VIP_CONFIG_MENU = 46
+ADMIN_VIP_CONFIG_VALUE = 47
 
 
 # ─── Data helpers ─────────────────────────────────────────────────────────────
@@ -950,7 +956,7 @@ def callback_permission(callback_data: str) -> str | None:
         return "reward_settings"
     if callback_data.startswith(("admin_coupons", "coupon_")):
         return "coupon_manage"
-    if callback_data.startswith("admin_vip") or callback_data.startswith("set_vip_"):
+    if callback_data.startswith(("admin_vip", "vip_cfg_", "set_vip_")):
         return "vip_manage"
     if callback_data.startswith(("admin_maintenance", "maint_")):
         return "maintenance"
@@ -1604,15 +1610,66 @@ def is_maintenance() -> bool:
 
 # ─── VIP & Discount logic ────────────────────────────────────────────────────
 
-def get_user_vip(user_id: str) -> dict:
+def get_vip_settings() -> tuple[str, list[dict]]:
+    """Return the configured VIP metric and normalized tier definitions."""
+    settings = load_settings()
+    metric = settings.get("vip_metric", VIP_METRIC_PURCHASES)
+    if metric not in VIP_METRICS:
+        metric = VIP_METRIC_PURCHASES
+    raw_levels = settings.get("vip_levels")
+    source = raw_levels if isinstance(raw_levels, list) and raw_levels else VIP_LEVELS
+    levels = []
+    for index, fallback in enumerate(VIP_LEVELS):
+        raw = source[index] if index < len(source) and isinstance(source[index], dict) else fallback
+        try:
+            threshold = max(0, int(raw.get("min_purchases", fallback["min_purchases"])))
+        except (TypeError, ValueError):
+            threshold = fallback["min_purchases"]
+        try:
+            discount = min(1.0, max(0.0, float(raw.get("discount", fallback["discount"]))))
+        except (TypeError, ValueError):
+            discount = fallback["discount"]
+        levels.append({
+            "name": str(raw.get("name") or fallback["name"])[:32],
+            "icon": str(raw.get("icon") or fallback["icon"])[:4],
+            "min_purchases": threshold,
+            "discount": discount,
+        })
+    levels.sort(key=lambda level: level["min_purchases"])
+    if not levels or levels[0]["min_purchases"] != 0:
+        levels.insert(0, dict(VIP_LEVELS[0]))
+    return metric, levels
+
+
+def vip_progress_for_user(user_id: str, metric: str | None = None) -> int:
     users = load_json(USERS_FILE)
-    u = users.get(user_id, {})
-    purchases = u.get("purchases", 0)
-    current_vip = VIP_LEVELS[0]
-    for level in VIP_LEVELS:
-        if purchases >= level["min_purchases"]:
+    user = users.get(str(user_id), {}) if isinstance(users, dict) else {}
+    if not isinstance(user, dict):
+        return 0
+    selected_metric = metric or get_vip_settings()[0]
+    if selected_metric == VIP_METRIC_VIDEOS:
+        orders = load_json(ORDERS_FILE)
+        return sum(
+            max(0, int(order.get("videos_count", 0) or 0))
+            for order in (orders if isinstance(orders, list) else [])
+            if isinstance(order, dict) and str(order.get("user_id")) == str(user_id)
+        )
+    return max(0, int(user.get("purchases", 0) or 0))
+
+
+def get_user_vip(user_id: str) -> dict:
+    metric, levels = get_vip_settings()
+    users = load_json(USERS_FILE)
+    user = users.get(str(user_id), {}) if isinstance(users, dict) else {}
+    override = user.get("vip_override") if isinstance(user, dict) else None
+    if isinstance(override, int) and 0 <= override < len(levels):
+        return {**levels[override], "metric": metric, "progress": vip_progress_for_user(user_id, metric), "manual": True}
+    progress = vip_progress_for_user(user_id, metric)
+    current_vip = levels[0]
+    for level in levels:
+        if progress >= level["min_purchases"]:
             current_vip = level
-    return current_vip
+    return {**current_vip, "metric": metric, "progress": progress}
 
 def get_discounted_price(user_id: str, original_price: float) -> float:
     vip = get_user_vip(user_id)
@@ -2217,11 +2274,14 @@ async def vip_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = str(query.from_user.id)
     user_vip = get_user_vip(uid)
     users = load_json(USERS_FILE)
-    purchases = users.get(uid, {}).get("purchases", 0)
+    metric, levels = get_vip_settings()
+    progress = vip_progress_for_user(uid, metric)
+    metric_label = "purchases" if metric == VIP_METRIC_PURCHASES else "videos purchased"
+    metric_label_he = "רכישות" if metric == VIP_METRIC_PURCHASES else "סרטונים שנרכשו"
     english = get_user_language(uid) == "en"
-    text = (f"👑 *VIP tiers*\n\nYour tier: {user_vip['icon']} *{user_vip['name']}*\nPurchases: *{purchases}*\n\n📊 *Tier table:*\n"
-            if english else f"👑 *מערכת דרגות VIP*\n\nהדרגה שלך: {user_vip['icon']} *{user_vip['name']}*\nרכישות שביצעת: *{purchases}*\n\n📊 *טבלת דרגות:*\n")
-    for level in VIP_LEVELS:
+    text = (f"👑 *VIP tiers*\n\nYour tier: {user_vip['icon']} *{user_vip['name']}*\n{metric_label.title()}: *{progress}*\n\n📊 *Tier table:*\n"
+            if english else f"👑 *מערכת דרגות VIP*\n\nהדרגה שלך: {user_vip['icon']} *{user_vip['name']}*\n{metric_label_he}: *{progress}*\n\n📊 *טבלת דרגות:*\n")
+    for level in levels:
         text += (f"{level['icon']} *{level['name']}*: {level['min_purchases']}+ purchases | {int(level['discount']*100)}% discount\n"
                  if english else f"{level['icon']} *{level['name']}*: {level['min_purchases']}+ רכישות | {int(level['discount']*100)}% הנחה\n")
     text += "\n_Discounts apply automatically to PayPal and coin payments._" if english else "\n_ההנחה חלה באופן אוטומטי על תשלום בפייפאל ובמטבעות._"
@@ -8816,14 +8876,111 @@ async def admin_broadcast_cancel_and_back(update: Update, context: ContextTypes.
     return ConversationHandler.END
 
 # ─── Admin: VIP management ────────────────────────────────────────────────────
+def _vip_config_markup() -> InlineKeyboardMarkup:
+    metric, levels = get_vip_settings()
+    rows = [
+        [InlineKeyboardButton(
+            f"📊 מדד: {'רכישות' if metric == VIP_METRIC_PURCHASES else 'סרטונים'}",
+            callback_data="vip_cfg_metric",
+        )]
+    ]
+    for index, level in enumerate(levels):
+        rows.append([InlineKeyboardButton(
+            f"{level['icon']} {level['name']} — {level['min_purchases']}+ | {int(level['discount'] * 100)}%",
+            callback_data=f"vip_cfg_edit_{index}",
+        )])
+    rows.extend([
+        [InlineKeyboardButton("👤 שינוי דרגה למשתמש", callback_data="vip_cfg_user")],
+        [InlineKeyboardButton("🔙 חזרה", callback_data="back_admin")],
+    ])
+    return InlineKeyboardMarkup(rows)
+
+
+async def admin_vip_config_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if not has_admin_permission(query.from_user.id, "vip_manage"):
+        return ConversationHandler.END
+    metric, levels = get_vip_settings()
+    lines = [
+        "💎 *ניהול דרגות VIP*",
+        f"מדד נוכחי: *{'מספר רכישות' if metric == VIP_METRIC_PURCHASES else 'מספר סרטונים'}*",
+        "",
+        "לחץ על דרגה כדי לשנות את הסף ואת אחוז ההנחה.",
+    ]
+    for level in levels:
+        lines.append(f"{level['icon']} {level['name']}: {level['min_purchases']}+ | {int(level['discount'] * 100)}%")
+    await query.edit_message_text("\n".join(lines), parse_mode="Markdown", reply_markup=_vip_config_markup())
+    return ADMIN_VIP_CONFIG_MENU
+
+
+async def admin_vip_config_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if not has_admin_permission(query.from_user.id, "vip_manage"):
+        return ConversationHandler.END
+    if query.data == "vip_cfg_user":
+        await query.edit_message_text("שלח את ה-ID של המשתמש לשינוי ידני:", reply_markup=_flow_back_markup())
+        return ADMIN_VIP_ID
+    if query.data == "vip_cfg_metric":
+        settings = load_settings()
+        settings["vip_metric"] = VIP_METRIC_VIDEOS if settings.get("vip_metric", VIP_METRIC_PURCHASES) == VIP_METRIC_PURCHASES else VIP_METRIC_PURCHASES
+        save_settings(settings)
+        return await admin_vip_config_menu(update, context)
+    try:
+        index = int(query.data.rsplit("_", 1)[1])
+    except (TypeError, ValueError):
+        return ADMIN_VIP_CONFIG_MENU
+    _, levels = get_vip_settings()
+    if index < 0 or index >= len(levels):
+        return ADMIN_VIP_CONFIG_MENU
+    context.user_data["vip_config_index"] = index
+    level = levels[index]
+    await query.edit_message_text(
+        f"עריכת {level['icon']} {level['name']}\n\n"
+        f"הגדר סף ואחוז הנחה בפורמט: `סף אחוז`\n"
+        f"לדוגמה: `10 15`\n\n"
+        f"נוכחי: {level['min_purchases']} ו־{int(level['discount'] * 100)}%",
+        parse_mode="Markdown",
+        reply_markup=_flow_back_markup(),
+    )
+    return ADMIN_VIP_CONFIG_VALUE
+
+
+async def admin_vip_config_value(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not has_admin_permission(update.effective_user.id, "vip_manage"):
+        return ConversationHandler.END
+    parts = (update.message.text or "").replace(",", " ").split()
+    try:
+        threshold = int(parts[0])
+        discount_percent = float(parts[1])
+        if threshold < 0 or not 0 <= discount_percent <= 100:
+            raise ValueError
+    except (IndexError, TypeError, ValueError):
+        await update.message.reply_text("❌ קלט לא תקין. שלח שני מספרים: סף ואחוז, לדוגמה `10 15`.", parse_mode="Markdown", reply_markup=_flow_back_markup())
+        return ADMIN_VIP_CONFIG_VALUE
+    index = context.user_data.get("vip_config_index")
+    metric, levels = get_vip_settings()
+    if not isinstance(index, int) or index < 0 or index >= len(levels):
+        return await admin_vip_config_menu(update, context)
+    settings = load_settings()
+    settings["vip_metric"] = metric
+    settings["vip_levels"] = levels
+    settings["vip_levels"][index]["min_purchases"] = threshold
+    settings["vip_levels"][index]["discount"] = discount_percent / 100
+    settings["vip_levels"] = sorted(settings["vip_levels"], key=lambda level: level["min_purchases"])
+    save_settings(settings)
+    context.user_data.pop("vip_config_index", None)
+    await update.message.reply_text("✅ הגדרות הדרגה נשמרו.", reply_markup=_vip_config_markup())
+    return ADMIN_VIP_CONFIG_MENU
+
 
 async def admin_vip_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     if not has_admin_permission(query.from_user.id, "vip_manage"):
         return ConversationHandler.END
-    await query.edit_message_text("💎 *ניהול דרגות VIP*\n\nשלח את ה-ID של המשתמש:", parse_mode="Markdown", reply_markup=_flow_back_markup())
-    return ADMIN_VIP_ID
+    return await admin_vip_config_menu(update, context)
 
 async def admin_vip_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not has_admin_permission(update.effective_user.id, "vip_manage"):
@@ -8843,8 +9000,9 @@ async def admin_vip_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = users[uid]
     vip  = get_user_vip(uid)
     
+    metric, levels = get_vip_settings()
     keyboard = []
-    for i, level in enumerate(VIP_LEVELS):
+    for i, level in enumerate(levels):
         keyboard.append([InlineKeyboardButton(f"{level['icon']} {level['name']}", callback_data=f"set_vip_{i}")])
     keyboard.append([InlineKeyboardButton("❌ ביטול / חזור", callback_data="back_admin")])
     
@@ -8852,7 +9010,7 @@ async def admin_vip_id(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"👤 *משתמש:* {user.get('first_name', 'לא ידוע')}\n"
         f"🆔 *ID:* `{uid}`\n"
         f"💎 *דרגה נוכחית:* {vip['icon']} {vip['name']}\n"
-        f"🧾 *רכישות:* {user.get('purchases', 0)}\n\n"
+        f"🧾 *{'רכישות' if metric == VIP_METRIC_PURCHASES else 'סרטונים שנרכשו'}:* {vip_progress_for_user(uid, metric)}\n\n"
         "בחר את הדרגה החדשה:",
         parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup(keyboard)
@@ -8867,13 +9025,13 @@ async def admin_vip_level(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
     try:
         level_idx = int(query.data.replace("set_vip_", ""))
-        new_level = VIP_LEVELS[level_idx]
+        _, levels = get_vip_settings()
+        new_level = levels[level_idx]
         uid = context.user_data.get("vip_target_id")
         
         users = load_json(USERS_FILE)
         if uid in users:
-            # שינוי הדרגה מתבצע על ידי עדכון מספר הרכישות המינימלי הנדרש לאותה דרגה
-            users[uid]["purchases"] = new_level["min_purchases"]
+            users[uid]["vip_override"] = level_idx
             save_json(USERS_FILE, users)
             
             await query.edit_message_text(
@@ -10333,6 +10491,8 @@ def main():
     vip_conv = ConversationHandler(
         entry_points=[CallbackQueryHandler(admin_vip_start, pattern="^admin_vip$")],
         states={
+            ADMIN_VIP_CONFIG_MENU: [CallbackQueryHandler(admin_vip_config_action, pattern=r"^vip_cfg_(?:metric|edit_\d+|user)$")],
+            ADMIN_VIP_CONFIG_VALUE: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_vip_config_value)],
             ADMIN_VIP_ID:    [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_vip_id)],
             ADMIN_VIP_LEVEL: [CallbackQueryHandler(admin_vip_level, pattern="^set_vip_")],
         },
