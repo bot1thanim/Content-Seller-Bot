@@ -621,17 +621,27 @@ def _restore_payload_matches_after_save(filename: str, expected, actual) -> bool
     # Runtime settings are normalized by load_settings()/save_settings() while
     # restore also persists duplicate-review compatibility data. Compare the
     # semantic, normalized view so harmless migrations do not trigger rollback.
-    expected_normalized = normalize_restored_settings(dict(expected))
-    actual_normalized = normalize_restored_settings(dict(actual))
+    def normalized_runtime_settings(value: dict) -> dict:
+        normalized = normalize_restored_settings(dict(value))
+        categories = [
+            category for category in normalized.get("categories", [])
+            if category != DEFAULT_CATEGORY
+        ]
+        for key in ("category_visibility", "category_random_enabled"):
+            raw = normalized.get(key, {})
+            if not isinstance(raw, dict):
+                raw = {}
+            # load_settings() fills missing entries with True for every current
+            # category. Do the same for both expected and actual settings.
+            normalized[key] = {
+                category: bool(raw.get(category, True)) for category in categories
+            }
+        return normalized
+
+    expected_normalized = normalized_runtime_settings(expected)
+    actual_normalized = normalized_runtime_settings(actual)
     for key, expected_value in expected_normalized.items():
-        if key in {"category_visibility", "category_random_enabled"} and isinstance(expected_value, dict):
-            expected_value = {str(name): bool(value) for name, value in expected_value.items()}
-            actual_value = actual_normalized.get(key, {})
-            if not isinstance(actual_value, dict):
-                return False
-            actual_value = {str(name): bool(value) for name, value in actual_value.items()}
-        else:
-            actual_value = actual_normalized.get(key)
+        actual_value = actual_normalized.get(key)
         # ``load_settings`` may add compatibility/default keys while the file is
         # being written.  Check the normalized view, not the raw JSON object;
         # otherwise an otherwise valid legacy backup is rolled back with a false
