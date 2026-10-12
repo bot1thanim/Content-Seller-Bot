@@ -22,6 +22,7 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 from telegram import (
     Update,
+    MessageEntity,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     ReplyKeyboardMarkup,
@@ -182,6 +183,7 @@ ADMIN_COUPON_EDIT_REFERRAL_MINIMUM = 45
 ADMIN_VIP_CONFIG_MENU = 46
 ADMIN_VIP_CONFIG_VALUE = 47
 ADMIN_VIP_CONFIG_CONFIRM_DELETE = 48
+ADMIN_VIDEO_BROWSE_FILTER = 49
 
 
 # ─── Data helpers ─────────────────────────────────────────────────────────────
@@ -638,7 +640,13 @@ def _restore_payload_matches_after_save(filename: str, expected, actual) -> bool
         # "settings.json" verification failure.
         if key not in actual_normalized:
             return False
-        if key in {"categories", DUPLICATE_REVIEWED_KEY} and isinstance(expected_value, list) and isinstance(actual_value, list):
+        if key in {"category_visibility", "category_random_enabled"} and isinstance(expected_value, dict):
+            # load_settings() materializes defaults for every current category.
+            # A legacy backup may contain only the explicitly configured entries;
+            # require those entries to survive but tolerate newly-added defaults.
+            if any(actual_value.get(name) != value for name, value in expected_value.items()):
+                return False
+        elif key in {"categories", DUPLICATE_REVIEWED_KEY} and isinstance(expected_value, list) and isinstance(actual_value, list):
             if set(actual_value) != set(expected_value):
                 return False
         elif actual_value != expected_value:
@@ -927,6 +935,8 @@ def callback_permission(callback_data: str) -> str | None:
         return "dashboard"
     if callback_data.startswith(("vid_", "fav_", "admin_favorites", "admin_video_search", "admin_search_sec", "admin_search_size", "admin_size_group", "size_group_", "admin_combined_search")):
         return "gallery_browse"
+    if callback_data.startswith("gallery_browse_"):
+        return "gallery_browse"
     if callback_data.startswith(("admin_categories", "admin_cat_", "cat_")):
         if callback_data.startswith(("admin_cat_visibility", "cat_visibility_", "admin_cat_random", "cat_random_")):
             return "owner"
@@ -986,7 +996,7 @@ async def admin_callback_gate(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
     data = query.data or ""
     permission = callback_permission(data)
-    private_callback = data.startswith(("admin_", "broadcast_", "coupon_", "cat_", "dup_", "vid_", "trash_", "del_", "maint_", "support_reply"))
+    private_callback = data.startswith(("admin_", "broadcast_", "coupon_", "cat_", "dup_", "vid_", "gallery_browse_", "trash_", "del_", "maint_", "support_reply"))
     allowed = is_owner(query.from_user.id)
     if not allowed and permission == "panel":
         allowed = is_admin(query.from_user.id)
@@ -2023,6 +2033,7 @@ def _clear_transient_flow_state(context: ContextTypes.DEFAULT_TYPE) -> None:
         "pending_restore", "support_reply_target", "category_rename_old",
         "broadcast_msg", "broadcast_media", "broadcast_markup", "broadcast_delay",
         "broadcast_edit_mode", "repair_list", "repair_index", "repair_scan_summary",
+        "gallery_browse_ids", "gallery_browse_filter_label",
         "assistant_pending_action", "assistant_delivery_draft", "coupon_edit_code",
         "coupon_edit_field", "coupon_edit_referral_mode",
         "nickname_edit_target", "cat_sort_shared_resume_page", "purchase_category",
@@ -6118,6 +6129,7 @@ async def admin_gallery(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if has_admin_permission(user_id, "gallery_browse"):
         keyboard.extend([
             [InlineKeyboardButton("🎬 עיון בספריה", callback_data="vid_page_0")],
+            [InlineKeyboardButton("🎞️ דפדוף מסונן סרטון־סרטון", callback_data="gallery_browse_start")],
             [InlineKeyboardButton("⭐ מועדפים למנהל", callback_data="admin_favorites")],
             [InlineKeyboardButton("📤 שלח את כל הסרטונים", callback_data="vid_send_all")],
         ])
@@ -7433,6 +7445,128 @@ async def admin_search_sec_start(update: Update, context: ContextTypes.DEFAULT_T
     return ADMIN_VIDEO_SEARCH_SECONDS
 
 
+async def admin_gallery_browse_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if not has_admin_permission(query.from_user.id, "gallery_browse"):
+        return ConversationHandler.END
+    await query.edit_message_text(
+        "🎞️ *דפדוף מסונן סרטון־סרטון*\n\n"
+        "שלח טווח זמן ואפשרות קטגוריה בפורמט:\n"
+        "`1:00-5:00 | אקשן`\n\n"
+        "אפשר להשאיר קטגוריה ריקה: `10:00-99:00 | הכל`\n"
+        "הסרטונים יוצגו מהקצר לארוך.",
+        parse_mode="Markdown", reply_markup=_flow_back_markup("admin_gallery", "🔙 חזרה לגלריה"),
+    )
+    return ADMIN_VIDEO_BROWSE_FILTER
+
+
+async def admin_gallery_browse_filter(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not has_admin_permission(update.effective_user.id, "gallery_browse"):
+        return ConversationHandler.END
+    raw = (update.message.text or "").strip()
+    parts = [part.strip() for part in raw.split("|", 1)]
+    time_range = parse_smart_time_range(parts[0]) if parts else None
+    category = parts[1] if len(parts) == 2 and parts[1] and parts[1] != "הכל" else None
+    if not time_range:
+        await update.message.reply_text("❌ טווח לא תקין. לדוגמה: `1:00-5:00 | אקשן`.", parse_mode="Markdown")
+        return ADMIN_VIDEO_BROWSE_FILTER
+    if category and category not in _admin_categories():
+        await update.message.reply_text("❌ הקטגוריה לא נמצאה. כתוב `הכל` או שם קטגוריה קיים.")
+        return ADMIN_VIDEO_BROWSE_FILTER
+    first, last = time_range
+    results = [
+        video for video in load_videos_with_entry_ids()
+        if isinstance(video, dict)
+        and first <= int(video.get("duration", 0) or 0) <= last
+        and (category is None or category in video_categories(video))
+    ]
+    results.sort(key=lambda video: (int(video.get("duration", 0) or 0), str(video.get("entry_id", ""))))
+    context.user_data["gallery_browse_ids"] = [str(video.get("entry_id")) for video in results]
+    context.user_data["gallery_browse_filter_label"] = f"{format_duration(first)}–{format_duration(last)}" + (f" | {category}" if category else " | כל הקטגוריות")
+    if not results:
+        await update.message.reply_text("❌ לא נמצאו סרטונים במסנן שבחרת.", reply_markup=get_admin_inline_keyboard())
+        return ConversationHandler.END
+    await update.message.reply_text(f"✅ נמצאו {len(results)} סרטונים. מציג סרטון אחד בכל פעם.")
+    await admin_gallery_browse_page(update, context, 0)
+    return ConversationHandler.END
+
+
+async def admin_gallery_browse_page(update: Update, context: ContextTypes.DEFAULT_TYPE, page: int = 0):
+    query = update.callback_query
+    if query:
+        await query.answer()
+    await clear_sent_duplicate_group_media(context)
+    ids = context.user_data.get("gallery_browse_ids", [])
+    videos = load_videos_with_entry_ids()
+    by_id = {str(video.get("entry_id")): video for video in videos}
+    selected = [by_id[item] for item in ids if item in by_id]
+    if not selected:
+        target = query.message if query else update.message
+        await target.reply_text("המסנן ריק או שהסרטונים נמחקו.", reply_markup=get_admin_inline_keyboard())
+        return
+    page = max(0, min(int(page), len(selected) - 1))
+    video = selected[page]
+    label = context.user_data.get("gallery_browse_filter_label", "מסנן")
+    text = (f"🎞️ *דפדוף סרטונים ({page + 1}/{len(selected)})*\n\n"
+            f"🔎 מסנן: {label}\n🆔 `{video.get('entry_id')}`\n"
+            f"⏱ אורך: {format_duration(video.get('duration', 0))}\n"
+            f"📁 קטגוריות: {display_video_categories(video)}")
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton("⬅️ הקודם", callback_data=f"gallery_browse_page_{page - 1}"))
+    nav.append(InlineKeyboardButton(f"{page + 1}/{len(selected)}", callback_data="noop"))
+    if page < len(selected) - 1:
+        nav.append(InlineKeyboardButton("הבא ➡️", callback_data=f"gallery_browse_page_{page + 1}"))
+    markup = InlineKeyboardMarkup([
+        nav,
+        [InlineKeyboardButton("🗑 מחק את הסרטון הנוכחי", callback_data=f"gallery_browse_delete_{page}")],
+        [InlineKeyboardButton("🔙 חזרה לגלריה", callback_data="gallery_browse_back")],
+    ])
+    if query:
+        await query.edit_message_text(text, parse_mode="Markdown", reply_markup=markup)
+        chat_id = query.message.chat_id
+    else:
+        control = await update.message.reply_text(text, parse_mode="Markdown", reply_markup=markup)
+        chat_id = update.effective_chat.id
+    sent = await send_admin_video_with_delete_button(context.bot, video["file_id"], video["entry_id"], chat_id, include_category_assignment=True)
+    if sent and sent != "INVALID_FILE_ID":
+        context.user_data["dup_sent_media_message_ids"] = [sent.message_id]
+        context.user_data["admin_preview_chat_id"] = int(chat_id)
+
+
+async def admin_gallery_browse_delete(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    ids = context.user_data.get("gallery_browse_ids", [])
+    try:
+        page = int(query.data.rsplit("_", 1)[1])
+        entry_id = ids[page]
+    except (ValueError, IndexError, TypeError):
+        await query.answer("הסרטון כבר אינו זמין.", show_alert=True)
+        return
+    moved, _ = _move_video_to_trash(entry_id)
+    if moved:
+        ids.pop(page)
+        context.user_data["gallery_browse_ids"] = ids
+        await query.answer("הסרטון הועבר לסל המיחזור.", show_alert=True)
+        if ids:
+            await admin_gallery_browse_page(update, context, min(page, len(ids) - 1))
+        else:
+            await query.edit_message_text("✅ כל הסרטונים במסנן טופלו.", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 גלריה", callback_data="admin_gallery")]]))
+    else:
+        await query.answer("הסרטון כבר נמחק.", show_alert=True)
+
+
+async def admin_gallery_browse_back(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    await clear_sent_duplicate_group_media(context)
+    context.user_data.pop("gallery_browse_ids", None)
+    context.user_data.pop("gallery_browse_filter_label", None)
+    await admin_gallery(update, context)
+
+
 def parse_smart_time(text: str) -> int:
     """Parse '26' as 26s, '1:20' as 80s, and reject invalid minute:second values."""
     text = text.strip()
@@ -8533,7 +8667,7 @@ async def admin_quick_category_done(update: Update, context: ContextTypes.DEFAUL
 
 
 def _clear_broadcast_draft(context: ContextTypes.DEFAULT_TYPE) -> None:
-    for key in ("broadcast_msg", "broadcast_media", "broadcast_markup", "broadcast_delay", "broadcast_edit_mode"):
+    for key in ("broadcast_msg", "broadcast_entities", "broadcast_media", "broadcast_markup", "broadcast_delay", "broadcast_edit_mode"):
         context.user_data.pop(key, None)
 
 
@@ -8547,25 +8681,33 @@ def _broadcast_preview_markup() -> InlineKeyboardMarkup:
     ])
 
 
-async def _send_message_payload(bot_client, target_id: int | str, text: str, media=None, markup=None) -> None:
+def _message_entities_payload(entities) -> list[dict]:
+    return [entity.to_dict() for entity in (entities or []) if isinstance(entity, MessageEntity)]
+
+
+def _message_entities_from_payload(payload) -> list[MessageEntity]:
+    return [MessageEntity.de_json(item, None) for item in (payload or []) if isinstance(item, dict)]
+
+
+async def _send_message_payload(bot_client, target_id: int | str, text: str, media=None, markup=None, entities=None) -> None:
     """Deliver only the manager-supplied payload; do not parse its formatting as Telegram Markdown."""
     if media:
         media_type, file_id = media
         if media_type == "photo":
-            await bot_client.send_photo(chat_id=int(target_id), photo=file_id, caption=text, reply_markup=markup)
+            await bot_client.send_photo(chat_id=int(target_id), photo=file_id, caption=text, caption_entities=entities or [], reply_markup=markup)
             return
-        await bot_client.send_video(chat_id=int(target_id), video=file_id, caption=text, reply_markup=markup)
+        await bot_client.send_video(chat_id=int(target_id), video=file_id, caption=text, caption_entities=entities or [], reply_markup=markup)
         return
-    await bot_client.send_message(chat_id=int(target_id), text=text, reply_markup=markup)
+    await bot_client.send_message(chat_id=int(target_id), text=text, entities=entities or [], reply_markup=markup)
 
 
-async def _send_broadcast_payload(context: ContextTypes.DEFAULT_TYPE, users: dict, source_text: str, media=None, markup=None, progress=None) -> tuple[int, int]:
+async def _send_broadcast_payload(context: ContextTypes.DEFAULT_TYPE, users: dict, source_text: str, media=None, markup=None, progress=None, entities=None) -> tuple[int, int]:
     """Send one identical administrator-supplied broadcast to every registered user."""
     sent = 0
     failed = 0
     for uid in users:
         try:
-            await _send_message_payload(context.bot, uid, source_text, media, markup)
+            await _send_message_payload(context.bot, uid, source_text, media, markup, entities)
             sent += 1
         except Exception as exc:
             logger.warning("Failed to send broadcast to %s: %s", uid, type(exc).__name__)
@@ -8657,6 +8799,7 @@ async def admin_broadcast_get_msg(update: Update, context: ContextTypes.DEFAULT_
     if not is_admin(update.effective_user.id):
         return ConversationHandler.END
     context.user_data["broadcast_msg"] = update.message.text
+    context.user_data["broadcast_entities"] = _message_entities_payload(update.message.entities)
     if context.user_data.pop("broadcast_edit_mode", None) == "text":
         await _show_broadcast_preview(update.message, context)
         return ADMIN_BROADCAST_PREVIEW
@@ -8755,7 +8898,7 @@ def _save_broadcast_record(record: dict) -> None:
     save_json(BROADCASTS_FILE, records)
 
 
-def _new_broadcast_record(*, actor_id: int, text: str, media, markup, delay_min: int, users: dict) -> dict:
+def _new_broadcast_record(*, actor_id: int, text: str, entities, media, markup, delay_min: int, users: dict) -> dict:
     now = datetime.now(timezone.utc)
     return {
         "id": uuid.uuid4().hex,
@@ -8763,6 +8906,7 @@ def _new_broadcast_record(*, actor_id: int, text: str, media, markup, delay_min:
         "scheduled_for": (now + timedelta(minutes=max(0, delay_min))).isoformat(),
         "created_by": int(actor_id),
         "text": text,
+        "entities": list(entities) if isinstance(entities, list) else [],
         "media": list(media) if isinstance(media, tuple) else None,
         "markup": _broadcast_markup_payload(markup),
         "recipient_ids": [str(uid) for uid in users],
@@ -8782,7 +8926,7 @@ async def _execute_broadcast_record(bot_client, record: dict) -> None:
     sent = failed = 0
     for uid in record.get("recipient_ids", []):
         try:
-            await _send_message_payload(bot_client, uid, str(record.get("text") or ""), media, markup)
+            await _send_message_payload(bot_client, uid, str(record.get("text") or ""), media, markup, _message_entities_from_payload(record.get("entities")))
             sent += 1
         except Exception as exc:
             logger.warning("Failed scheduled broadcast to %s: %s", uid, type(exc).__name__)
@@ -8862,6 +9006,7 @@ async def admin_broadcast_preview_action(update: Update, context: ContextTypes.D
     record = _new_broadcast_record(
         actor_id=query.from_user.id,
         text=msg,
+        entities=context.user_data.get("broadcast_entities", []),
         media=media,
         markup=markup,
         delay_min=delay_min,
@@ -10668,6 +10813,16 @@ def main():
         ],
         per_message=False, per_chat=True,
     )
+    gallery_browse_conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(admin_gallery_browse_start, pattern="^gallery_browse_start$")],
+        states={ADMIN_VIDEO_BROWSE_FILTER: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_gallery_browse_filter)]},
+        fallbacks=[
+            CommandHandler("cancel", cancel),
+            CallbackQueryHandler(exit_to_gallery, pattern="^admin_gallery$"),
+            CallbackQueryHandler(exit_to_admin_panel, pattern="^back_admin$"),
+        ],
+        per_message=False, per_chat=True,
+    )
     video_combined_search_conv = ConversationHandler(
         entry_points=[CallbackQueryHandler(admin_combined_search_start, pattern="^admin_combined_search$")],
         states={ADMIN_VIDEO_COMBINED_SEARCH: [MessageHandler(filters.TEXT & ~filters.COMMAND, admin_combined_search_input)]},
@@ -10812,7 +10967,7 @@ def main():
     for conv in [
         check_conv, send_conv, approve_conv, broadcast_conv, coins_conv, vip_conv,
         coupon_new_conv, coupon_edit_conv, coin_control_conv, restore_conv, global_reset_conv,
-        video_search_conv, video_search_sec_conv, video_combined_search_conv, repair_conv, support_conv, coupon_redeem_conv, support_reply_conv,
+        video_search_conv, video_search_sec_conv, gallery_browse_conv, video_combined_search_conv, repair_conv, support_conv, coupon_redeem_conv, support_reply_conv,
         cat_add_conv, cat_rename_conv, manager_add_conv, nickname_conv, assistant_conv, audit_search_conv, video_upload_conv
     ]:
         app.add_handler(conv)
@@ -10907,6 +11062,9 @@ def main():
         (r"^size_group_send_\d+$",       admin_size_group_send),
         ("^size_group_back_gallery$",     admin_size_group_back_gallery),
 
+        (r"^gallery_browse_page_\d+$",  lambda update, context: admin_gallery_browse_page(update, context, int(update.callback_query.data.removeprefix("gallery_browse_page_")))),
+        (r"^gallery_browse_delete_\d+$", admin_gallery_browse_delete),
+        ("^gallery_browse_back$",        admin_gallery_browse_back),
         (r"^vid_page_\d+$",             admin_gallery_page),
         (r"^vid_del_\d+$",              admin_gallery_delete),
         (r"^fav_toggle_.+$",             admin_favorite_toggle),
