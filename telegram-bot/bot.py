@@ -8842,10 +8842,10 @@ async def admin_broadcast_get_btn(update: Update, context: ContextTypes.DEFAULT_
     interaction = None
     if raw.lower().startswith("ack|"):
         interaction = {"kind": "ack", "label": raw.split("|", 1)[1].strip() or "✅ קראתי"}
-    elif raw.lower().startswith("react|"):
+    elif raw.lower().startswith(("react|", "poll|")):
         options = [item.strip() for item in raw.split("|", 1)[1].split(",") if item.strip()]
         if options:
-            interaction = {"kind": "reaction", "options": options[:8]}
+            interaction = {"kind": "poll" if raw.lower().startswith("poll|") else "reaction", "options": options[:8]}
     if interaction is None and raw.lower() != "skip":
         if "|" in raw:
             parts = raw.split("|", 1)
