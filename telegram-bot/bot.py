@@ -78,6 +78,7 @@ USER_ACTIVITY_FILE = DATA_DIR / "user_activity.json"
 ALERTS_FILE = DATA_DIR / "alerts.json"
 DUPLICATE_REVIEWS_FILE = DATA_DIR / "duplicate_reviews.json"
 BROADCASTS_FILE = DATA_DIR / "broadcasts.json"
+INTERACTIONS_FILE = DATA_DIR / "interactions.json"
 RESTORE_UNDO_FILE = DATA_DIR / "restore_undo.json"
 RESTORE_SESSION_FILE = DATA_DIR / "restore_session.json"
 AUTO_BACKUPS_DIR = DATA_DIR / "auto_backups"
@@ -100,6 +101,7 @@ BACKUP_ALLOWED_FILES = {
     "alerts.json": list,
     "duplicate_reviews.json": list,
     "broadcasts.json": list,
+    "interactions.json": dict,
 }
 MAX_RESTORE_ARCHIVE_BYTES = 20 * 1024 * 1024
 MAX_RESTORE_UNCOMPRESSED_BYTES = 40 * 1024 * 1024
@@ -206,6 +208,7 @@ def ensure_data_files():
         (ALERTS_FILE, []),
         (DUPLICATE_REVIEWS_FILE, []),
         (BROADCASTS_FILE, []),
+        (INTERACTIONS_FILE, {}),
     ]
     for filepath, default in defaults:
         if not filepath.exists():
@@ -2031,7 +2034,7 @@ def _clear_transient_flow_state(context: ContextTypes.DEFAULT_TYPE) -> None:
         "new_coupon_code", "new_coupon_coins", "new_coupon_expiry", "new_coupon_max_uses",
         "new_coupon_referral_mode", "new_coupon_referral_minimum",
         "pending_restore", "support_reply_target", "category_rename_old",
-        "broadcast_msg", "broadcast_media", "broadcast_markup", "broadcast_delay",
+        "broadcast_msg", "broadcast_media", "broadcast_markup", "broadcast_interaction", "broadcast_delay",
         "broadcast_edit_mode", "repair_list", "repair_index", "repair_scan_summary",
         "gallery_browse_ids", "gallery_browse_filter_label",
         "assistant_pending_action", "assistant_delivery_draft", "coupon_edit_code",
@@ -8667,7 +8670,7 @@ async def admin_quick_category_done(update: Update, context: ContextTypes.DEFAUL
 
 
 def _clear_broadcast_draft(context: ContextTypes.DEFAULT_TYPE) -> None:
-    for key in ("broadcast_msg", "broadcast_entities", "broadcast_media", "broadcast_markup", "broadcast_delay", "broadcast_edit_mode"):
+    for key in ("broadcast_msg", "broadcast_entities", "broadcast_media", "broadcast_markup", "broadcast_interaction", "broadcast_delay", "broadcast_edit_mode"):
         context.user_data.pop(key, None)
 
 
@@ -8836,7 +8839,14 @@ async def admin_broadcast_get_btn(update: Update, context: ContextTypes.DEFAULT_
         return ConversationHandler.END
     raw    = update.message.text.strip()
     markup = None
-    if raw.lower() != "skip":
+    interaction = None
+    if raw.lower().startswith("ack|"):
+        interaction = {"kind": "ack", "label": raw.split("|", 1)[1].strip() or "✅ קראתי"}
+    elif raw.lower().startswith("react|"):
+        options = [item.strip() for item in raw.split("|", 1)[1].split(",") if item.strip()]
+        if options:
+            interaction = {"kind": "reaction", "options": options[:8]}
+    if interaction is None and raw.lower() != "skip":
         if "|" in raw:
             parts = raw.split("|", 1)
             btn_text, btn_url = parts[0].strip(), parts[1].strip()
@@ -8849,6 +8859,7 @@ async def admin_broadcast_get_btn(update: Update, context: ContextTypes.DEFAULT_
             await update.message.reply_text("❌ פורמט לא תקין. השתמש ב-`טקסט|קישור` או `skip`.", parse_mode="Markdown", reply_markup=_flow_back_markup())
             return ADMIN_BROADCAST_BTN
     context.user_data["broadcast_markup"] = markup
+    context.user_data["broadcast_interaction"] = interaction
     if context.user_data.pop("broadcast_edit_mode", None) == "link":
         await _show_broadcast_preview(update.message, context)
         return ADMIN_BROADCAST_PREVIEW
@@ -8889,6 +8900,51 @@ def _broadcast_markup_from_payload(payload):
     return InlineKeyboardMarkup([[InlineKeyboardButton(str(payload.get("text") or "קישור"), url=str(payload["url"]))]])
 
 
+def _interaction_markup(record: dict) -> InlineKeyboardMarkup | None:
+    interaction = record.get("interaction") if isinstance(record, dict) else None
+    if not isinstance(interaction, dict):
+        return None
+    kind = interaction.get("kind")
+    broadcast_id = str(record.get("id"))
+    if kind == "ack":
+        label = str(interaction.get("label") or "✅ קראתי")
+        count = len((load_json(INTERACTIONS_FILE) or {}).get(broadcast_id, {}).get("users", {}))
+        return InlineKeyboardMarkup([[InlineKeyboardButton(f"{label} — {count}", callback_data=f"broadcast_interaction_ack_{broadcast_id}")]])
+    options = interaction.get("options") if isinstance(interaction.get("options"), list) else []
+    rows = []
+    state = load_json(INTERACTIONS_FILE) or {}
+    users = state.get(broadcast_id, {}).get("users", {}) if isinstance(state.get(broadcast_id), dict) else {}
+    counts = {str(index): sum(1 for value in users.values() if str(value) == str(index)) for index in range(len(options))}
+    for index, option in enumerate(options):
+        rows.append([InlineKeyboardButton(f"{option} — {counts[str(index)]}", callback_data=f"broadcast_interaction_{broadcast_id}_{index}")])
+    return InlineKeyboardMarkup(rows)
+
+
+async def broadcast_interaction_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    parts = (query.data or "").split("_")
+    if len(parts) < 4:
+        return
+    if parts[2] == "ack":
+        broadcast_id, choice = parts[3], "ack"
+    else:
+        broadcast_id, choice = parts[2], (parts[3] if len(parts) > 3 else "")
+    state = load_json(INTERACTIONS_FILE)
+    if not isinstance(state, dict) or broadcast_id not in state:
+        await query.answer("ההודעה כבר אינה פעילה.", show_alert=True)
+        return
+    record = state[broadcast_id]
+    if not isinstance(record, dict):
+        return
+    users = record.setdefault("users", {})
+    users[str(query.from_user.id)] = choice
+    save_json(INTERACTIONS_FILE, state)
+    broadcast = next((item for item in load_json(BROADCASTS_FILE) if isinstance(item, dict) and item.get("id") == broadcast_id), None)
+    if broadcast:
+        await query.edit_message_reply_markup(reply_markup=_interaction_markup({**broadcast, "interaction": record.get("interaction", {})}))
+
+
 def _save_broadcast_record(record: dict) -> None:
     records = load_json(BROADCASTS_FILE)
     if not isinstance(records, list):
@@ -8898,7 +8954,7 @@ def _save_broadcast_record(record: dict) -> None:
     save_json(BROADCASTS_FILE, records)
 
 
-def _new_broadcast_record(*, actor_id: int, text: str, entities, media, markup, delay_min: int, users: dict) -> dict:
+def _new_broadcast_record(*, actor_id: int, text: str, entities, interaction, media, markup, delay_min: int, users: dict) -> dict:
     now = datetime.now(timezone.utc)
     return {
         "id": uuid.uuid4().hex,
@@ -8907,6 +8963,7 @@ def _new_broadcast_record(*, actor_id: int, text: str, entities, media, markup, 
         "created_by": int(actor_id),
         "text": text,
         "entities": list(entities) if isinstance(entities, list) else [],
+        "interaction": dict(interaction) if isinstance(interaction, dict) else None,
         "media": list(media) if isinstance(media, tuple) else None,
         "markup": _broadcast_markup_payload(markup),
         "recipient_ids": [str(uid) for uid in users],
@@ -8923,10 +8980,18 @@ async def _execute_broadcast_record(bot_client, record: dict) -> None:
     _save_broadcast_record(record)
     media = tuple(record["media"]) if isinstance(record.get("media"), list) and len(record["media"]) == 2 else None
     markup = _broadcast_markup_from_payload(record.get("markup"))
+    interaction = record.get("interaction")
+    if isinstance(interaction, dict):
+        interaction_state = load_json(INTERACTIONS_FILE)
+        if not isinstance(interaction_state, dict):
+            interaction_state = {}
+        interaction_state.setdefault(record["id"], {"interaction": interaction, "users": {}})
+        save_json(INTERACTIONS_FILE, interaction_state)
     sent = failed = 0
     for uid in record.get("recipient_ids", []):
         try:
-            await _send_message_payload(bot_client, uid, str(record.get("text") or ""), media, markup, _message_entities_from_payload(record.get("entities")))
+            current_markup = _interaction_markup(record) if isinstance(interaction, dict) else markup
+            await _send_message_payload(bot_client, uid, str(record.get("text") or ""), media, current_markup, _message_entities_from_payload(record.get("entities")))
             sent += 1
         except Exception as exc:
             logger.warning("Failed scheduled broadcast to %s: %s", uid, type(exc).__name__)
@@ -9007,6 +9072,7 @@ async def admin_broadcast_preview_action(update: Update, context: ContextTypes.D
         actor_id=query.from_user.id,
         text=msg,
         entities=context.user_data.get("broadcast_entities", []),
+        interaction=context.user_data.get("broadcast_interaction"),
         media=media,
         markup=markup,
         delay_min=delay_min,
@@ -11003,6 +11069,7 @@ def main():
         ("^admin_coins_menu$",          admin_coins_menu),
         ("^admin_coin_control$",         admin_coin_control_menu),
         ("^admin_menu_communications$", admin_menu_communications),
+        (r"^broadcast_interaction_.+$", broadcast_interaction_callback),
         ("^admin_broadcast_status$",   admin_broadcast_status),
         (r"^broadcast_cancel_[0-9a-f]+$", admin_broadcast_cancel),
         ("^admin_restore_apply$",       admin_restore_apply),
