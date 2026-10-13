@@ -8770,6 +8770,7 @@ async def admin_broadcast_status(update: Update, context: ContextTypes.DEFAULT_T
         if record.get("interaction"):
             label = "✅ אישורים" if record["interaction"].get("kind") == "ack" else "📊 הצבעות"
             lines.append(f"  ↳ {label}: {len(answered)}/{len(record.get('recipient_ids', []))}")
+            buttons.append([InlineKeyboardButton(f"📊 תוצאות {str(record.get('id'))[:8]}", callback_data=f"broadcast_interaction_admin_{record.get('id')}")])
         if record.get("status") == "pending":
             buttons.append([InlineKeyboardButton(f"❌ בטל {str(record.get('id'))[:8]}", callback_data=f"broadcast_cancel_{record.get('id')}")])
     if not records:
@@ -8912,6 +8913,8 @@ def _interaction_markup(record: dict) -> InlineKeyboardMarkup | None:
     interaction = record.get("interaction") if isinstance(record, dict) else None
     if not isinstance(interaction, dict):
         return None
+    if interaction.get("closed"):
+        return None
     kind = interaction.get("kind")
     broadcast_id = str(record.get("id"))
     if kind == "ack":
@@ -8951,6 +8954,53 @@ async def broadcast_interaction_callback(update: Update, context: ContextTypes.D
     broadcast = next((item for item in load_json(BROADCASTS_FILE) if isinstance(item, dict) and item.get("id") == broadcast_id), None)
     if broadcast:
         await query.edit_message_reply_markup(reply_markup=_interaction_markup({**broadcast, "interaction": record.get("interaction", {})}))
+
+
+async def admin_broadcast_interaction_details(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if not has_admin_permission(query.from_user.id, "broadcast"):
+        return
+    broadcast_id = (query.data or "").removeprefix("broadcast_interaction_admin_")
+    record = next((item for item in load_json(BROADCASTS_FILE) if isinstance(item, dict) and item.get("id") == broadcast_id), None)
+    state = load_json(INTERACTIONS_FILE)
+    entry = state.get(broadcast_id, {}) if isinstance(state, dict) else {}
+    users = entry.get("users", {}) if isinstance(entry, dict) else {}
+    all_ids = [str(uid) for uid in (record or {}).get("recipient_ids", [])]
+    users_db = load_json(USERS_FILE)
+    lines = ["📊 *תוצאות הודעה*", "", f"✅ השיבו: *{len(users)}*", f"⏳ לא השיבו: *{max(0, len(all_ids) - len(users))}*", ""]
+    grouped = {}
+    for uid, choice in users.items():
+        grouped.setdefault(str(choice), []).append(uid)
+    for choice, ids in grouped.items():
+        names = [str((users_db.get(uid) or {}).get("first_name") or uid) for uid in ids[:12]]
+        lines.append(f"• {choice}: {len(ids)} — {', '.join(names)}")
+    rows = [
+        [InlineKeyboardButton("🔄 אפס תוצאות", callback_data=f"broadcast_interaction_reset_{broadcast_id}"), InlineKeyboardButton("🔒 סגור", callback_data=f"broadcast_interaction_close_{broadcast_id}")],
+        [InlineKeyboardButton("🔙 חזרה", callback_data="admin_broadcast_status")],
+    ]
+    await query.edit_message_text("\n".join(lines), parse_mode="Markdown", reply_markup=InlineKeyboardMarkup(rows))
+
+
+async def admin_broadcast_interaction_manage(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    if not has_admin_permission(query.from_user.id, "broadcast"):
+        return
+    data = query.data or ""
+    action, broadcast_id = (data.removeprefix("broadcast_interaction_").split("_", 1) if data.startswith("broadcast_interaction_") else ("", ""))
+    state = load_json(INTERACTIONS_FILE)
+    entry = state.get(broadcast_id) if isinstance(state, dict) else None
+    if not isinstance(entry, dict):
+        await query.answer("האינטראקציה לא נמצאה.", show_alert=True)
+        return
+    if action == "reset":
+        entry["users"] = {}
+    elif action == "close":
+        interaction = entry.setdefault("interaction", {})
+        interaction["closed"] = True
+    save_json(INTERACTIONS_FILE, state)
+    await admin_broadcast_interaction_details(update, context)
 
 
 def _save_broadcast_record(record: dict) -> None:
@@ -11077,6 +11127,8 @@ def main():
         ("^admin_coins_menu$",          admin_coins_menu),
         ("^admin_coin_control$",         admin_coin_control_menu),
         ("^admin_menu_communications$", admin_menu_communications),
+        (r"^broadcast_interaction_admin_.+$", admin_broadcast_interaction_details),
+        (r"^broadcast_interaction_(reset|close)_.+$", admin_broadcast_interaction_manage),
         (r"^broadcast_interaction_.+$", broadcast_interaction_callback),
         ("^admin_broadcast_status$",   admin_broadcast_status),
         (r"^broadcast_cancel_[0-9a-f]+$", admin_broadcast_cancel),
