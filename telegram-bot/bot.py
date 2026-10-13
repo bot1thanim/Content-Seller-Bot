@@ -8757,11 +8757,19 @@ async def admin_broadcast_status(update: Update, context: ContextTypes.DEFAULT_T
     records = load_json(BROADCASTS_FILE)
     records = [item for item in records if isinstance(item, dict)] if isinstance(records, list) else []
     records = list(reversed(records[-20:]))
+    interaction_state = load_json(INTERACTIONS_FILE)
+    if not isinstance(interaction_state, dict):
+        interaction_state = {}
     buttons = []
     lines = ["📊 *סטטוס הודעות מתוזמנות*", ""]
     for record in records:
         status = _broadcast_status_label(str(record.get("status")))
         lines.append(f"• {status} | {record.get('sent', 0)}/{len(record.get('recipient_ids', []))} | {str(record.get('created_at', ''))[:16]}")
+        saved_interaction = interaction_state.get(str(record.get("id")), {})
+        answered = saved_interaction.get("users", {}) if isinstance(saved_interaction, dict) else {}
+        if record.get("interaction"):
+            label = "✅ אישורים" if record["interaction"].get("kind") == "ack" else "📊 הצבעות"
+            lines.append(f"  ↳ {label}: {len(answered)}/{len(record.get('recipient_ids', []))}")
         if record.get("status") == "pending":
             buttons.append([InlineKeyboardButton(f"❌ בטל {str(record.get('id'))[:8]}", callback_data=f"broadcast_cancel_{record.get('id')}")])
     if not records:
