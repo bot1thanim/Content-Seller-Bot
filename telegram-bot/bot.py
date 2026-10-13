@@ -79,6 +79,7 @@ ALERTS_FILE = DATA_DIR / "alerts.json"
 DUPLICATE_REVIEWS_FILE = DATA_DIR / "duplicate_reviews.json"
 BROADCASTS_FILE = DATA_DIR / "broadcasts.json"
 INTERACTIONS_FILE = DATA_DIR / "interactions.json"
+REWARDS_FILE = DATA_DIR / "pending_rewards.json"
 RESTORE_UNDO_FILE = DATA_DIR / "restore_undo.json"
 RESTORE_SESSION_FILE = DATA_DIR / "restore_session.json"
 AUTO_BACKUPS_DIR = DATA_DIR / "auto_backups"
@@ -102,6 +103,7 @@ BACKUP_ALLOWED_FILES = {
     "duplicate_reviews.json": list,
     "broadcasts.json": list,
     "interactions.json": dict,
+    "pending_rewards.json": dict,
 }
 MAX_RESTORE_ARCHIVE_BYTES = 20 * 1024 * 1024
 MAX_RESTORE_UNCOMPRESSED_BYTES = 40 * 1024 * 1024
@@ -209,6 +211,7 @@ def ensure_data_files():
         (DUPLICATE_REVIEWS_FILE, []),
         (BROADCASTS_FILE, []),
         (INTERACTIONS_FILE, {}),
+        (REWARDS_FILE, {}),
     ]
     for filepath, default in defaults:
         if not filepath.exists():
@@ -968,6 +971,8 @@ def callback_permission(callback_data: str) -> str | None:
         return "coin_balances"
     if callback_data.startswith(("admin_coin_control", "admin_coin_set_", "admin_multiplier")):
         return "reward_settings"
+    if callback_data.startswith("coupon_reward_"):
+        return None
     if callback_data.startswith(("admin_coupons", "coupon_")):
         return "coupon_manage"
     if callback_data.startswith(("admin_vip", "vip_cfg_", "set_vip_")):
@@ -999,7 +1004,7 @@ async def admin_callback_gate(update: Update, context: ContextTypes.DEFAULT_TYPE
         return
     data = query.data or ""
     permission = callback_permission(data)
-    private_callback = data.startswith(("admin_", "broadcast_", "coupon_", "cat_", "dup_", "vid_", "gallery_browse_", "trash_", "del_", "maint_", "support_reply"))
+    private_callback = data.startswith(("admin_", "broadcast_", "coupon_", "cat_", "dup_", "vid_", "gallery_browse_", "trash_", "del_", "maint_", "support_reply")) and not data.startswith("coupon_reward_")
     allowed = is_owner(query.from_user.id)
     if not allowed and permission == "panel":
         allowed = is_admin(query.from_user.id)
@@ -2031,7 +2036,7 @@ def _clear_transient_flow_state(context: ContextTypes.DEFAULT_TYPE) -> None:
     for key in (
         "admin_msg_text", "approve_v_count", "coins_target_id", "vip_target_id",
         "vip_config_index", "vip_config_mode",
-        "new_coupon_code", "new_coupon_coins", "new_coupon_expiry", "new_coupon_max_uses",
+        "new_coupon_code", "new_coupon_coins", "new_coupon_reward", "new_coupon_auto_claim", "new_coupon_expiry", "new_coupon_max_uses",
         "new_coupon_referral_mode", "new_coupon_referral_minimum",
         "pending_restore", "support_reply_target", "category_rename_old",
         "broadcast_msg", "broadcast_media", "broadcast_markup", "broadcast_interaction", "broadcast_delay",
@@ -2153,6 +2158,29 @@ async def maintenance_gate(update: Update) -> bool:
 
 # ─── /start ───────────────────────────────────────────────────────────────────
 
+async def process_auto_coupon_rewards(context: ContextTypes.DEFAULT_TYPE, user_id: str) -> None:
+    referral_count = _coupon_eligible_referral_count({"referral_mode": "total"}, user_id)
+    coupons = load_json(COUPONS_FILE)
+    changed = False
+    for code, coupon in coupons.items() if isinstance(coupons, dict) else []:
+        if not isinstance(coupon, dict) or not coupon.get("auto_claim"):
+            continue
+        if referral_count < int(coupon.get("referral_minimum", 0) or 0) or str(user_id) in {str(item) for item in coupon.get("auto_granted", [])}:
+            continue
+        reward = coupon.get("reward", {"type": "coins", "amount": int(coupon.get("coins", 0) or 0)})
+        coupon.setdefault("auto_granted", []).append(str(user_id)); changed = True
+        if reward.get("type") == "videos":
+            sent = await send_videos_to_user(context, int(user_id), int(reward.get("amount", 0)))
+            await context.bot.send_message(chat_id=int(user_id), text=f"🎁 השלמת את המשימה וקיבלת {sent} סרטונים!")
+        elif reward.get("type") == "choice":
+            pending = load_json(REWARDS_FILE); pending[f"{user_id}:{code}"] = {"user_id": str(user_id), "code": code, "coins": int(reward.get("coins", 0)), "videos": int(reward.get("videos", 0))}; save_json(REWARDS_FILE, pending)
+            await context.bot.send_message(chat_id=int(user_id), text="🎁 השלמת את המשימה! בחר את הפרס שלך:", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(f"🪙 {reward.get('coins', 0)} מטבעות", callback_data=f"coupon_reward_coins_{code}")], [InlineKeyboardButton(f"🎬 {reward.get('videos', 0)} סרטונים", callback_data=f"coupon_reward_videos_{code}")]]))
+        else:
+            amount = int(reward.get("amount", coupon.get("coins", 0))); coins = load_json(COINS_FILE); before = int(coins.get(str(user_id), 0)); coins[str(user_id)] = before + amount; save_json(COINS_FILE, coins); log_coin_transaction(str(user_id), before, amount, coins[str(user_id)], reason="automatic_coupon_reward", source="referral_task")
+            await context.bot.send_message(chat_id=int(user_id), text=f"🎁 השלמת את המשימה וקיבלת {amount} מטבעות!")
+    if changed:
+        save_json(COUPONS_FILE, coupons)
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.message and update.message.date:
         age = (datetime.now(timezone.utc) - update.message.date).total_seconds()
@@ -2174,6 +2202,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     users_before = load_json(USERS_FILE)
     is_new_user = str(user.id) not in users_before
     register_user(user, ref_id)
+    await process_auto_coupon_rewards(context, str(user.id))
     log_user_activity(user.id, "start", {"new_user": bool(is_new_user)})
 
     # Welcome guide for new users
@@ -2741,28 +2770,74 @@ async def coupon_redeem_input(update: Update, context: ContextTypes.DEFAULT_TYPE
             )
             return ConversationHandler.END
 
-    reward = coupon["coins"]
+    reward = coupon.get("reward", {"type": "coins", "amount": int(coupon.get("coins", 0) or 0)})
+    reward_type = reward.get("type", "coins") if isinstance(reward, dict) else "coins"
+    if reward_type == "choice":
+        pending = load_json(REWARDS_FILE)
+        pending[f"{user_id}:{code}"] = {"user_id": user_id, "code": code, "coins": int(reward.get("coins", 0)), "videos": int(reward.get("videos", 0))}
+        save_json(REWARDS_FILE, pending)
+        await update.message.reply_text("🎁 השלמת את המשימה! בחר את הפרס שלך:", reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(f"🪙 {reward.get('coins', 0)} מטבעות", callback_data=f"coupon_reward_coins_{code}")], [InlineKeyboardButton(f"🎬 {reward.get('videos', 0)} סרטונים", callback_data=f"coupon_reward_videos_{code}")]]))
+        return ConversationHandler.END
     used_by.append(user_id)
     coupon["used_by"] = used_by
     coupons[code] = coupon
     save_json(COUPONS_FILE, coupons)
 
-    coins          = load_json(COINS_FILE)
+    if reward_type == "videos":
+        amount = int(reward.get("amount", 0))
+        sent = await send_videos_to_user(context, int(user_id), amount)
+        await update.message.reply_text(f"✅ קיבלת {sent} סרטונים מתגמול הקופון.", reply_markup=back_btn)
+        return ConversationHandler.END
+    amount = int(reward.get("amount", coupon.get("coins", 0)) if isinstance(reward, dict) else reward)
+    coins = load_json(COINS_FILE)
     before = int(coins.get(user_id, 0))
-    after = before + reward
+    after = before + amount
     coins[user_id] = after
     save_json(COINS_FILE, coins)
-    log_coin_transaction(user_id, before, reward, after, reason="coupon_redeemed", source="user_coupon")
-    log_user_activity(user_id, "coupon_redeemed", {"reward": int(reward), "amount_before": before, "amount_after": after}, source="user")
+    log_coin_transaction(user_id, before, amount, after, reason="coupon_redeemed", source="user_coupon")
+    log_user_activity(user_id, "coupon_redeemed", {"reward": amount, "amount_before": before, "amount_after": after}, source="user")
 
     await update.message.reply_text(
-        (f"✅ *Coupon redeemed!*\n\n🪙 You received *{reward} coins*\n💰 Current balance: *{coins[user_id]}*" if english else f"✅ *קופון מומש!*\n\n🪙 קיבלת *{reward} מטבעות*\n💰 יתרה כעת: *{coins[user_id]}*"),
+        (f"✅ *Coupon redeemed!*\n\n🪙 You received *{amount} coins*\n💰 Current balance: *{coins[user_id]}*" if english else f"✅ *קופון מומש!*\n\n🪙 קיבלת *{amount} מטבעות*\n💰 יתרה כעת: *{coins[user_id]}*"),
         parse_mode="Markdown",
         reply_markup=back_btn,
     )
     await alert_admin(context,
-        f"🎟 *מימוש קופון*\n👤 ID: `{user_id}`\n🎫 קוד: `{code}`\n🪙 מטבעות: {reward}")
+        f"🎟 *מימוש קופון*\n👤 ID: `{user_id}`\n🎫 קוד: `{code}`\n🪙 מטבעות: {amount}")
     return ConversationHandler.END
+
+
+async def coupon_reward_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    parts = (query.data or "").split("_", 3)
+    if len(parts) != 4:
+        return
+    kind, code = parts[2], parts[3]
+    user_id = str(query.from_user.id)
+    pending = load_json(REWARDS_FILE)
+    key = f"{user_id}:{code}"
+    reward = pending.get(key)
+    if not isinstance(reward, dict):
+        await query.answer("הפרס כבר נבחר או אינו זמין.", show_alert=True)
+        return
+    coupons = load_json(COUPONS_FILE)
+    coupon = coupons.get(code)
+    if not isinstance(coupon, dict):
+        return
+    coupon.setdefault("used_by", []).append(user_id)
+    coupons[code] = coupon
+    save_json(COUPONS_FILE, coupons)
+    if kind == "coins":
+        amount = int(reward.get("coins", 0))
+        coins = load_json(COINS_FILE); before = int(coins.get(user_id, 0)); coins[user_id] = before + amount; save_json(COINS_FILE, coins)
+        log_coin_transaction(user_id, before, amount, coins[user_id], reason="coupon_reward_choice", source="user_coupon")
+        text = f"✅ קיבלת {amount} מטבעות!"
+    else:
+        sent = await send_videos_to_user(context, int(user_id), int(reward.get("videos", 0)))
+        text = f"✅ קיבלת {sent} סרטונים!"
+    pending.pop(key, None); save_json(REWARDS_FILE, pending)
+    await query.edit_message_text(text, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 חזרה", callback_data="back_main")]]))
 
 # ─── Support ──────────────────────────────────────────────────────────────────
 
@@ -9976,19 +10051,33 @@ async def admin_coupon_get_code(update: Update, context: ContextTypes.DEFAULT_TY
         await update.message.reply_text("❌ קוד כבר קיים.", reply_markup=_flow_back_markup())
         return ADMIN_COUPON_CODE
     context.user_data["new_coupon_code"] = code
-    await update.message.reply_text(f"✅ קוד: `{code}`\n\nכמה 🪙 מטבעות?", parse_mode="Markdown", reply_markup=_flow_back_markup())
+    await update.message.reply_text(f"✅ קוד: `{code}`\n\nשלח תגמול: מספר מטבעות, `coins:100`, `videos:5`, `choice:100:5`.\nלהענקה אוטומטית לאחר השלמת תנאי הפניות הוסף `auto:` לפני הפורמט.", parse_mode="Markdown", reply_markup=_flow_back_markup())
     return ADMIN_COUPON_COINS
 
 async def admin_coupon_get_coins(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not has_admin_permission(update.effective_user.id, "coupon_manage"):
         return ConversationHandler.END
+    raw = update.message.text.strip().lower()
+    auto_claim = raw.startswith("auto:")
+    if auto_claim:
+        raw = raw.removeprefix("auto:")
+        context.user_data["new_coupon_auto_claim"] = True
     try:
-        val = int(update.message.text.strip())
-        if val <= 0:
+        if raw.startswith("coins:"):
+            reward = {"type": "coins", "amount": int(raw.split(":", 1)[1])}
+        elif raw.startswith("videos:"):
+            reward = {"type": "videos", "amount": int(raw.split(":", 1)[1])}
+        elif raw.startswith("choice:"):
+            coins, videos = raw.split(":", 1)[1].split(":", 1)
+            reward = {"type": "choice", "coins": int(coins), "videos": int(videos)}
+        else:
+            reward = {"type": "coins", "amount": int(raw)}
+        if any(int(value) <= 0 for key, value in reward.items() if key in {"amount", "coins", "videos"}):
             raise ValueError
-        context.user_data["new_coupon_coins"] = val
-    except ValueError:
-        await update.message.reply_text("❌ מספר לא תקין.", reply_markup=_flow_back_markup())
+        context.user_data["new_coupon_reward"] = reward
+        context.user_data["new_coupon_coins"] = int(reward.get("amount", reward.get("coins", 0)))
+    except (ValueError, IndexError):
+        await update.message.reply_text("❌ פורמט לא תקין. השתמש ב־`coins:100`, `videos:5`, `choice:100:5` או במספר מטבעות.", parse_mode="Markdown", reply_markup=_flow_back_markup())
         return ADMIN_COUPON_COINS
     await update.message.reply_text("📅 תאריך תפוגה? הזן `YYYY-MM-DD` או בחר ללא תוקף.", parse_mode="Markdown", reply_markup=_new_coupon_expiry_markup())
     return ADMIN_COUPON_EXPIRY
@@ -10086,6 +10175,9 @@ async def admin_coupon_save(update: Update, context: ContextTypes.DEFAULT_TYPE):
     coupons[code] = {
         "coins": coins_val, "expires": expiry, "max_uses": max_uses, "used_by": [],
         "referral_mode": referral_mode, "referral_minimum": referral_minimum,
+        "reward": context.user_data.get("new_coupon_reward", {"type": "coins", "amount": coins_val}),
+        "auto_claim": bool(context.user_data.get("new_coupon_auto_claim", False)),
+        "auto_granted": [],
         "created_at": datetime.now(timezone.utc).isoformat(),
     }
     save_json(COUPONS_FILE, coupons)
@@ -11231,6 +11323,7 @@ def main():
         (r"^cat_quick_menu_[0-9a-f]+$", admin_quick_category_menu),
         (r"^cat_quick_toggle_[0-9a-f]+_\d+$", admin_quick_category_toggle),
         (r"^cat_quick_done_[0-9a-f]+$", admin_quick_category_done),
+        (r"^coupon_reward_(coins|videos)_.+$", coupon_reward_choice),
         ("^admin_coupons$",             admin_coupons_menu),
         (r"^admin_coupons_page_\d+$",   admin_coupons_menu),
         (r"^coupon_del_",               admin_coupon_delete),
