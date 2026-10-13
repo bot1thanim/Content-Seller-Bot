@@ -632,14 +632,7 @@ def _restore_payload_matches_after_save(filename: str, expected, actual) -> bool
     expected_normalized = normalize_restored_settings(dict(expected))
     actual_normalized = normalize_restored_settings(dict(actual))
     for key, expected_value in expected_normalized.items():
-        if key in {"category_visibility", "category_random_enabled"} and isinstance(expected_value, dict):
-            expected_value = {str(name): bool(value) for name, value in expected_value.items()}
-            actual_value = actual_normalized.get(key, {})
-            if not isinstance(actual_value, dict):
-                return False
-            actual_value = {str(name): bool(value) for name, value in actual_value.items()}
-        else:
-            actual_value = actual_normalized.get(key)
+        actual_value = actual_normalized.get(key)
         # ``load_settings`` may add compatibility/default keys while the file is
         # being written.  Check the normalized view, not the raw JSON object;
         # otherwise an otherwise valid legacy backup is rolled back with a false
@@ -647,13 +640,15 @@ def _restore_payload_matches_after_save(filename: str, expected, actual) -> bool
         if key not in actual_normalized:
             return False
         if key in {"category_visibility", "category_random_enabled"} and isinstance(expected_value, dict):
-            # load_settings() materializes defaults for every current category.
-            # A legacy backup may contain only the explicitly configured entries;
-            # require those entries to survive but tolerate newly-added defaults.
-            if any(actual_value.get(name) != value for name, value in expected_value.items()):
+            # Older backups may omit defaults added by the current runtime.
+            if not isinstance(actual_value, dict):
                 return False
+            for category, expected_flag in expected_value.items():
+                if bool(actual_value.get(category, True)) != bool(expected_flag):
+                    return False
         elif key in {"categories", DUPLICATE_REVIEWED_KEY} and isinstance(expected_value, list) and isinstance(actual_value, list):
-            if set(actual_value) != set(expected_value):
+            # Newer runtime entries may remain after an additive restore.
+            if not set(expected_value).issubset(set(actual_value)):
                 return False
         elif actual_value != expected_value:
             return False
